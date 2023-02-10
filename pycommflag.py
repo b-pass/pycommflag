@@ -12,6 +12,8 @@ import av
 import scipy.ndimage
 import math
 
+LOGO_EDGE_THRESHOLD = 85 # how strong an edge is strong enough?
+
 def logdbg(*a,**kw):
     print('DBG:',*a,**kw)
 
@@ -21,13 +23,27 @@ def logerr(*a,**kw):
 def loginfo(*a,**kw):
     print('INFO:',*a,**kw)
 
-def fplanar_to_gray(frame):
+def fplanar_to_gray(frame,box):
     return frame.to_ndarray()[:frame.planes[0].height, ...]
 
 def frgb_to_gray(frame):
     array = frame.to_ndarray(format="rgb24")
     return np.dot(array[...,:3], [0.2989, 0.5870, 0.1140])
-    
+
+def gray(frame,box=None):
+    if False and frame.format.is_planar:
+        x = frame.to_ndarray()
+        if box:
+            return x[box[0]:box[1],box[2]:box[3]]
+        else:
+            return x[:frame.planes[0].height]
+    else:
+        x = frame.to_ndarray(format="rgb24")
+        if box:
+            x = x[box[0]:box[1],box[2]:box[3]]
+        x = np.dot(x[...,:3], [0.2989, 0.5870, 0.1140])
+        return x
+
 #def nscale(a,n):
 #    s = np.zeros((int(a.shape[0]/n),int(a.shape[1]/n)), np.uint16)
 #    for x in range(n):
@@ -42,13 +58,12 @@ class Player:
         self.container.flags |= av.container.core.Flags.DISCARD_CORRUPT
         self.container.streams.video[0].thread_type = "AUTO"
         self.container.streams.audio[0].thread_type = "AUTO"
-        #self.container.streams.video[0].thread_count = 2
-        self.container.streams.audio[0].thread_count = 2
-
-        self.get_frame = lambda: self.next_raw_frame()
 
         self.duration = self.container.duration / av.time_base
-        
+        self.streams = {'video':0}
+        self.aq = None
+        self.vq = []
+
         inter = 0
         ninter = 0
         for f in self.container.decode(video=0):
@@ -59,7 +74,6 @@ class Player:
             if inter+ninter >= 100:
                 break
         
-        self.frame_format = f.format
         self.shape = (f.height, f.width)
 
         if inter*2 > ninter:
@@ -72,39 +86,78 @@ class Player:
             buffer.link_to(bwdif)
             bwdif.link_to(buffersink)
             self.graph.configure()
-            self.get_frame = lambda: self.next_deinterlaced_frame()
+            self.frames = lambda: self.next_deinterlaced_frame()
         else:
             self.interlaced = False
         self.frame_rate = self.container.streams.video[0].average_rate
-
-        pass
     
     def seek(self, seconds):
         self.container.seek(int(seconds / av.time_base))
-        # drain the graph
-        try:
-            while True:
-                self.graph.pull()
-        except av.AVError as e:
-            if e.errno != errno.EAGAIN:
-                raise
-
-    def next_raw_frame(self):
-        return next(self.container.decode(video=0))
+        self.flush_buffers()
     
-    def next_deinterlaced_frame(self):
-        try:
-            return self.graph.pull()
-        except av.AVError as e:
-            if e.errno != errno.EAGAIN:
-                raise
-            self.graph.push(self.next_raw_frame())
-            return self.next_deinterlaced_frame()
+    def enable_audio(self, stream=0):
+        self.streams['audio'] = stream
+        self.flush_buffers()
+        
+    def disable_audio(self):
+        if 'audio' in self.streams:
+            del self.streams['audio']
+        self.aq = None
 
-def find_logo_mask(player, skip=1, threshold=.33, search_seconds=600, search_beginning=False):
-    make_gray = lambda f: frgb_to_gray(f)
-    if player.frame_format.is_planar:
-        make_gray = lambda f: fplanar_to_gray(f)
+    def queue_audio(self, af):
+        # todo, convert to s16p
+        self.aq.append(af.to_ndarray())
+
+    def flush_buffers(self):
+        if self.graph:
+            try:
+                while True:
+                    self.graph.pull()
+            except av.AVError as e:
+                if e.errno != errno.EAGAIN:
+                    raise
+        self.vq = []
+        self.aq = [] if 'audio' in self.streams else None
+
+    def fill(self):
+        if self.aq:
+            af = self.aq[-1]
+            anext = af.time + af.samples * (af.time_base / af.sample_rate)
+        else:
+            anext = None
+
+        for frame in self.container.decode(**self.streams):
+            if type(frame) is av.AudioFrame:
+                af = frame
+                anext = af.time + af.samples * (af.time_base / af.sample_rate)
+                self.queue_audio(af)    
+            elif type(frame) is av.VideoFrame:
+                if self.graph:
+                    self.graph.push(frame)
+                    try:
+                        frame = self.graph.pull()
+                    except av.AVError as e:
+                        if e.errno != errno.EAGAIN:
+                            raise
+                        continue
+                self.vq.append(frame)
+                if self.aq is None:
+                    break
+            if len(self.vq) > 1 and anext:
+                if self.vq[1].time <= anext:
+                    break
+        
+    def frames(self):
+        self.fill()
+        if not self.vq:
+            raise StopIteration()
+        
+        vf = self.vq.pop()
+        # grab audio samples matching vf
+        yield (vf,audio)
+
+def find_logo_mask(player, skip=1, search_seconds=600, search_beginning=False):
+    global LOGO_EDGE_THRESHOLD
     
     logo_sum = np.ndarray(player.shape, np.uint16)
     
@@ -114,7 +167,6 @@ def find_logo_mask(player, skip=1, threshold=.33, search_seconds=600, search_beg
     else:
         player.seek(0)
     
-    thresh = int(255*threshold)
     fcount = 0
     ftotal = min(int(search_seconds * player.frame_rate), 65000*skip)
     
@@ -122,16 +174,13 @@ def find_logo_mask(player, skip=1, threshold=.33, search_seconds=600, search_beg
     report = math.ceil(ftotal/250)
     p = report
     for _ in range(ftotal):
-        try:
-            frame = player.get_frame()
-        except StopIteration:
-            break
+        frame = next(player.frames())
         
         p += 1
         if p%skip != 0:
             continue
-        data = make_gray(frame)
-        logo_sum += scipy.ndimage.sobel(data, mode='constant') > thresh
+        data = gray(frame)
+        logo_sum += scipy.ndimage.sobel(data) > LOGO_EDGE_THRESHOLD
         fcount += 1
         if p >= report:
             p = 0
@@ -157,21 +206,21 @@ def find_logo_mask(player, skip=1, threshold=.33, search_seconds=600, search_beg
 
     if best <= fcount / 3:
         loginfo("No logo found (insufficient edges)")
-        return (None,None,None)
+        return None
     
     logo_mask = logo_sum >= (best - fcount/10)
     if np.count_nonzero(logo_mask) < 50:
         loginfo("No logo found (not enough edges)")
-        return (None,None,None)
+        return None
     
     nz = np.nonzero(logo_mask)
-    top = min(nz[0])
-    left = min(nz[1])
-    bottom = max(nz[0])
-    right = max(nz[1])
+    top = int(min(nz[0]))
+    left = int(min(nz[1]))
+    bottom = int(max(nz[0]))
+    right = int(max(nz[1]))
     if right - left < 5 or bottom - top < 5:
         loginfo("No logo found (bounding box too narrow)")
-        return (None,None,None)
+        return None
     
     top -= 5
     left -= 5
@@ -193,12 +242,25 @@ def find_logo_mask(player, skip=1, threshold=.33, search_seconds=600, search_beg
     logdbg(f"Logo bounding box: {top},{left} to {bottom},{right}")
 
     logo_mask = logo_mask[top:bottom,left:right]
-    if np.count_nonzero(logo_mask) < 20:
+    lmc = np.count_nonzero(logo_mask)
+    if lmc < 20:
         loginfo("No logo found (not enough edges within bounding box)")
-        return (None,None,None)
+        return None
+    thresh = lmc * .75
+    return ((top,left),(bottom,right), logo_mask, thresh)
 
-    return ((top,left),(bottom,right), logo_mask)
-
+def check_for_logo(frame, logo):
+    global LOGO_EDGE_THRESHOLD
+    if not logo:
+        return False
+    
+    ((top,left),(bottom,right),lmask,thresh) = logo
+    c = gray(frame, [top,bottom,left,right])
+    c = scipy.ndimage.sobel(c) > LOGO_EDGE_THRESHOLD
+    c = np.where(lmask, c, False)
+    #print('\n!',np.count_nonzero(c),'of',np.count_nonzero(lmask),'!')
+    return np.count_nonzero(c) >= thresh
+    
 def main(argv):
     parser = optparse.OptionParser()
     parser.add_option('-f', '--file', dest="filename", 
@@ -211,28 +273,93 @@ def main(argv):
     print(opts.filename)
     player = Player(opts.filename)
 
-    (lmin,lmax,lmask) = find_logo_mask(player, skip=opts.skip, search_seconds=600 if player.duration <= 3700 else 900)
-    if lmask is None:
-        lmin = lmax = (0,0)
+    if os.path.exists('/tmp/logo'):
+        logo = json.load(open('/tmp/logo'))
+        logo[2] = np.array(logo[2])
     else:
-        for y in range(lmask.shape[0]):
-            for x in range(lmask.shape[1]):
-                print('#' if lmask[y][x] else ' ', end='')
-            print()
+        logo = find_logo_mask(player, skip=opts.skip, search_seconds=600 if player.duration <= 3700 else 900)
+        if logo:
+            temp = list(logo)
+            temp[2] = logo[2].tolist()
+            json.dump(temp, open('/tmp/logo','w'))
 
-    #sys.exit(1)
-    import matplotlib.pyplot as plt
-    fig = plt.figure()
-    plt.gray()
-    ax1 = fig.add_subplot(121)  # left side
-    ax2 = fig.add_subplot(122)  # right side
-    ax1.imshow(player.get_frame().to_ndarray(format="rgb24"))
-    ax2.imshow(lmask)
-    plt.show()
+    player.seek(0)
+    player.enable_audio()
+
+    # not doing format/aspect because everything is widescreen all the time now (that was very early '00s)
+    # for each frame: 
+    #    is it blank? 
+    #    does it have logo?
+    #    scene change -> video barcode?
+    #    also do a horizontal barcode? video qrcode?
+    #
+    prev_bar = None
+    fcount = 0
+    ftotal = int(player.duration * player.frame_rate)
+    percent = ftotal/100.0
+    report = math.ceil(ftotal/1000)
+    p = report
+    
+    def plot(l,r):
+        #sys.exit(1)
+        import matplotlib.pyplot as plt
+        fig = plt.figure()
+        #plt.gray()
+        ax1 = fig.add_subplot(121)  # left side
+        ax2 = fig.add_subplot(122)  # right side
+        ax1.imshow(l)
+        ax2.imshow(r)
+        plt.show()
+
+    fcolor = None
+    for frame in player.frames():
+        print(type(frame))
+        p += 1
+        fcount += 1
+        if p >= report:
+            p = 0
+            #print("Processing, %3.1f%%" % (min(fcount/percent,100.0)), end='\r')
+
+        prev_frame = fcolor
+        fcolor = frame.to_ndarray(format="rgb24")
+        x = np.max(fcolor)
+        if x < 128:
+            m = np.median(fcolor, (0,1))
+            frame_blank = max(m) < 25 and np.std(m) < 3 and np.std(fcolor) < 10
+        else:
+            frame_blank = False
+
+        if frame_blank:
+            logo_present = False
+            scene_change = True
+            prev_bar = None
+            print("BLANK!")
+        else:
+            logo_present = check_for_logo(frame, logo)
+        
+            #s = np.std(fcolor, (0,1,2))
+            #m = np.mean(fcolor, (0,1))
+            #d = np.median(fcolor, (0,1))
+            #x = np.max(fcolor)
+            #print(s,m,d,x)
+
+            column = fcolor.mean(axis=1)
+            if prev_bar is not None:
+                diff = column - prev_bar
+                s = np.std(diff, (0))
+                print(s)
+                if max(s) >= 8:
+                    scene_change = True
+            prev_bar = column
+        
+        #breakpoint()
+
+        if logo_present:
+            break
+
 
     sys.exit(1)
     if False:
-        print(s)
         # Collapse down to a column.
         column = array.mean(axis=1)
 
