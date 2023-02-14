@@ -5,8 +5,10 @@ import logging
 import optparse
 import os
 import sys
+import struct
 
-from time import time as now
+import time
+now = time.time
 import numpy as np
 import av
 import scipy.ndimage
@@ -31,7 +33,7 @@ def frgb_to_gray(frame):
     return np.dot(array[...,:3], [0.2989, 0.5870, 0.1140])
 
 def gray(frame,box=None):
-    if False and frame.format.is_planar:
+    if frame.format.is_planar:
         x = frame.to_ndarray()
         if box:
             return x[box[0]:box[1],box[2]:box[3]]
@@ -52,11 +54,12 @@ def gray(frame,box=None):
 #    return (s / n).astype(np.uint8)
 
 class Player:
-    def __init__(self, filename, nscale=1):
+    def __init__(self, filename, nscale=1, deinterlace=False):
         self.container = av.open(filename)
         self.container.flags |= av.container.core.Flags.GENPTS
         self.container.flags |= av.container.core.Flags.DISCARD_CORRUPT
         self.container.streams.video[0].thread_type = "AUTO"
+        #self.container.streams.video[0].thread_count = 4
         self.container.streams.audio[0].thread_type = "AUTO"
 
         self.duration = self.container.duration / av.time_base
@@ -71,14 +74,16 @@ class Player:
                 inter += 1
             else:
                 ninter += 1
-            if inter+ninter >= 100:
+            if inter+ninter >= 360:
                 break
+        self.container.seek(0)
         
+        #f = next(self.container.decode(video=0))
         self.shape = (f.height, f.width)
 
-        if inter*2 > ninter:
+        if inter*4 > ninter:
             self.interlaced = True
-            logdbg(f"{inter} interlaced frame and {ninter} not, means we will deinterlace.")
+            logdbg(f"{inter} interlaced frames and {ninter}, means we will deinterlace.")
             self.graph = av.filter.Graph()
             buffer = self.graph.add_buffer(template=self.container.streams.video[0])
             bwdif = self.graph.add("yadif", "")
@@ -86,9 +91,10 @@ class Player:
             buffer.link_to(bwdif)
             bwdif.link_to(buffersink)
             self.graph.configure()
-            self.frames = lambda: self.next_deinterlaced_frame()
         else:
+            logdbg(f"We will NOT deinterlace (had {inter} interlaced frames and {ninter} non-interlaced frames)")
             self.interlaced = False
+            self.graph = None
         self.frame_rate = self.container.streams.video[0].average_rate
     
     def seek(self, seconds):
@@ -98,6 +104,8 @@ class Player:
     def enable_audio(self, stream=0):
         self.streams['audio'] = stream
         self.flush_buffers()
+        self.vt_start = self.container.streams.video[self.streams['video']].start_time * self.container.streams.video[self.streams['video']].time_base
+        self.at_start = self.container.streams.audio[self.streams['audio']].start_time * self.container.streams.video[self.streams['audio']].time_base
         
     def disable_audio(self):
         if 'audio' in self.streams:
@@ -105,8 +113,55 @@ class Player:
         self.aq = None
 
     def queue_audio(self, af):
-        # todo, convert to s16p
-        self.aq.append(af.to_ndarray())
+        d = af.to_ndarray()
+        if d.dtype.kind != 'f':
+            d = d.astype('float32') / 32767.0
+        if d.shape[0] == 1:
+            x = []
+            nc = self.aq[0].channels
+            for c in range(nc):
+                x.append(d[c::nc])
+            for c in range(8-nc):
+                x.append([])
+            d = np.vstack(x)
+        if d.shape[0] < 6:
+            d = np.pad(d, [(0,8-d.shape[0]),(0,0)])
+        elif d.shape[0] > 6:
+            d = d[:6,...]
+        #print("AQ:",d.shape,af.time-self.at_start,af.sample_rate)
+        self.aq.append((d,af.time-self.at_start,af.sample_rate))
+
+    def get_audio_peaks(self, end):
+        if not self.aq:
+            return None
+        
+        qe = self.aq[-1][1]
+        if qe < end and end:
+            return None
+        
+        #print(len(self.aq), end, end - self.aq[0][1], "t=", self.aq[0][1], self.aq[0][2])
+        need = end - self.aq[0][1] if end else 1.0
+        if need < 0:
+            sys.exit(1)
+        assert(need >= 0)
+        
+        peaks = []
+        while self.aq and need > 0:
+            (d,t,sr) = self.aq[0]
+            nsamp = int(need * sr)
+            if nsamp == 0:
+                break
+            #print(len(self.aq),need, end, "t=", t,sr,nsamp,nsamp/sr,d.shape,t+nsamp/sr)
+            if nsamp >= d.shape[1]:
+                nsamp = d.shape[1]
+                self.aq.pop(0)
+            else:
+                self.aq[0] = (d[..., nsamp:], t+nsamp/sr, sr)
+                d = d[..., 0:nsamp]
+            need -= nsamp/sr
+            peaks.append(np.max(np.abs(d), axis=1))
+        
+        return np.max(peaks, axis=0) if peaks else None
 
     def flush_buffers(self):
         if self.graph:
@@ -119,18 +174,10 @@ class Player:
         self.vq = []
         self.aq = [] if 'audio' in self.streams else None
 
-    def fill(self):
-        if self.aq:
-            af = self.aq[-1]
-            anext = af.time + af.samples * (af.time_base / af.sample_rate)
-        else:
-            anext = None
-
+    def frames(self):
         for frame in self.container.decode(**self.streams):
             if type(frame) is av.AudioFrame:
-                af = frame
-                anext = af.time + af.samples * (af.time_base / af.sample_rate)
-                self.queue_audio(af)    
+                self.queue_audio(frame)
             elif type(frame) is av.VideoFrame:
                 if self.graph:
                     self.graph.push(frame)
@@ -140,21 +187,21 @@ class Player:
                         if e.errno != errno.EAGAIN:
                             raise
                         continue
-                self.vq.append(frame)
-                if self.aq is None:
-                    break
-            if len(self.vq) > 1 and anext:
-                if self.vq[1].time <= anext:
-                    break
-        
-    def frames(self):
-        self.fill()
-        if not self.vq:
-            raise StopIteration()
-        
-        vf = self.vq.pop()
-        # grab audio samples matching vf
-        yield (vf,audio)
+                if self.aq is not None:
+                    self.vq.append(frame)
+                else:
+                    yield (frame,None)
+            if len(self.vq) > 1:
+                af = self.get_audio_peaks(self.vq[1].time - self.vt_start)
+                if af is None:
+                    continue
+                vf = self.vq.pop(0)
+                yield (vf,af)
+        while self.vq:
+            af = self.get_audio_peaks(None)
+            vf = self.vq.pop(0)
+            yield (vf,af)
+        return #raise StopIteration()
 
 def find_logo_mask(player, skip=1, search_seconds=600, search_beginning=False):
     global LOGO_EDGE_THRESHOLD
@@ -170,11 +217,12 @@ def find_logo_mask(player, skip=1, search_seconds=600, search_beginning=False):
     fcount = 0
     ftotal = min(int(search_seconds * player.frame_rate), 65000*skip)
     
+    get_frame = player.frames()
     percent = ftotal/skip/100.0
     report = math.ceil(ftotal/250)
     p = report
     for _ in range(ftotal):
-        frame = next(player.frames())
+        (frame,audio) = next(get_frame)
         
         p += 1
         if p%skip != 0:
@@ -187,13 +235,11 @@ def find_logo_mask(player, skip=1, search_seconds=600, search_beginning=False):
             print("Searching, %3.1f%%" % (min(fcount/percent,100.0)), end='\r')
     print("Searching is complete.")
 
-    # overscan, ignore 3.5% on each side
-    for n in range(math.ceil(player.shape[0]*.035)):
-        logo_sum[n] = 0
-        logo_sum[-n-1] = 0
-    for n in range(math.ceil(player.shape[1]*.035)):
-        logo_sum[..., n] = 0
-        logo_sum[..., -n-1] = 0
+    # overscan, ignore 3% on each side
+    logo_sum[:math.ceil(player.shape[0]*.03)] = 0
+    logo_sum[-math.ceil(player.shape[0]*.03)-1:] = 0
+    logo_sum[..., 0:math.ceil(player.shape[1]*.03)] = 0
+    logo_sum[..., -math.ceil(player.shape[1]*.03)-1:] = 0
     
     # no logos in the middle 1/3 of the screen
     logo_sum[int(player.shape[0]/3):int(player.shape[0]*2/3),int(player.shape[1]/3):int(player.shape[1]*2/3)] = 0
@@ -246,7 +292,7 @@ def find_logo_mask(player, skip=1, search_seconds=600, search_beginning=False):
     if lmc < 20:
         loginfo("No logo found (not enough edges within bounding box)")
         return None
-    thresh = lmc * .75
+    thresh = int(lmc * .75)
     return ((top,left),(bottom,right), logo_mask, thresh)
 
 def check_for_logo(frame, logo):
@@ -287,6 +333,8 @@ def main(argv):
     player.enable_audio()
 
     # not doing format/aspect because everything is widescreen all the time now (that was very early '00s)
+    # except ultra wide screen movies, and sometimes ultra-wide commercials?
+
     # for each frame: 
     #    is it blank? 
     #    does it have logo?
@@ -296,10 +344,13 @@ def main(argv):
     prev_bar = None
     fcount = 0
     ftotal = int(player.duration * player.frame_rate)
+
     percent = ftotal/100.0
     report = math.ceil(ftotal/1000)
-    p = report
-    
+    rt = time.perf_counter()
+    p = 0
+    print('Processing...', end='\r') 
+
     def plot(l,r):
         #sys.exit(1)
         import matplotlib.pyplot as plt
@@ -312,20 +363,29 @@ def main(argv):
         plt.show()
 
     fcolor = None
-    for frame in player.frames():
-        print(type(frame))
+    fdata = open('/tmp/frames', 'wb')
+    fdata.write(struct.pack('@Iff',1, player.duration, player.frame_rate))
+    if logo:
+        fdata.write(struct.pack('IIIII', int(logo[3]), logo[0][0], logo[0][1], logo[1][0], logo[1][1]))
+        fdata.write(logo[2].astype('uint8').tobytes())
+    else:
+        fdata.write(struct.pack('IIIII', 0, 0, 0, 0, 0))
+    
+    for (frame,audio) in player.frames():
         p += 1
         fcount += 1
         if p >= report:
+            ro = rt
+            rt = time.perf_counter()
+            print("Processing, %5.1f%% (%5.1f fps)          " % (min(fcount/percent,100.0), p/(rt - ro)), end='\r')
             p = 0
-            #print("Processing, %3.1f%%" % (min(fcount/percent,100.0)), end='\r')
 
-        prev_frame = fcolor
-        fcolor = frame.to_ndarray(format="rgb24")
-        x = np.max(fcolor)
-        if x < 128:
+        fcolor = frame.to_ndarray(format="rgb24", height=720, width=frame.width*(720/frame.height))
+        # trying to be fast, just look at the middle 1/4 for the blank checking
+        x = np.max(fcolor[int(fcolor.shape[0]*3/8):int(fcolor.shape[0]*5/8)])
+        if x < 96:
             m = np.median(fcolor, (0,1))
-            frame_blank = max(m) < 25 and np.std(m) < 3 and np.std(fcolor) < 10
+            frame_blank = max(m) < 32 and np.std(m) < 3 and np.std(fcolor) < 10
         else:
             frame_blank = False
 
@@ -333,7 +393,6 @@ def main(argv):
             logo_present = False
             scene_change = True
             prev_bar = None
-            print("BLANK!")
         else:
             logo_present = check_for_logo(frame, logo)
         
@@ -343,37 +402,42 @@ def main(argv):
             #x = np.max(fcolor)
             #print(s,m,d,x)
 
-            column = fcolor.mean(axis=1)
+            # the below code is equivalent to:
+            #   column = fcolor.mean(axis=(1),dtype='float32').astype('int16')
+            # but is almost TEN TIMES faster!
+            
+            # change 1080x1920x3 into 1080x5760
+            fcolor.reshape(-1, fcolor.shape[1]*fcolor.shape[2])
+
+            # pick out the individual color channels by skipping by 3, and then average them
+            cr = fcolor[...,0::3].astype('float32').mean(axis=(1))
+            cg = fcolor[...,1::3].astype('float32').mean(axis=(1))
+            cb = fcolor[...,2::3].astype('float32').mean(axis=(1))
+            
+            # and now convert back into a 1080x3
+            column = np.stack((cb,cg,cr), axis=1).astype('int16')
+            
+            scene_change = False
             if prev_bar is not None:
                 diff = column - prev_bar
+                prev_bar = column
                 s = np.std(diff, (0))
-                print(s)
                 if max(s) >= 8:
                     scene_change = True
-            prev_bar = column
+            else:
+                prev_bar = column
         
-        #breakpoint()
-
-        if logo_present:
-            break
-
-
-    sys.exit(1)
-    if False:
-        # Collapse down to a column.
-        column = array.mean(axis=1)
-
-        # Convert to bytes, as the `mean` turned our array into floats.
-        column = column.clip(0, 255).astype("uint8")
-
-        # Get us in the right shape for the `hstack` below.
-        column = column.reshape(-1, 1, 3)
-
-        columns.append(column)
-
-        print(column)
-        print(columns)
-        sys.exit(1)
+        fdata.write(struct.pack(
+            'If???BIII',
+            fcount,frame.time-player.vt_start,
+            logo_present,frame_blank,scene_change,
+            column.shape[2], column.shape[0], column.shape[1], audio.shape[0]
+        ))
+        fdata.write(column.astype('uint8').tobytes())
+        fdata.write(audio.astype('float32').tobytes())
+    
+    fdata.close()
+    print("done!")
 
 if __name__ == '__main__':
     main(sys.argv)
