@@ -1,3 +1,4 @@
+from typing import Any
 import numpy as np
 import scipy.ndimage
 import math
@@ -7,10 +8,12 @@ from av.video import VideoFrame
 from .player import Player
 _LOGO_EDGE_THRESHOLD = 85 # how strong an edge is strong enough?
 
-def search(player : Player, skip :int =4, search_seconds: float =600, search_beginning :bool =False, quiet:bool =False) -> tuple:
+def search(player : Player, search_seconds: float =600, search_beginning :bool =False, opts:Any=None) -> tuple:
     global _LOGO_EDGE_THRESHOLD
     
     logo_sum = np.ndarray(player.shape, np.uint16)
+
+    skip = opts.logo_skip
     
     # search around 1/3 of the way through the show, there should be a lot of show there
     if not search_beginning and player.duration >= search_seconds*2:
@@ -23,9 +26,9 @@ def search(player : Player, skip :int =4, search_seconds: float =600, search_beg
     
     get_frame = player.frames()
     percent = ftotal/skip/100.0
-    report = math.ceil(ftotal/250) if not quiet else ftotal * 10
+    report = math.ceil(ftotal/250) if not opts.quiet else ftotal * 10
     p = 0
-    if not quiet: print("Searching          ", end='\r')
+    if not opts.quiet: print("Searching          ", end='\r')
     for _ in range(ftotal):
         (frame,audio) = next(get_frame)
         
@@ -38,7 +41,7 @@ def search(player : Player, skip :int =4, search_seconds: float =600, search_beg
         if p >= report:
             p = 0
             print("Searching, %3.1f%%    " % (min(fcount/percent,100.0)), end='\r')
-    if not quiet: print("Searching is complete.\n")
+    if not opts.quiet: print("Searching is complete.\n")
 
     # overscan, ignore 3% on each side
     logo_sum[:math.ceil(player.shape[0]*.03)] = 0
