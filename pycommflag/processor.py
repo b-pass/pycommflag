@@ -5,12 +5,12 @@ import numpy as np
 import math
 import time
 
-from typing import Any, BinaryIO
+from typing import Any, Union, BinaryIO
 
 from .player import Player
 from . import logo_finder
 
-def process_video(filename:str, frame_log:Any[str|BinaryIO], opts:Any=None) -> None:
+def process_video(filename:str, frame_log:Union[str,BinaryIO], opts:Any=None) -> None:
     if type(frame_log) is str:
         with open(frame_log, 'w+b') as fd:
             return process_video(filename, fd, opts)
@@ -118,7 +118,7 @@ def process_video(filename:str, frame_log:Any[str|BinaryIO], opts:Any=None) -> N
     
     if not opts.quiet: print('Processing complete           ')
 
-def process_log(log_in:Any[str | BinaryIO], log_out:Any[str|BinaryIO]) -> None:
+def process_log(log_in:Union[str,BinaryIO], log_out:Union[str,BinaryIO]) -> None:
     if type(log_in) is str:
         if log_in == log_out:
             with open(log_in, 'r+b') as fd:

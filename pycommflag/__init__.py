@@ -12,7 +12,3 @@ applications as a python module.
 
 from . import logo_finder, options, processor
 from .player import Player
-
-if __name__ == '__main__':
-    from . import main
-    main.run(options.parse_argv())
