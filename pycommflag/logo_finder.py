@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, BinaryIO
 import numpy as np
 import scipy.ndimage
 import math
@@ -8,7 +8,7 @@ from av.video import VideoFrame
 from .player import Player
 _LOGO_EDGE_THRESHOLD = 85 # how strong an edge is strong enough?
 
-def search(player : Player, search_seconds: float =600, search_beginning :bool =False, opts:Any=None) -> tuple:
+def search(player : Player, search_seconds: float =600, search_beginning :bool =False, opts:Any=None) -> tuple|None:
     global _LOGO_EDGE_THRESHOLD
     
     logo_sum = np.ndarray(player.shape, np.uint16)
@@ -101,7 +101,7 @@ def search(player : Player, search_seconds: float =600, search_beginning :bool =
         log.info("No logo found (not enough edges within bounding box)")
         return None
     thresh = int(lmc * .75)
-    return ((top,left),(bottom,right), logo_mask, thresh)
+    return ((top,left), (bottom,right), logo_mask, thresh)
 
 def check_frame(frame :VideoFrame, logo :tuple) -> bool:
     global _LOGO_EDGE_THRESHOLD
@@ -129,3 +129,21 @@ def _gray(frame:VideoFrame,box:tuple=None) -> np.ndarray:
             x = x[box[0]:box[1],box[2]:box[3]]
         x = np.dot(x[...,:3], [0.2989, 0.5870, 0.1140])
         return x
+
+def write(frame_log:BinaryIO, logo:tuple) -> None:
+    import struct
+    if logo:
+        frame_log.write(struct.pack('IIIII', logo[3], logo[0][0], logo[0][1], logo[1][0], logo[1][1]))
+        logo[2].astype('uint8').tofile(frame_log)
+    else:
+        frame_log.write(struct.pack('IIIII', 0, 0, 0, 0, 0))
+
+def read(log_in:BinaryIO) -> tuple|None:
+    import struct
+    info = struct.unpack('IIIII', log_in.read(20))
+    if not info[0]:
+        return None
+    shape = ((info[3] - info[1]), (info[4] - info[2]))
+    data = np.fromfile(log_in, 'uint8', shape[0]*shape[1], '')
+    data.shape = shape
+    return ((info[1], info[2]), (info[3], info[4]), data, info[0])

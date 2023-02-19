@@ -7,23 +7,25 @@ def get_options():
 
     parser.add_option('-f', '--file', dest="filename", type='string',
                         help="Video input file name")
-    parser.add_option('-d', '--frame-data', dest="frame_log", type='string',
-                        help="Output location of frame data log. If a video file is processed then this file will be overwritten.")
-    parser.add_option('-r', '--reprocess', dest="reprocess_file", type='string', 
-                        help="Input location of frame data log to be reprocessed.")
+    parser.add_option('--feature-log', dest="feature_log", type='string',
+                        help="Output location of feature log. If a video file is processed then this file will be overwritten. Defaults to video base name + .feat")
+    parser.add_option('--no-log', dest="no_feature_log", action='store_true',
+                        help="Use a temporary file for the feature log and don't persist it anywhere.")
+    parser.add_option('-r', '--reprocess', dest="reprocess", type='string', 
+                        help="Input location of feature data log to be reprocessed.")
     parser.add_option('-q', '--quiet', dest='quiet', action='store_true',
-                        help="Do not print status information during processing")
+                        help="Do not print progress during processing")
     parser.add_option('--loglevel', dest='loglevel', type='string',
                         help="Python logger's logging level")
     parser.add_option('--yaml', dest='yaml', type='string',
                         help="Pull configuration from a yaml file and overwrite commandline configuration and default with that.")
     
-    logo = parser.add_option_group(title="Logo Search")
-    logo.add_option('--no-logo', dest='no_logo', type='store_true', 
+    logo = optparse.OptionGroup(parser, 'Logo Search')
+    logo.add_option('--no-logo', dest='no_logo', action='store_true', 
                     help="Disable logo searching")
     logo.add_option('--skip', dest="logo_skip", type="int", default=4,
                     help="Only search every Nth frame during the logo search phase.  (Speeds up searching at a slight cost to accuracy.)")
-    
+    parser.add_option_group(logo)
     return parser
 
 def parse_yaml(filename:str):

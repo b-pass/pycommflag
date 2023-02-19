@@ -47,8 +47,8 @@ class Player:
             self.graph = None
         self.frame_rate = self.container.streams.video[0].average_rate
     
-    def seek(self, seconds:float):
-        self.container.seek(int(seconds / av.time_base))
+    def seek(self, seconds:float, **kwargs):
+        self.container.seek(int(seconds / av.time_base), **kwargs)
         self._flush()
     
     def enable_audio(self, stream=0):
@@ -56,7 +56,7 @@ class Player:
         self._flush()
         self.vt_start = self.container.streams.video[self.streams['video']].start_time * self.container.streams.video[self.streams['video']].time_base
         self.at_start = self.container.streams.audio[self.streams['audio']].start_time * self.container.streams.video[self.streams['audio']].time_base
-        
+    
     def disable_audio(self):
         if 'audio' in self.streams:
             del self.streams['audio']
