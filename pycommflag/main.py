@@ -19,4 +19,4 @@ def run(opts:Any) -> None:
         feature_log = opts.feature_log
     
     processor.process_video(opts.filename, feature_log, opts)
-    processor.process_features(feature_log, feature_log, opts)
+    return processor.process_features(feature_log, feature_log, opts)

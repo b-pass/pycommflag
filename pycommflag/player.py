@@ -26,14 +26,14 @@ class Player:
                 ninter += 1
             if inter+ninter >= 360:
                 break
-        self.container.seek(0)
+        self.container.seek(self.container.streams.video[0].start_time, stream=self.container.streams.video[0])
         
         #f = next(self.container.decode(video=0))
         self.shape = (f.height, f.width)
 
         if inter*4 > ninter and not no_deinterlace:
             self.interlaced = True
-            log.debug(f"{inter} interlaced frames and {ninter}, means we will deinterlace.")
+            log.debug(f"{inter} interlaced frames (and {ninter} not), means we will deinterlace.")
             self.graph = av.filter.Graph()
             buffer = self.graph.add_buffer(template=self.container.streams.video[0])
             bwdif = self.graph.add("yadif", "")
@@ -45,11 +45,24 @@ class Player:
             log.debug(f"We will NOT deinterlace (had {inter} interlaced frames and {ninter} non-interlaced frames)")
             self.interlaced = False
             self.graph = None
-        self.frame_rate = self.container.streams.video[0].average_rate
+        self.frame_rate = float(self.container.streams.video[0].average_rate)
+        self.vt_start = self.container.streams.video[0].start_time * self.container.streams.video[0].time_base
+        log.debug(f"Video {filename} is {self.shape} at {self.frame_rate} fps")
     
-    def seek(self, seconds:float, **kwargs):
-        self.container.seek(int(seconds / av.time_base), **kwargs)
+    def seek(self, seconds:float):
+        vs = self.container.streams.video[self.streams.get('video', 0)]
+        if seconds <= 0.1:
+            self.container.seek(vs.start_time, stream=vs, any_frame=True)
+        else:
+            self.container.seek(int(seconds / vs.time_base) + vs.start_time, stream=vs)
         self._flush()
+
+    def seek_exact(self, seconds:float)->tuple|None:
+        self.seek(seconds)
+        for f in self.frames():
+            if f[0].time + 1/self.frame_rate > seconds:
+                return f
+        return None
     
     def enable_audio(self, stream=0):
         self.streams['audio'] = stream
@@ -63,6 +76,8 @@ class Player:
         self.aq = None
 
     def _queue_audio(self, af):
+        if self.aq is None:
+            return
         d = af.to_ndarray()
         if d.dtype.kind != 'f':
             d = d.astype('float32') / 32767.0
@@ -80,8 +95,9 @@ class Player:
             d = d[:6,...]
         #print("AQ:",d.shape,af.time-self.at_start,af.sample_rate)
         self.aq.append((d,af.time-self.at_start,af.sample_rate))
+        assert(self.aq[0][1] <= self.aq[-1][1])
 
-    def _get_audioi_peaks(self, end):
+    def _get_audio_peaks(self, end):
         if not self.aq:
             return None
         
@@ -89,8 +105,9 @@ class Player:
             return None
         
         #print(len(self.aq), end, end - self.aq[0][1], "t=", self.aq[0][1], self.aq[0][2])
-        need = end - self.aq[0][1] if end else 1.0
-        assert(need >= 0)
+        need = (end - self.aq[0][1]) if end else 1.0
+        if need <= 0:
+            return np.zeros((6,1))
         
         peaks = []
         while self.aq and need > 0:
@@ -108,7 +125,7 @@ class Player:
             need -= nsamp/sr
             peaks.append(np.max(np.abs(d), axis=1))
         
-        return np.max(peaks, axis=0) if peaks else None
+        return np.max(peaks, axis=0) if peaks else np.zeros((6,1))
 
     def _flush(self):
         if self.graph:
@@ -139,13 +156,13 @@ class Player:
                 else:
                     yield (frame,None)
             if len(self.vq) > 1:
-                af = self._get_audioi_peaks(self.vq[1].time - self.vt_start)
+                af = self._get_audio_peaks(self.vq[1].time - self.vt_start)
                 if af is None:
                     continue
                 vf = self.vq.pop(0)
                 yield (vf,af)
         while self.vq:
-            af = self._get_audioi_peaks(self.vq[1].time - self.vt_start if len(self.vq) > 1 else None)
+            af = self._get_audio_peaks(self.vq[1].time - self.vt_start if len(self.vq) > 1 else None)
             vf = self.vq.pop(0)
             yield (vf,af)
         return #raise StopIteration()

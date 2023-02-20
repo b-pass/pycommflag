@@ -1,3 +1,4 @@
-*.cff
+*.feat
+*.gz
 *.xz
 **/__pycache__

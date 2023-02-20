@@ -1,5 +1,6 @@
 import logging as log
 import struct
+import sys
 import os
 import numpy as np
 import math
@@ -7,18 +8,20 @@ import time
 
 from typing import Any, Union, BinaryIO
 
-from .player import Player
 from . import logo_finder
+from .player import Player
+from .scene import Scene
 
 def process_video(video_filename:str, feature_log:Union[str,BinaryIO], opts:Any=None) -> None:
     logo = None
     if type(feature_log) is str:
-        if os.path.exists(feature_log):
+        if os.path.exists(feature_log) and not opts.no_logo:
             with open(feature_log, 'r+b') as tfl:
                 tfl.seek(12)
-                if tfl.tell() > 0:
-                    if not opts.quiet: print(f"{opts.feature_log} exists, re-using logo")
+                if tfl.tell() == 12:
                     logo = logo_finder.read(tfl)
+                    if logo and not opts.quiet:
+                        print(f"{feature_log} exists, re-using logo ", logo[0], logo[1])
         feature_log = open(feature_log, 'w+b')
     
     player = Player(video_filename)
@@ -26,14 +29,13 @@ def process_video(video_filename:str, feature_log:Union[str,BinaryIO], opts:Any=
     if opts.no_logo:
         logo = None
     elif logo is not None:
-        print(logo)
         pass
     else:
        logo = logo_finder.search(player, search_seconds=600 if player.duration <= 3700 else 900, opts=opts)
     
     player.seek(0)
     player.enable_audio()
-    player.seek(0, any_frame=False)
+    player.seek(0)
 
     # not doing format/aspect because everything is widescreen all the time now (that was very early '00s)
     # except ultra wide screen movies, and sometimes ultra-wide commercials?
@@ -140,8 +142,10 @@ def process_features(log_in:Union[str,BinaryIO], log_out:Union[str,BinaryIO], op
     logo = logo_finder.read(log_in)
     
     fprev = 0
-    prev_blank = True
-    prev_col = None
+    column = None
+    scenes = []
+    scene = None
+    blanks = []
     while True:
         d = log_in.read(4)
         if len(d) < 4:
@@ -151,35 +155,111 @@ def process_features(log_in:Union[str,BinaryIO], log_out:Union[str,BinaryIO], op
             log.error(f'Bad frame number {fnum} (expected > {fprev})')
         if fnum == 0xFFFFFFFF:
             break
+        
         fprev = fnum
+        prev_col = column
 
         (ftime, logo_present, frame_blank, scene_change, depth, h, w, alen) = struct.unpack('f???BIII', log_in.read(20))
         column = np.fromfile(log_in, 'uint8', depth*h*w, '').astype('int16')
         peaks = np.fromfile(log_in, 'float32', alen, '')
 
         column.shape = (h,w,depth)
+
+        if frame_blank:
+            scene_change = True
+            prev_sc = False
+            blanks.append((ftime, column, peaks, logo_present))
+            continue
+
+        if blanks:
+            if scene is not None:
+                piv = min(math.ceil(len(blanks)/2), 60)
+                for x in blanks[:piv]:
+                    scene += x
+                scene.finish(end_blank=True)
+                scenes.append(scene)
+            else:
+                piv = 0
+            if piv < len(blanks):
+                scene = Scene(*blanks[piv], start_blank=True)
+                for x in blanks[piv+1:]:
+                    scene += x
+                scene += (ftime, column, peaks, logo_present)
+            else:
+                scene = Scene(ftime, column, peaks, logo_present, start_blank=True)
+            blanks = []
+            prev_sc = False
+            scene_change = False
+            continue
         
-        if prev_col is None or frame_blank or prev_blank:
+        if prev_col is None:
             scene_change = True
         else:
             diff = column - prev_col
-            s = np.std(diff, (0))
-            if max(s) >= 8:
+            scm = np.mean(np.std(np.abs(diff), (0)))
+            if scm >= 12 or (scm >= 10 and prev_sc):
                 scene_change = True
             else:
                 scene_change = False
-        prev_col = column
-        prev_blank = frame_blank
-
-        #if not quiet: print('B' if frame_blank else 'S' if scene_change else '_', end='')
+        
+        if scene is not None and (not scene_change or prev_sc or len(scene) < 4):
+            scene += (ftime, column, peaks, logo_present)
+        else:
+            if scene is not None:
+                scene.finish(ftime)
+                scenes.append(scene)
+            scene = Scene(ftime, column, peaks, logo_present)
+        prev_sc = scene_change
     
-    if log_in != log_out:
+    scene.finish(end_blank=True)
+    scenes.append(scene)
+
+    if log_in != log_out and log_out:
         n = log_in.tell()
         log_in.seek(0)
         while n > 0:
             w = min(n, 1048576)
             log_out.write(log_in.read(w))
             n -= w
-    log_out.seek(0, 2)
+    if log_out:
+        log_out.seek(0, 2)
+    
+    temp = open('/tmp/scenes', 'w')
+    temp.write(f'{len(scenes)}')
+    for s in scenes:
+        s.write_txt(temp)
+    
+    vbc = []
+    temp.write('\n\n')
+    m = []
+    for ai in range(4,len(scenes)):
+        a = scenes[ai]
+        r = []
+        for bi in range(ai-4,ai):
+            b = scenes[bi]
+            
+            diff = a.barcode.astype('int16') - b.barcode
+            x = np.mean(np.std(diff, (0)))
+            r.append(x)
+            #temp.write("%-7.03f "%(np.max(s)))
+        temp.write(str(ai) + ": ")
+        temp.write(str(r))
+        temp.write('\n')
+
+        vbc.append(a.barcode.reshape(-1, 1, 3))
+
+    #full_img = Image.fromarray(full_array, "RGB")
+
+    temp.write('\n\n')
+    temp.close()
+
+    vbc = np.hstack(vbc)
+
+    import matplotlib.pyplot as plt
+    fig = plt.figure()
+    plt.gray()
+    ax1 = fig.add_subplot(121) 
+    ax1.imshow(vbc)
+    plt.show()
     
     print("Done reading")

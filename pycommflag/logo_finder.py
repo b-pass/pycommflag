@@ -140,7 +140,10 @@ def write(frame_log:BinaryIO, logo:tuple) -> None:
 
 def read(log_in:BinaryIO) -> tuple|None:
     import struct
-    info = struct.unpack('IIIII', log_in.read(20))
+    buf = log_in.read(20)
+    if len(buf) == 0:
+        return None
+    info = struct.unpack('IIIII', buf)
     if not info[0]:
         return None
     shape = ((info[3] - info[1]), (info[4] - info[2]))
