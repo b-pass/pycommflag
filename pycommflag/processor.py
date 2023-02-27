@@ -246,9 +246,12 @@ def process_features(log_in:Union[str,BinaryIO], log_out:Union[str,BinaryIO], op
         temp.write(str(r))
         temp.write('\n')
 
-        vbc.append(a.barcode.reshape(-1, 1, 3))
-
-    #full_img = Image.fromarray(full_array, "RGB")
+        x = a.barcode.astype('uint8').reshape(-1, 1, 3)
+        if a.start_blank:
+            vbc.append(np.zeros(x.shape, dtype='uint8'))
+        vbc.append(x)
+        if a.end_blank:
+            vbc.append(np.zeros(x.shape, dtype='uint8'))
 
     temp.write('\n\n')
     temp.close()
@@ -258,7 +261,7 @@ def process_features(log_in:Union[str,BinaryIO], log_out:Union[str,BinaryIO], op
     import matplotlib.pyplot as plt
     fig = plt.figure()
     plt.gray()
-    ax1 = fig.add_subplot(121) 
+    ax1 = fig.add_subplot() 
     ax1.imshow(vbc)
     plt.show()
     
