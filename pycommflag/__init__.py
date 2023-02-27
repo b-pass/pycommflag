@@ -10,5 +10,5 @@ This utility can be run directly, or can be integrated into other
 applications as a python module.
 """
 
-from . import logo_finder, options, processor
+from . import logo_finder, options, processor, gui
 from .player import Player

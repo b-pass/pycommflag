@@ -13,6 +13,8 @@ def get_options():
                         help="Use a temporary file for the feature log and don't persist it anywhere.")
     parser.add_option('-r', '--reprocess', dest="reprocess", type='string', 
                         help="Input location of feature data log to be reprocessed.")
+    parser.add_option('-g', '--gui', dest='gui', action='store_true', 
+                        help="Enable GUI editing.  Must also supply --file and --feature-log for the thing being edited in the GUI.")
     parser.add_option('-q', '--quiet', dest='quiet', action='store_true',
                         help="Do not print progress during processing")
     parser.add_option('--loglevel', dest='loglevel', type='string',
@@ -26,6 +28,7 @@ def get_options():
     logo.add_option('--skip', dest="logo_skip", type="int", default=4,
                     help="Only search every Nth frame during the logo search phase.  (Speeds up searching at a slight cost to accuracy.)")
     parser.add_option_group(logo)
+    
     return parser
 
 def parse_yaml(filename:str):

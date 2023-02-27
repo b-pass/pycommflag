@@ -2,8 +2,9 @@ from typing import Any
 import os
 import tempfile
 from . import processor
+from . import gui
 
-def run(opts:Any) -> None:
+def run(opts:Any) -> None|int:
     if opts.reprocess:
         return processor.process_features(opts.reprocess, opts.feature_log, opts)
     
@@ -17,6 +18,10 @@ def run(opts:Any) -> None:
         feature_log = tempfile.gettempdir() + os.path.sep + 'cf_'+os.path.basename(opts.filename)+'.feat'
     else:
         feature_log = opts.feature_log
+    
+    if opts.gui:
+        w = gui.Window(video=opts.filename, log=feature_log)
+        return w.run()
     
     processor.process_video(opts.filename, feature_log, opts)
     return processor.process_features(feature_log, feature_log, opts)

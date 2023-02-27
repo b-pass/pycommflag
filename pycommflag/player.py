@@ -140,6 +140,7 @@ class Player:
 
     def frames(self) -> iter:
         for frame in self.container.decode(**self.streams):
+            #print(frame, frame.time)
             if type(frame) is av.AudioFrame:
                 self._queue_audio(frame)
             elif type(frame) is av.VideoFrame:
