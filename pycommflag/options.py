@@ -27,6 +27,8 @@ def get_options():
                     help="Disable logo searching")
     logo.add_option('--skip', dest="logo_skip", type="int", default=4,
                     help="Only search every Nth frame during the logo search phase.  (Speeds up searching at a slight cost to accuracy.)")
+    logo.add_option('--dont-check-blanks', dest="blank_no_logo", action="store_true",
+                    help="Allow logo to appear on \"blank\" frames")
     parser.add_option_group(logo)
     
     return parser

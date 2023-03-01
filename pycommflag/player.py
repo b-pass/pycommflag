@@ -45,9 +45,9 @@ class Player:
             log.debug(f"We will NOT deinterlace (had {inter} interlaced frames and {ninter} non-interlaced frames)")
             self.interlaced = False
             self.graph = None
-        self.frame_rate = float(self.container.streams.video[0].average_rate)
+        self.frame_rate = self.container.streams.video[0].average_rate
         self.vt_start = self.container.streams.video[0].start_time * self.container.streams.video[0].time_base
-        log.debug(f"Video {filename} is {self.shape} at {self.frame_rate} fps")
+        log.debug(f"Video {filename} is {self.shape} at {float(self.frame_rate)} fps")
     
     def seek(self, seconds:float):
         vs = self.container.streams.video[self.streams.get('video', 0)]
@@ -58,9 +58,24 @@ class Player:
         self._flush()
 
     def seek_exact(self, seconds:float)->tuple|None:
-        self.seek(seconds)
+        orig_ask = seconds
+        vs = self.container.streams.video[self.streams.get('video', 0)]
+        while True:
+            if seconds <= 0.1:
+                self.container.seek(vs.start_time, stream=vs, any_frame=True, backward=True)
+                break
+            else:
+                self.container.seek(int(seconds / vs.time_base) + vs.start_time, stream=vs, backward=True)
+                f = next(self.frames())
+                if (f[0].time - self.vt_start) > orig_ask:
+                    seconds -= 0.25
+                elif (f[0].time + 1/self.frame_rate - self.vt_start) < orig_ask:
+                    break
+                else:
+                    return f
+
         for f in self.frames():
-            if f[0].time + 1/self.frame_rate > seconds:
+            if (f[0].time + 1/self.frame_rate - self.vt_start) > orig_ask:
                 return f
         return None
     

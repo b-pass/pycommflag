@@ -150,3 +150,12 @@ def read(log_in:BinaryIO) -> tuple|None:
     data = np.fromfile(log_in, 'uint8', shape[0]*shape[1], '')
     data.shape = shape
     return ((info[1], info[2]), (info[3], info[4]), data, info[0])
+
+def subtract(data:np.ndarray, logo:tuple)->np.ndarray:
+    if logo is None:
+        return data
+    
+    data = np.copy(data)
+    ((top,left),(bottom,right),lmask,thresh) = logo
+    data[top:bottom,left:right] = 0
+    return data

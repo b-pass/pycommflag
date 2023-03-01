@@ -15,6 +15,8 @@ class Scene:
         self.logo_count = 1 if logo_present else 0
         self.start_blank = start_blank
         self.end_blank = False
+        self.start_break = False
+        self.end_break = False
     
     def __iadd__(self, tup:tuple[float,np.ndarray,np.ndarray,bool]):
         assert(not self.finished)

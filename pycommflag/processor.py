@@ -66,11 +66,15 @@ def process_video(video_filename:str, feature_log:Union[str,BinaryIO], opts:Any=
 
         fcolor = frame.to_ndarray(format="rgb24", height=720, width=frame.width*(720/frame.height))
         
-        # trying to be fast, just look at the middle 1/4 for the blank checking
+        # trying to be fast, just look at the middle 1/4 for blank-ish-ness and then verify with the full frame
         x = np.max(fcolor[int(fcolor.shape[0]*3/8):int(fcolor.shape[0]*5/8)])
-        if x < 96:
-            m = np.median(fcolor, (0,1))
-            frame_blank = max(m) < 32 and np.std(m) < 3 and np.std(fcolor) < 10
+        if x < 64:
+            blank = fcolor
+            if opts.blank_no_logo:
+                blank = logo_finder.subtract(blank, logo)
+            m = np.median(blank, (0,1))
+            frame_blank = max(m) < 24 and np.std(m) < 3 and np.std(blank) < 5
+            blank = None
         else:
             frame_blank = False
 
@@ -266,3 +270,94 @@ def process_features(log_in:Union[str,BinaryIO], log_out:Union[str,BinaryIO], op
     plt.show()
     
     print("Done reading")
+
+def process_scenes(log_in:Union[str,BinaryIO], opts:Any=None) -> list[tuple[float,float]]:
+    if type(log_in) is str:
+        with open(log_in, 'r+b') as fd:
+            return process_scenes(fd)
+
+    print("Reading feature log...")
+    log_in.seek(0)
+
+    (ver,duration,frame_rate) = struct.unpack('@Iff', log_in.read(12))
+    if ver > 256:
+        raise RuntimeError("Wrong endianness in feature log data.")
+    
+    logo = logo_finder.read(log_in)
+    
+    fprev = 0
+    column = None
+    scenes = []
+    scene = None
+    blanks = []
+    while True:
+        d = log_in.read(4)
+        if len(d) < 4:
+            break
+        (fnum,) = struct.unpack('I', d)
+        if fnum <= fprev:
+            log.error(f'Bad frame number {fnum} (expected > {fprev})')
+        if fnum == 0xFFFFFFFF:
+            break
+        
+        fprev = fnum
+        prev_col = column
+
+        (ftime, logo_present, frame_blank, scene_change, depth, h, w, alen) = struct.unpack('f???BIII', log_in.read(20))
+        column = np.fromfile(log_in, 'uint8', depth*h*w, '').astype('int16')
+        peaks = np.fromfile(log_in, 'float32', alen, '')
+
+        column.shape = (h,w,depth)
+
+        if frame_blank:
+            scene_change = True
+            prev_sc = False
+            blanks.append((ftime, column, peaks, logo_present))
+            continue
+
+        if blanks:
+            if scene is not None:
+                piv = min(math.ceil(len(blanks)/2), 60)
+                for x in blanks[:piv]:
+                    scene += x
+                scene.finish(end_blank=True)
+                scenes.append(scene)
+            else:
+                piv = 0
+            if piv < len(blanks):
+                scene = Scene(*blanks[piv], start_blank=True)
+                for x in blanks[piv+1:]:
+                    scene += x
+                scene += (ftime, column, peaks, logo_present)
+            else:
+                scene = Scene(ftime, column, peaks, logo_present, start_blank=True)
+            blanks = []
+            prev_sc = False
+            scene_change = False
+            continue
+        
+        if prev_col is None:
+            scene_change = True
+        else:
+            diff = column - prev_col
+            scm = np.mean(np.std(np.abs(diff), (0)))
+            if scm >= 12 or (scm >= 10 and prev_sc):
+                scene_change = True
+            else:
+                scene_change = False
+        
+        if scene is not None and (not scene_change or prev_sc or len(scene) < 4):
+            scene += (ftime, column, peaks, logo_present)
+        else:
+            if scene is not None:
+                scene.finish(ftime)
+                scenes.append(scene)
+            scene = Scene(ftime, column, peaks, logo_present)
+        prev_sc = scene_change
+    
+    scene.finish(end_blank=True)
+    scenes.append(scene)
+
+    print("Done reading, got",len(scenes),"scenes in",fprev,"frames")
+
+    return scenes
