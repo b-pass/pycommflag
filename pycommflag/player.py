@@ -6,8 +6,8 @@ import numpy as np
 class Player:
     def __init__(self, filename:str, no_deinterlace:bool=False):
         self.container = av.open(filename)
-        self.container.flags |= av.container.core.Flags.GENPTS
-        self.container.flags |= av.container.core.Flags.DISCARD_CORRUPT
+        self.container.gen_pts = True
+        self.container.discard_corrupt = True
         self.container.streams.video[0].thread_type = "AUTO"
         #self.container.streams.video[0].thread_count = 4
         self.container.streams.audio[0].thread_type = "AUTO"
@@ -19,16 +19,20 @@ class Player:
 
         inter = 0
         ninter = 0
-        for f in self.container.decode(video=0):
-            if f.interlaced_frame:
-                inter += 1
-            else:
-                ninter += 1
-            if inter+ninter >= 360:
-                break
+        f = None
+        try:
+            for f in self.container.decode(video=0):
+                if f.interlaced_frame:
+                    inter += 1
+                else:
+                    ninter += 1
+                if inter+ninter >= 360:
+                    break
+        except Exception as e:
+            log.warn("Decode failure: " + str(e))
+        
         self.container.seek(self.container.streams.video[0].start_time, stream=self.container.streams.video[0])
         
-        #f = next(self.container.decode(video=0))
         self.shape = (f.height, f.width)
 
         if inter*4 > ninter and not no_deinterlace:
@@ -47,26 +51,41 @@ class Player:
             self.graph = None
         self.frame_rate = self.container.streams.video[0].average_rate
         self.vt_start = self.container.streams.video[0].start_time * self.container.streams.video[0].time_base
+        self.vt_pos = self.vt_start
         log.debug(f"Video {filename} is {self.shape} at {float(self.frame_rate)} fps")
     
     def seek(self, seconds:float):
+        if seconds > self.duration:
+            seconds = self.duration
         vs = self.container.streams.video[self.streams.get('video', 0)]
         if seconds <= 0.1:
+            self.vt_pos = vs.start_time
             self.container.seek(vs.start_time, stream=vs, any_frame=True)
         else:
-            self.container.seek(int(seconds / vs.time_base) + vs.start_time, stream=vs)
+            time = int(seconds / vs.time_base) + vs.start_time
+            self.vt_pos = time
+            self.container.seek(time, stream=vs)
         self._flush()
 
     def seek_exact(self, seconds:float)->tuple|None:
+        if seconds > self.duration:
+            seconds = self.duration
         orig_ask = seconds
         vs = self.container.streams.video[self.streams.get('video', 0)]
         while True:
             if seconds <= 0.1:
+                self.vt_pos = vs.start_time
                 self.container.seek(vs.start_time, stream=vs, any_frame=True, backward=True)
                 break
             else:
-                self.container.seek(int(seconds / vs.time_base) + vs.start_time, stream=vs, backward=True)
-                f = next(self.frames())
+                time = int(seconds / vs.time_base) + vs.start_time
+                self.vt_pos = time
+                self.container.seek(time, stream=vs, backward=True)
+                try:
+                    f = next(self.frames())
+                except StopIteration:
+                    seconds -= 0.25
+                    continue
                 if (f[0].time - self.vt_start) > orig_ask:
                     seconds -= 0.25
                 elif (f[0].time + 1/self.frame_rate - self.vt_start) < orig_ask:
@@ -77,7 +96,7 @@ class Player:
         for f in self.frames():
             if (f[0].time + 1/self.frame_rate - self.vt_start) > orig_ask:
                 return f
-        return None
+        return (None,None)
     
     def enable_audio(self, stream=0):
         self.streams['audio'] = stream
@@ -110,7 +129,9 @@ class Player:
             d = d[:6,...]
         #print("AQ:",d.shape,af.time-self.at_start,af.sample_rate)
         self.aq.append((d,af.time-self.at_start,af.sample_rate))
-        assert(self.aq[0][1] <= self.aq[-1][1])
+        if len(self.aq) > 1 and self.aq[-2][1] > self.aq[-1][1]:
+            # out of order PTS, should never happen...
+            self.aq = sorted(self.aq, key=lambda x:x[1])
 
     def _get_audio_peaks(self, end):
         if not self.aq:
@@ -138,7 +159,9 @@ class Player:
                 self.aq[0] = (d[..., nsamp:], t+nsamp/sr, sr)
                 d = d[..., 0:nsamp]
             need -= nsamp/sr
-            peaks.append(np.max(np.abs(d), axis=1))
+            m = np.max(np.abs(d), axis=1)
+            m.resize((6,),refcheck=False)
+            peaks.append(m)
         
         return np.max(peaks, axis=0) if peaks else np.zeros((6,1))
 
@@ -154,7 +177,29 @@ class Player:
         self.aq = [] if 'audio' in self.streams else None
 
     def frames(self) -> iter:
-        for frame in self.container.decode(**self.streams):
+        fail = 0
+        vs = self.container.streams.video[self.streams.get('video', 0)]
+        iter = self.container.decode(**self.streams)
+        while True:
+            try:
+                frame = next(iter)
+                if fail:
+                    log.debug(f"Resync'd after {fail} skipped/dropped/corrupt/whatever frames")
+                    fail = 0
+            except StopIteration:
+                break
+            except av.error.InvalidDataError as e:
+                if fail%100 == 0:
+                    if fail >= 10000:
+                        log.critical(f"Repeated InvalidDataError, skipped {fail} frames but found nothing good")
+                        break
+                    log.debug(f"InvalidDataError during decode -- seeking ahead #{fail}")
+                fail += 1
+                self.vt_pos = int(self.vt_pos + (1/self.frame_rate)/vs.time_base)
+                self.container.seek(self.vt_pos, stream=vs, any_frame=True, backward=False)
+                self._flush()
+                iter = self.container.decode(**self.streams)
+                continue
             #print(frame, frame.time)
             if type(frame) is av.AudioFrame:
                 self._queue_audio(frame)
@@ -167,6 +212,7 @@ class Player:
                         if e.errno != errno.EAGAIN:
                             raise
                         continue
+                self.vt_pos = frame.time
                 if self.aq is not None:
                     self.vq.append(frame)
                 else:

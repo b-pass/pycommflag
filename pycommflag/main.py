@@ -1,15 +1,25 @@
 from typing import Any
 import os
+import sys
 import tempfile
 from . import processor
 from . import gui
+from . import mythtv
 
 def run(opts:Any) -> None|int:
+    if opts.rebuild:
+        sys.exit(os.execvp("mythcommflag", ["mythcommflag", "--rebuild", "--chanid", opts.chanid, "--starttime", opts.starttime]))
+    if opts.queue:
+        sys.exit(os.execvp("mythcommflag", ["mythcommflag", "--queue", "--chanid", opts.chanid, "--starttime", opts.starttime]))
+    
     if opts.reprocess:
         return processor.process_features(opts.reprocess, opts.feature_log, opts)
     
+    if opts.chanid and opts.starttime:
+        opts.filename = mythtv.get_filename(opts.chanid, opts.starttime)
+
     if not opts.filename:
-        print('Either reprocess or video file are required')
+        print('No file to work on (need one of: -f, -r, --chanid, etc)')
         return 1
 
     if opts.gui:

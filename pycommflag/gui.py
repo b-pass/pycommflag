@@ -118,6 +118,8 @@ class Window(tk.Tk):
         self.info = tk.Label(self, text=f'File: {video}; Length:{self.player.duration/60.0:0.1f} mins; {float(self.player.frame_rate)} fps')
         self.info.grid(row=7, column=0, sticky="se", columnspan=5)
 
+        # TODO: add a little display of the logo we found.
+
         self.images = [ImageTk.PhotoImage(Image.new("RGB", (320,180))), ImageTk.PhotoImage(Image.new("RGB", (640,360)))]
         for v in range(len(self.video_labels)):
             self.video_labels[v].configure(image=self.images[0 if v != 2 else 1])
@@ -171,7 +173,9 @@ class Window(tk.Tk):
         
         (f,_) = self.player.seek_exact(min(max(0, seconds - 10/self.player.frame_rate), self.player.duration - 5/self.player.frame_rate))
         
-        frames = [f]
+        frames = []
+        if f is not None:
+            frames.append(f)
         for (f,_) in self.player.frames():
             frames.append(f)
             if len(frames) > 1 and (f.time - self.player.vt_start) > seconds and (frames[-2].time - self.player.vt_start) >= seconds:
@@ -187,9 +191,9 @@ class Window(tk.Tk):
             self.next_frame_time = frames[-1].time - self.player.vt_start
             self.images[3] = ImageTk.PhotoImage(frames[-1].to_image(height=180,width=320))
         
-        s = self.player.seek_exact(seconds + 5)
-        if s is not None:
-            self.images[4] = ImageTk.PhotoImage(s[0].to_image(height=180,width=320))
+        (f,_) = self.player.seek_exact(seconds + 5)
+        if f is not None:
+            self.images[4] = ImageTk.PhotoImage(f.to_image(height=180,width=320))
         
         self.pos_label.configure(text=f'{int(self.position/60):02}:{self.position%60:06.03f}')
 

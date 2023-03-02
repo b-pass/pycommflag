@@ -27,10 +27,21 @@ def get_options():
                     help="Disable logo searching")
     logo.add_option('--skip', dest="logo_skip", type="int", default=4,
                     help="Only search every Nth frame during the logo search phase.  (Speeds up searching at a slight cost to accuracy.)")
-    logo.add_option('--dont-check-blanks', dest="blank_no_logo", action="store_true",
-                    help="Allow logo to appear on \"blank\" frames")
+    #logo.add_option('--check-blanks', dest="blanks_check_logo", action="store_true",
+    #                help="Include logo area when checking for blank frames (tends towards not marking frames blank if they have logo)")
     parser.add_option_group(logo)
     
+    mcf = optparse.OptionGroup(parser, 'MythTV Options', description="Commandline compatibility with mythcommflag")
+    mcf.add_option('--chanid', dest='chanid', type='int', 
+                    help="Channel ID of recording")
+    mcf.add_option('--starttime', dest="starttime",
+                    help="Start timestamp of recording")
+    mcf.add_option('--queue', dest="queue", action="store_true",
+                    help="Insert a job into the mythtv job queue")
+    mcf.add_option('--rebuild', dest="rebuild", action="store_true",
+                    help="Rebuild seek table (this just runs mythcommflag directly to do this)")
+    parser.add_option_group(mcf)
+
     return parser
 
 def parse_yaml(filename:str):

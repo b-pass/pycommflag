@@ -1,4 +1,8 @@
 *.feat
 *.gz
 *.xz
+*.ts
+*.mp4
+*.m4v
 **/__pycache__
+perf.data*

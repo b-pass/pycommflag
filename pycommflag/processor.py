@@ -69,12 +69,8 @@ def process_video(video_filename:str, feature_log:Union[str,BinaryIO], opts:Any=
         # trying to be fast, just look at the middle 1/4 for blank-ish-ness and then verify with the full frame
         x = np.max(fcolor[int(fcolor.shape[0]*3/8):int(fcolor.shape[0]*5/8)])
         if x < 64:
-            blank = fcolor
-            if opts.blank_no_logo:
-                blank = logo_finder.subtract(blank, logo)
-            m = np.median(blank, (0,1))
-            frame_blank = max(m) < 24 and np.std(m) < 3 and np.std(blank) < 5
-            blank = None
+            m = np.median(fcolor, (0,1))
+            frame_blank = max(m) < 24 and np.std(m) < 3 and np.std(fcolor) < 6
         else:
             frame_blank = False
 
@@ -177,7 +173,7 @@ def process_features(log_in:Union[str,BinaryIO], log_out:Union[str,BinaryIO], op
 
         if blanks:
             if scene is not None:
-                piv = min(math.ceil(len(blanks)/2), 60)
+                piv = int(min(math.ceil(len(blanks)/2), 60))
                 for x in blanks[:piv]:
                     scene += x
                 scene.finish(end_blank=True)
@@ -215,8 +211,9 @@ def process_features(log_in:Union[str,BinaryIO], log_out:Union[str,BinaryIO], op
             scene = Scene(ftime, column, peaks, logo_present)
         prev_sc = scene_change
     
-    scene.finish(end_blank=True)
-    scenes.append(scene)
+    if scene:
+        scene.finish(end_blank=True)
+        scenes.append(scene)
 
     if log_in != log_out and log_out:
         n = log_in.tell()
