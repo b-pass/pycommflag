@@ -3,7 +3,7 @@ import av
 import numpy as np
 
 class Scene:
-    def __init__(self,ftime:float,column:np.ndarray,audio:np.ndarray,logo_present:bool,start_blank:bool=False):
+    def __init__(self,ftime:float,column:np.ndarray,audio:np.ndarray,logo_present:bool,is_blank:bool=False):
         self.finished = False
         self.start_time = ftime
         self.stop_time = ftime
@@ -13,10 +13,8 @@ class Scene:
         self.peak_peaks = audio
         self.valley_peaks = audio
         self.logo_count = 1 if logo_present else 0
-        self.start_blank = start_blank
-        self.end_blank = False
-        self.start_break = False
-        self.end_break = False
+        self.is_blank = is_blank
+        self.is_break = False
     
     def __iadd__(self, tup:tuple[float,np.ndarray,np.ndarray,bool]):
         assert(not self.finished)
@@ -29,12 +27,10 @@ class Scene:
         if tup[3]: self.logo_count += 1
         return self
     
-    def finish(self, next_frame_time:float=None, end_blank=False):
+    def finish(self, next_frame_time:float=None):
         assert(not self.finished)
         if next_frame_time:
             self.stop_time = max(self.stop_time, next_frame_time)
-        if end_blank:
-            self.end_blank = True
         self.barcode = (self.barcode / self.frame_count).astype('uint8')
         self.avg_peaks = (self.avg_peaks / self.frame_count).astype('float32')
         self.logo = self.logo_count / self.frame_count 
@@ -45,6 +41,13 @@ class Scene:
         s = np.std(self.barcode.astype('int16') - other.barcode, (0))
         return max(s)
     
+    @property
+    def middle_time(self):
+        if self.frame_count > 2:
+            return self.start_time + (self.stop_time - self.start_time)/2
+        else:
+            return self.start_time
+
     def __len__(self):
         return self.frame_count
 

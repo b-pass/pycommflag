@@ -5,9 +5,10 @@ import numpy as np
 
 class Player:
     def __init__(self, filename:str, no_deinterlace:bool=False):
-        self.container = av.open(filename)
+        self.filename = filename
+        self.container = av.open(self.filename)
         self.container.gen_pts = True
-        self.container.discard_corrupt = True
+        #self.container.discard_corrupt = True
         self.container.streams.video[0].thread_type = "AUTO"
         #self.container.streams.video[0].thread_count = 4
         self.container.streams.audio[0].thread_type = "AUTO"
@@ -115,6 +116,7 @@ class Player:
         if self.aq is None:
             return
         d = af.to_ndarray()
+        # av.AudioResampler doesn't actually work, so we have to do it manually:
         if d.dtype.kind != 'f':
             d = d.astype('float32') / 32767.0
         if d.shape[0] == 1:
@@ -122,11 +124,11 @@ class Player:
             nc = self.aq[0].channels
             for c in range(nc):
                 x.append(d[c::nc])
-            for c in range(8-nc):
+            for c in range(6-nc):
                 x.append([])
             d = np.vstack(x)
         if d.shape[0] < 6:
-            d = np.pad(d, [(0,8-d.shape[0]),(0,0)])
+            d = np.pad(d, [(0,6-d.shape[0]),(0,0)])
         elif d.shape[0] > 6:
             d = d[:6,...]
         #print("AQ:",d.shape,af.time-self.at_start,af.sample_rate)
@@ -178,6 +180,15 @@ class Player:
         self.vq = []
         self.aq = [] if 'audio' in self.streams else None
 
+    def _resync(self, pts):
+        self._flush()
+        self.container = av.open(self.filename)
+        self.container.gen_pts = True
+        self.container.streams.video[0].thread_type = "AUTO"
+        #self.container.streams.video[0].thread_count = 4
+        self.container.streams.audio[0].thread_type = "AUTO"
+        self.container.seek(pts, stream=self.container.streams.video[0], any_frame=True, backward=False)
+
     def frames(self) -> iter:
         fail = 0
         vs = self.container.streams.video[self.streams.get('video', 0)]
@@ -188,6 +199,8 @@ class Player:
                 if fail:
                     log.debug(f"Resync'd after {fail} skipped/dropped/corrupt/whatever frames")
                     fail = 0
+                    self._resync(frame.pts)
+                    continue
             except StopIteration:
                 break
             except av.error.InvalidDataError as e:

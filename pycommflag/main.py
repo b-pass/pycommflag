@@ -13,7 +13,7 @@ def run(opts:Any) -> None|int:
         os.execvp("mythcommflag", ["mythcommflag", "--queue", "--chanid", opts.chanid, "--starttime", opts.starttime])
     
     if opts.reprocess:
-        return processor.process_features(opts.reprocess, opts.feature_log, opts)
+        return processor.process_scenes(opts.reprocess, out=opts.feature_log, opts=opts)
     
     if opts.chanid and opts.starttime:
         opts.filename = mythtv.get_filename(opts.chanid, opts.starttime)
@@ -36,4 +36,4 @@ def run(opts:Any) -> None|int:
         feature_log = opts.feature_log
     
     processor.process_video(opts.filename, feature_log, opts)
-    return processor.process_features(feature_log, feature_log, opts)
+    return processor.process_scenes(feature_log, out=feature_log, opts=opts)

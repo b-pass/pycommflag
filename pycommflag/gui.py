@@ -1,4 +1,5 @@
 import tkinter as tk
+import math
 import time
 import numpy as np
 from PIL import ImageTk, Image
@@ -116,17 +117,15 @@ class Window(tk.Tk):
         b.grid(row=0, column=8, padx=5)
         self.misc.append(b)
         
-        x = tk.Label(self, text="video map")
-        x.grid(row=6, column=0, columnspan=5)
-        self.misc.append(x)
+        self.vidMap = tk.Canvas(self, width=1280, height=50)
+        self.vidMap.grid(row=6, column=0, columnspan=5)
         
-        x = tk.Label(self, text="audio map")
-        x.grid(row=7, column=0, columnspan=5)
-        self.misc.append(x)
+        self.audMap = tk.Canvas(self, width=1280, height=50)
+        self.audMap.grid(row=7, column=0, columnspan=5)
         
         self.scroller = tk.Scale(self, 
                                 from_=0, to_=self.player.duration/60, resolution=1/60, tickinterval=5, showvalue=False,
-                                length=1280, orient=tk.HORIZONTAL,
+                                length=1280+25, orient=tk.HORIZONTAL, sliderlength=25,
                                 command=lambda n: self.move(abs=float(n)*60))
         self.scroller.grid(row=8, column=0, columnspan=5)
 
@@ -175,26 +174,31 @@ class Window(tk.Tk):
         self.position = 0
         self.prev_frame_time = 0
         self.next_frame_time = 1/self.player.frame_rate
+        
+        self.drawMap()
+
         self.move(abs=0)
     
     def prev(self,scene=False,blank=False,cbreak=False):
         for s in reversed(self.scenes):
-            if blank and not s.start_blank:
+            if blank and not s.is_blank:
                 continue
-            if cbreak and not s.start_break:
+            if cbreak and not s.is_break:
                 continue
-            if s.start_time <= self.posiiton and (self.position - s.start_time) > 2/self.player.frame_rate:
-                self.move(abs=s.start_time)
+            abs = s.middle_time if blank and s.is_blank else s.start_time
+            if (abs - self.position) < -3/self.player.frame_rate:
+                self.move(abs=abs)
                 return
 
     def next(self,scene=False,blank=False,cbreak=False):
         for s in self.scenes:
-            if blank and not s.start_blank:
+            if blank and not s.is_blank:
                 continue
-            if cbreak and not s.start_break:
+            if cbreak and not s.is_break:
                 continue
-            if s.start_time > self.posiiton:
-                self.move(abs=s.start_time)
+            abs = s.middle_time if blank and s.is_blank else s.start_time
+            if (abs - self.position) > 3/self.player.frame_rate:
+                self.move(abs=abs)
                 return
 
     def move_prev_frame(self):
@@ -230,7 +234,6 @@ class Window(tk.Tk):
             frames.append(f)
         for (f,_) in self.player.frames():
             frames.append(f)
-            #print([x.time-self.player.vt_start for x in frames])
             if len(frames) >= 3 and (f.time - self.player.vt_start) > seconds and (frames[-2].time - self.player.vt_start) >= seconds:
                 break
         
@@ -249,9 +252,95 @@ class Window(tk.Tk):
         for n in range(len(self.images)):
             self.video_labels[n].configure(image=self.images[n])
         self.pos_label.configure(text=f'{int(self.position/60):02}:{self.position%60:06.03f}')
-        self.scroller.set(self.position/60)
-    
-        #print("SOUGHT", self.prev_frame_time, self.position, self.next_frame_time)
+        
+        #self.scroller.set(self.position/60)
+        x = self.position / (self.player.duration / 1280)
+        self.vidMap.coords(self.vMapPos, x, 0, x, 50)
+        self.audMap.coords(self.aMapPos, x, 0, x, 50)
+
+    def drawMap(self):
+        map_height = 50
+        sec_per_pix = self.player.duration / 1280
+        last = 0
+
+        # indicate logo?
+        for s in self.scenes:
+            if s.is_blank:
+                continue
+            startx = math.floor(s.start_time / sec_per_pix)
+            stopx = math.ceil(s.stop_time / sec_per_pix)
+            fill = 'green' # TODO: show=green, comm=red, others=yellow
+            #if stopx - startx > 2:
+            #    fill = 'light '+fill
+            self.vidMap.create_rectangle(startx, 0, stopx, map_height, width=0, fill=fill)
+        
+        for s in self.scenes:
+            if s.is_blank:
+                startx = math.floor(s.start_time / sec_per_pix)
+                stopx = math.ceil(s.stop_time / sec_per_pix)
+                self.vidMap.create_rectangle(startx, 0, stopx, map_height, width=0, fill='black')
+        
+        # find a scale to exagerate the line graph features
+        # FFmpeg channel layout for 5.1: FL+FR+FC+LFE+SL+SR
+
+        maxmax = [0]*6
+        for s in self.scenes:
+            for c in range(6):
+                maxmax[c] = max(maxmax[c], s.peak_peaks[c])
+        scale = [1.0/x if x > 0 else 1.0 for x in maxmax]
+
+        bott = 0
+        height = map_height/3
+        for cs in [(0,1),(2,),(4,5)]:
+            bott += height
+            line = []
+            bline = []
+            for s in self.scenes:
+                #print(s.peak_peaks)
+                startx = math.floor(s.start_time / sec_per_pix)
+                stopx = math.ceil(s.stop_time / sec_per_pix)
+
+                y = 0
+                for c in cs:
+                    y += s.peak_peaks[c] * scale[c]
+                y = bott - y/len(cs) * height
+
+                line.append(startx)
+                line.append(y)
+                line.append(stopx)
+                line.append(y)
+
+                y = 0
+                for c in cs:
+                    y += s.valley_peaks[c] * scale[c]
+                y = bott - y/len(cs) * height
+                bline.append(startx)
+                bline.append(y)
+                bline.append(stopx)
+                bline.append(y)
+            if bline:
+                self.audMap.create_line(*bline,fill='black')
+            if line:
+                self.audMap.create_line(*line,fill='blue')
+
+        for s in self.scenes:
+            break
+            startx = math.floor(s.start_time / sec_per_pix)
+            stopx = math.ceil(s.stop_time / sec_per_pix)
+            for c in range(3):
+                top = map_height/3*c
+                bott = map_height/3*(c+1)
+                height = map_height/3
+                y = bott - (s.peak_peaks[c*2]+s.peak_peaks[c*2+1])/2 * height * scale[c]
+                self.audMap.create_line(startx,y,stopx,y,fill='green')
+                y = bott - (s.avg_peaks[c*2]+s.avg_peaks[c*2+1])/2 * height * scale[c]
+                self.audMap.create_line(startx,y,stopx,y,fill='blue')
+                y = bott - (s.valley_peaks[c*2]+s.valley_peaks[c*2+1])/2 * height * scale[c]
+                self.audMap.create_line(startx,y,stopx,y,fill='black')
+        
+        # lastly, add the positional indicator
+        self.aMapPos = self.audMap.create_line(0,0,0,map_height,arrow=tk.BOTH,fill='orange')
+        self.vMapPos = self.vidMap.create_line(0,0,0,map_height,arrow=tk.BOTH,fill='orange')
 
     def run(self):
         tk.mainloop()
