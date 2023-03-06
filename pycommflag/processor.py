@@ -24,7 +24,7 @@ def process_video(video_filename:str, feature_log:Union[str,BinaryIO], opts:Any=
                         print(f"{feature_log} exists, re-using logo ", logo[0], logo[1])
         feature_log = open(feature_log, 'w+b')
     
-    player = Player(video_filename)
+    player = Player(video_filename, no_deinterlace=opts.no_deinterlace)
 
     if opts.no_logo:
         logo = None
@@ -33,7 +33,7 @@ def process_video(video_filename:str, feature_log:Union[str,BinaryIO], opts:Any=
     else:
        logo = logo_finder.search(player, search_seconds=600 if player.duration <= 3700 else 900, opts=opts)
     
-    player.seek(0)
+    player = Player(video_filename, no_deinterlace=opts.no_deinterlace)
     player.enable_audio()
     player.seek(0)
 
@@ -61,7 +61,7 @@ def process_video(video_filename:str, feature_log:Union[str,BinaryIO], opts:Any=
         if p >= report:
             ro = rt
             rt = time.perf_counter()
-            print("Extracting, %5.1f%% (%5.1f fps)          " % (min(fcount/percent,100.0), p/(rt - ro)), end='\r')
+            print("Extracting, %5.1f%% (%5.1f fps)           " % (min(fcount/percent,100.0), p/(rt - ro)), end='\r')
             p = 0
 
         fcolor = frame.to_ndarray(format="rgb24", height=720, width=frame.width*(720/frame.height))
@@ -74,14 +74,8 @@ def process_video(video_filename:str, feature_log:Union[str,BinaryIO], opts:Any=
         else:
             frame_blank = False
 
-        #s = np.std(fcolor, (0,1,2))
-        #m = np.mean(fcolor, (0,1))
-        #d = np.median(fcolor, (0,1))
-        #x = np.max(fcolor)
-        #print(s,m,d,x)
-
         # the below code is equivalent to:
-        #   column = fcolor.mean(axis=(1),dtype='float32').astype('int16')
+        #   column = fcolor.mean(axis=(1),dtype='float32').astype('uint8')
         # but is almost TEN TIMES faster!
         
         # flatten 3rd dimension (color) into contiguous 2nd dimension
@@ -119,6 +113,13 @@ def process_video(video_filename:str, feature_log:Union[str,BinaryIO], opts:Any=
     feature_log.write(struct.pack('I', 0xFFFFFFFF))
     
     if not opts.quiet: print('Extraction complete           ')
+
+def read_logo(log_in:Union[str,BinaryIO]) -> None|tuple:
+    if type(log_in) is str:
+        with open(log_in, 'r+b') as fd:
+            (ver,duration,frame_rate) = struct.unpack('@Iff', fd.read(12))
+            return read_logo(fd)
+    return logo_finder.read(log_in)
 
 def process_features(log_in:Union[str,BinaryIO], log_out:Union[str,BinaryIO], opts:Any=None) -> None:
     if type(log_in) is str:
@@ -225,6 +226,8 @@ def process_features(log_in:Union[str,BinaryIO], log_out:Union[str,BinaryIO], op
     if log_out:
         log_out.seek(0, 2)
     
+def debug_junk():
+  if False:
     temp = open('/tmp/scenes', 'w')
     temp.write(f'{len(scenes)}')
     for s in scenes:
@@ -280,7 +283,7 @@ def process_scenes(log_in:Union[str,BinaryIO], opts:Any=None) -> list[tuple[floa
     if ver > 256:
         raise RuntimeError("Wrong endianness in feature log data.")
     
-    logo = logo_finder.read(log_in)
+    logo_finder.read(log_in)
     
     fprev = 0
     column = None

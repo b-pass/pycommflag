@@ -62,7 +62,7 @@ def search(player : Player, search_seconds: float =600, search_beginning :bool =
         log.info("No logo found (insufficient edges)")
         return None
     
-    logo_mask = logo_sum >= (best - fcount/10)
+    logo_mask = logo_sum >= (best - fcount*.15)
     if np.count_nonzero(logo_mask) < 50:
         log.info("No logo found (not enough edges)")
         return None
@@ -82,20 +82,41 @@ def search(player : Player, search_seconds: float =600, search_beginning :bool =
     right += 5
 
     # if the bound is more than half the image then clip it
+    trunc = False
     if bottom-top >= player.shape[0]/2:
         if bottom >= player.shape[0]*.75:
             top = int(player.shape[0]/2)
+            trunc = True
         else:
             bottom = int(player.shape[0]/2)
+            trunc = True
     if right-left >= player.shape[1]/2:
         if right >= player.shape[1]*.75:
             left = int(player.shape[1]/2)
+            trunc = True
         else:
             right = int(player.shape[1]/2)
+            trunc = True
+    
+    logo_mask = logo_mask[top:bottom,left:right]
+    if trunc:
+        # recalculate after we truncated to shrink down on the real area as best we can
+        nz = np.nonzero(logo_mask)
+        top = int(min(nz[0]))
+        left = int(min(nz[1]))
+        bottom = int(max(nz[0]))
+        right = int(max(nz[1]))
+        if right - left < 5 or bottom - top < 5:
+            log.info("No logo found (bounding box too narrow)")
+            return None
+        top -= 5
+        left -= 5
+        bottom += 5
+        right += 5
+        logo_mask = logo_mask[top:bottom,left:right]
     
     log.debug(f"Logo bounding box: {top},{left} to {bottom},{right}")
 
-    logo_mask = logo_mask[top:bottom,left:right]
     lmc = np.count_nonzero(logo_mask)
     if lmc < 20:
         log.info("No logo found (not enough edges within bounding box)")
@@ -138,7 +159,10 @@ def write(frame_log:BinaryIO, logo:tuple) -> None:
     else:
         frame_log.write(struct.pack('IIIII', 0, 0, 0, 0, 0))
 
-def read(log_in:BinaryIO) -> tuple|None:
+def read(log_in:BinaryIO|str) -> tuple|None:
+    if type(log_in) is str:
+        with open(log_in, 'rb') as f:
+            return read(f)
     import struct
     buf = log_in.read(20)
     if len(buf) == 0:
@@ -149,7 +173,13 @@ def read(log_in:BinaryIO) -> tuple|None:
     shape = ((info[3] - info[1]), (info[4] - info[2]))
     data = np.fromfile(log_in, 'uint8', shape[0]*shape[1], '')
     data.shape = shape
-    return ((info[1], info[2]), (info[3], info[4]), data, info[0])
+    return ((info[1], info[2]), (info[3], info[4]), data.astype('bool'), info[0])
+
+def toimage(logo):
+    from PIL import Image
+    if logo is None:
+        return None
+    return Image.fromarray(np.where(logo[2], 255, 0).astype('uint8'), mode="L")
 
 def subtract(data:np.ndarray, logo:tuple)->np.ndarray:
     if logo is None:

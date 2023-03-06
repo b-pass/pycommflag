@@ -34,6 +34,7 @@ class Player:
         self.container.seek(self.container.streams.video[0].start_time, stream=self.container.streams.video[0])
         
         self.shape = (f.height, f.width)
+        self.frame_rate = self.container.streams.video[0].guessed_rate
 
         if inter*4 > ninter and not no_deinterlace:
             self.interlaced = True
@@ -49,7 +50,6 @@ class Player:
             log.debug(f"We will NOT deinterlace (had {inter} interlaced frames and {ninter} non-interlaced frames)")
             self.interlaced = False
             self.graph = None
-        self.frame_rate = self.container.streams.video[0].average_rate
         self.vt_start = self.container.streams.video[0].start_time * self.container.streams.video[0].time_base
         self.vt_pos = self.vt_start
         log.debug(f"Video {filename} is {self.shape} at {float(self.frame_rate)} fps")
@@ -76,11 +76,13 @@ class Player:
             if seconds <= 0.1:
                 self.vt_pos = vs.start_time
                 self.container.seek(vs.start_time, stream=vs, any_frame=True, backward=True)
+                self._flush()
                 break
             else:
                 time = int(seconds / vs.time_base) + vs.start_time
                 self.vt_pos = time
                 self.container.seek(time, stream=vs, backward=True)
+                self._flush()
                 try:
                     f = next(self.frames())
                 except StopIteration:
@@ -94,7 +96,7 @@ class Player:
                     return f
 
         for f in self.frames():
-            if (f[0].time + 1/self.frame_rate - self.vt_start) > orig_ask:
+            if (f[0].time - self.vt_start) >= orig_ask:
                 return f
         return (None,None)
     

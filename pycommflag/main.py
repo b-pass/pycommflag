@@ -8,9 +8,9 @@ from . import mythtv
 
 def run(opts:Any) -> None|int:
     if opts.rebuild:
-        sys.exit(os.execvp("mythcommflag", ["mythcommflag", "--rebuild", "--chanid", opts.chanid, "--starttime", opts.starttime]))
+        os.execvp("mythcommflag", ["mythcommflag", "--rebuild", "--chanid", opts.chanid, "--starttime", opts.starttime])
     if opts.queue:
-        sys.exit(os.execvp("mythcommflag", ["mythcommflag", "--queue", "--chanid", opts.chanid, "--starttime", opts.starttime]))
+        os.execvp("mythcommflag", ["mythcommflag", "--queue", "--chanid", opts.chanid, "--starttime", opts.starttime])
     
     if opts.reprocess:
         return processor.process_features(opts.reprocess, opts.feature_log, opts)
@@ -23,8 +23,9 @@ def run(opts:Any) -> None|int:
         return 1
 
     if opts.gui:
+        logo = processor.read_logo(opts.feature_log) if opts.feature_log else None
         scenes = processor.process_scenes(opts.feature_log) if opts.feature_log else []
-        w = gui.Window(video=opts.filename, scenes=scenes)
+        w = gui.Window(video=opts.filename, scenes=scenes, logo=logo)
         return w.run()
     
     if opts.no_feature_log:

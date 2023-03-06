@@ -21,6 +21,8 @@ def get_options():
                         help="Python logger's logging level")
     parser.add_option('--yaml', dest='yaml', type='string',
                         help="Pull configuration from a yaml file and overwrite commandline configuration and default with that.")
+    parser.add_option('--no-deinterlace', dest='no_deinterlace', action='store_true',
+                        help="Never use a deinterlacing filter")
     
     logo = optparse.OptionGroup(parser, 'Logo Search')
     logo.add_option('--no-logo', dest='no_logo', action='store_true', 
@@ -33,9 +35,9 @@ def get_options():
     
     mcf = optparse.OptionGroup(parser, 'MythTV Options', description="Commandline compatibility with mythcommflag")
     mcf.add_option('--chanid', dest='chanid', type='int', 
-                    help="Channel ID of recording")
+                    help="Channel ID of recording, filename will be fetched from the mythtv database")
     mcf.add_option('--starttime', dest="starttime",
-                    help="Start timestamp of recording")
+                    help="Start timestamp of recording, filename will be fetched from the mythtv database")
     mcf.add_option('--queue', dest="queue", action="store_true",
                     help="Insert a job into the mythtv job queue")
     mcf.add_option('--rebuild', dest="rebuild", action="store_true",
