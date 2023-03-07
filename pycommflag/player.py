@@ -40,13 +40,7 @@ class Player:
         if inter*4 > ninter and not no_deinterlace:
             self.interlaced = True
             log.debug(f"{inter} interlaced frames (and {ninter} not), means we will deinterlace.")
-            self.graph = av.filter.Graph()
-            buffer = self.graph.add_buffer(template=self.container.streams.video[0])
-            bwdif = self.graph.add("yadif", "")
-            buffersink = self.graph.add("buffersink")
-            buffer.link_to(bwdif)
-            bwdif.link_to(buffersink)
-            self.graph.configure()
+            self._create_graph()
         else:
             log.debug(f"We will NOT deinterlace (had {inter} interlaced frames and {ninter} non-interlaced frames)")
             self.interlaced = False
@@ -91,7 +85,7 @@ class Player:
                     continue
                 if (f[0].time - self.vt_start) > orig_ask:
                     seconds -= 0.25
-                elif (f[0].time + 1/self.frame_rate - self.vt_start) < orig_ask:
+                elif (f[0].time + 1.75/self.frame_rate - self.vt_start) < orig_ask:
                     break
                 else:
                     return f
@@ -171,23 +165,27 @@ class Player:
 
     def _flush(self):
         if self.graph:
-            try:
-                while True:
-                    self.graph.pull()
-            except av.AVError as e:
-                if e.errno != errno.EAGAIN:
-                    raise
+            self._create_graph()
         self.vq = []
         self.aq = [] if 'audio' in self.streams else None
+    
+    def _create_graph(self):
+        self.graph = av.filter.Graph()
+        buffer = self.graph.add_buffer(template=self.container.streams.video[0])
+        bwdif = self.graph.add("yadif", "")
+        buffersink = self.graph.add("buffersink")
+        buffer.link_to(bwdif)
+        bwdif.link_to(buffersink)
+        self.graph.configure()
 
     def _resync(self, pts):
-        self._flush()
         self.container = av.open(self.filename)
         self.container.gen_pts = True
         self.container.streams.video[0].thread_type = "AUTO"
         #self.container.streams.video[0].thread_count = 4
         self.container.streams.audio[0].thread_type = "AUTO"
         self.container.seek(pts, stream=self.container.streams.video[0], any_frame=True, backward=False)
+        self._flush()
 
     def frames(self) -> iter:
         fail = 0
@@ -215,7 +213,7 @@ class Player:
                 self._flush()
                 iter = self.container.decode(**self.streams)
                 continue
-            #print(frame, frame.time)
+            
             if type(frame) is av.AudioFrame:
                 self._queue_audio(frame)
             elif type(frame) is av.VideoFrame:

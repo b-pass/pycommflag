@@ -2,13 +2,14 @@ import logging as log
 import struct
 import sys
 import os
+import re
 import numpy as np
 import math
 import time
 
 from typing import Any, Union, BinaryIO
 
-from . import logo_finder
+from . import logo_finder, mythtv
 from .player import Player
 from .scene import Scene
 
@@ -74,20 +75,7 @@ def process_video(video_filename:str, feature_log:Union[str,BinaryIO], opts:Any=
         else:
             frame_blank = False
 
-        # the below code is equivalent to:
-        #   column = fcolor.mean(axis=(1),dtype='float32').astype('uint8')
-        # but is almost TEN TIMES faster!
-        
-        # flatten 3rd dimension (color) into contiguous 2nd dimension
-        fcolor.reshape(-1, fcolor.shape[1]*fcolor.shape[2])
-
-        # pick out the individual color channels by skipping by 3, and then average them
-        cr = fcolor[...,0::3].astype('float32').mean(axis=(1))
-        cg = fcolor[...,1::3].astype('float32').mean(axis=(1))
-        cb = fcolor[...,2::3].astype('float32').mean(axis=(1))
-        
-        # and now convert those stacks back into a 720x3
-        column = np.stack((cb,cg,cr), axis=1).astype('uint8')
+        column = mean_axis1_float_uint8(fcolor)
         
         if frame_blank:
             logo_present = False
@@ -114,6 +102,25 @@ def process_video(video_filename:str, feature_log:Union[str,BinaryIO], opts:Any=
     
     if not opts.quiet: print('Extraction complete           ')
 
+def mean_axis1_float_uint8(fcolor:np.ndarray)->np.ndarray:
+    # the below code is equivalent to:
+    #   column = fcolor.mean(axis=(1),dtype='float32').astype('uint8')
+    # but is almost TEN TIMES faster!
+    
+    # flatten 3rd dimension (color) into contiguous 2nd dimension
+    fcolor.reshape(-1, fcolor.shape[1]*fcolor.shape[2])
+
+    # pick out the individual color channels by skipping by 3, and then average them
+    cr = fcolor[...,0::3].astype('float32').mean(axis=(1))
+    cg = fcolor[...,1::3].astype('float32').mean(axis=(1))
+    cb = fcolor[...,2::3].astype('float32').mean(axis=(1))
+    
+    # and now convert those stacks back into a 720x3
+    return np.stack((cb,cg,cr), axis=1).astype('uint8')
+
+def columnize_frame(frame)->np.ndarray:
+    return mean_axis1_float_uint8(frame.to_ndarray(format="rgb24", height=720, width=frame.width*(720/frame.height)))
+
 def read_logo(log_in:Union[str,BinaryIO]) -> None|tuple:
     if type(log_in) is str:
         with open(log_in, 'r+b') as fd:
@@ -127,6 +134,7 @@ def process_scenes(log_in:Union[str,BinaryIO], out=None, opts:Any=None) -> list[
             return process_scenes(fd, out=out, opts=opts)
 
     # TODO re-write log to output...?
+    scene_thresh = opts.scene_threshold if opts else 15.0
 
     print("Reading feature log...")
     log_in.seek(0)
@@ -189,13 +197,13 @@ def process_scenes(log_in:Union[str,BinaryIO], out=None, opts:Any=None) -> list[
         else:
             diff = column - prev_col
             scm = np.mean(np.std(np.abs(diff), (0)))
-            if scm >= 12 or (scm >= 10 and prev_sc):
+            if scm >= scene_thresh or (scm >= scene_thresh*2 and prev_sc):
                 scene_change = True
             else:
                 scene_change = False
         
         #print(len(scene) if scene else '-',ftime, column, peaks, logo_present)
-        if scene is not None and (not scene_change or prev_sc or len(scene) < 4):
+        if scene is not None and (prev_sc or not scene_change):
             scene += (ftime, column, peaks, logo_present)
         else:
             if scene is not None:
@@ -210,3 +218,92 @@ def process_scenes(log_in:Union[str,BinaryIO], out=None, opts:Any=None) -> list[
     print("Done reading, got",len(scenes),"scenes in",fprev,"frames")
 
     return scenes
+
+def read_breaks(opts:Any):
+    if not opts:
+        return None
+    
+    if opts.chanid and opts.starttime:
+        return mythtv.get_breaks(opts.chanid, opts.starttime)
+
+    if opts.filename:
+        if m:=re.match(r'(?:.*/|)(\d{4,6})_(\d{12,})\.[a-zA-Z0-9]{2,5}'):
+            mtb = mythtv.get_breaks(m[1], m[2])
+            if mtb:
+                return mtb
+    
+    if opts.feature_log:
+        if m:=re.match(r'(?:.*/|)cf_(\d{4,6})_(\d{12,})\.[a-zA-Z0-9]{2,5}\.feat'):
+            mtb = mythtv.get_breaks(m[1], m[2])
+            if mtb:
+                return mtb
+    
+    if opts.comm_file:
+        if m:=re.search(r'\D(\d{4,6})[_.-](\d{12,})\D'):
+            mtb = mythtv.get_breaks(m[1], m[2])
+            if mtb:
+                return mtb
+
+    if opts.comm_file and os.path.exists(opts.comm_file):
+        with open(opts.comm_file, 'r') as cf:
+            # TODO: more formats?
+            magic = cf.read(2)
+            marks = []
+            fps = None
+            if magic == '# ':
+                markre = re.compile(r'\s*framenum:\s*(\d+)\s*marktype:\s*(\d+)\s*')
+                for line in cf.readlines():
+                    if fps is None and line[0] == 'F':
+                        if m := re.match(r'FPS\s*=\s*(\d*\.\d*)\s*', line):
+                            fps = float(m[1])
+                    if m := markre.match(line):
+                        mv = int(m[1])
+                        mt = int(m[2])
+                        if mt == 4:
+                            marks.append((mv,None))
+                        elif mt == 5:
+                            marks[-1] = (marks[-1][0], mv)
+            elif magic == 'FI':
+                if m := re.match(r'^(?:FI)LE\s*PROCESSING\s*COMPLETE\s*\d+\s*FRAMES\s*(?:AT\s*)?\s*(\d+)\s*', cf.readline()):
+                    if m[1]:
+                        fps = float(m[1])/100
+                markre = re.compile('(\d+)\s*(\d+)\s*')
+                for line in cf.readlines():
+                    if line[0:4] in ('FILE','----'):
+                        continue
+                    if m:=markre.match(line):
+                        marks.append((int(m[1]),int(m[2])))
+            else:
+                log.info(f"Unlnowmn comm break text file format '{magic}'")
+                return []
+            if fps is None:
+                fps = 29.97
+            ret = []
+            for (a,b) in marks:
+                if a is not None and b is not None and a < b:
+                    ret.append((a/fps, b/fps))
+            return ret
+    
+    return None
+
+def update_scene_tags(scenes:list[Scene],marks:list[tuple(float,float)]=None,opts:Any=None)->None:
+    if marks is None:
+        if opts is not None:
+            marks = read_breaks(opts)
+        else:
+            return
+    
+    for (start,stop) in marks:
+        first = True
+        for s in scenes:
+            if s.start_time >= stop:
+                break
+            elif s.duration > 1 and (stop - s.start_time) < s.duration/2:
+                # if it ends just inside this scene then don't count it
+                break
+            if s.start_time <= stop and s.stop_time >= start:
+                if first and s.duration >= 1 and s.duration < 10 and (s.stop_time - start) < s.duration/2:
+                    # if the tag is near the end of the scene then don't count it
+                    continue
+                first = False
+                s.is_break = True

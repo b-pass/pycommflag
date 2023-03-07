@@ -7,6 +7,7 @@ from .player import Player
 from .scene import Scene
 from .processor import process_scenes
 from . import logo_finder
+from . import processor
 
 class Window(tk.Tk):
     def __init__(self, video, scenes:list[Scene]=[], logo:tuple=None):
@@ -15,13 +16,17 @@ class Window(tk.Tk):
         self.player = Player(video)
 
         self.scenes = scenes
+        self.position = 0
+        self.prev_frame_time = 0
+        self.next_frame_time = 1/self.player.frame_rate
+
         self.misc = []
         self.video_labels = []
         self.images = []
         for x in range(5):
             v = tk.Label(self)
             if x == 2:
-                v.grid(row=1,column=0, columnspan=5)
+                v.grid(row=1,column=1, columnspan=3)
             else:
                 v.grid(row=2, column=x)
             self.video_labels.append(v)
@@ -123,9 +128,11 @@ class Window(tk.Tk):
         self.audMap = tk.Canvas(self, width=1280, height=50)
         self.audMap.grid(row=7, column=0, columnspan=5)
         
+        self.scale_pos = tk.DoubleVar()
         self.scroller = tk.Scale(self, 
                                 from_=0, to_=self.player.duration/60, resolution=1/60, tickinterval=5, showvalue=False,
                                 length=1280+25, orient=tk.HORIZONTAL, sliderlength=25,
+                                variable=self.scale_pos,
                                 command=lambda n: self.move(abs=float(n)*60))
         self.scroller.grid(row=8, column=0, columnspan=5)
 
@@ -166,14 +173,13 @@ class Window(tk.Tk):
             v.configure(image=limg)
         else:
             v.configure(text='[No logo]')
+        
+        self.vinfo = tk.Label(self)
+        self.vinfo.grid(row=1, column=4, sticky='nswe')
 
         self.images = [ImageTk.PhotoImage(Image.new("RGB", (320,180))), ImageTk.PhotoImage(Image.new("RGB", (640,360)))]
         for v in range(len(self.video_labels)):
             self.video_labels[v].configure(image=self.images[0 if v != 2 else 1])
-
-        self.position = 0
-        self.prev_frame_time = 0
-        self.next_frame_time = 1/self.player.frame_rate
         
         self.drawMap()
 
@@ -227,16 +233,17 @@ class Window(tk.Tk):
             if f is not None:
                 self.images[0] = ImageTk.PhotoImage(f.to_image(height=180,width=320))
         
-        (f,_) = self.player.seek_exact(max(0, min(seconds - 10/self.player.frame_rate, self.player.duration - 10/self.player.frame_rate)))
+        (f,_) = self.player.seek_exact(max(0, min(seconds - 7/self.player.frame_rate, self.player.duration - 10/self.player.frame_rate)))
         
         frames = []
         if f is not None:
             frames.append(f)
         for (f,_) in self.player.frames():
             frames.append(f)
-            if len(frames) >= 3 and (f.time - self.player.vt_start) > seconds and (frames[-2].time - self.player.vt_start) >= seconds:
+            if len(frames) >= 3 and round(f.time - self.player.vt_start, 3) > round(seconds,3) and round(frames[-2].time - self.player.vt_start, 3) >= round(seconds,3):
                 break
         
+        print([f.time - self.player.vt_start for f in frames])
         if len(frames) >= 3:
             self.images[1] = ImageTk.PhotoImage(frames[-3].to_image(height=180,width=320))
         if len(frames) >= 2:
@@ -245,6 +252,19 @@ class Window(tk.Tk):
         if len(frames) >= 1:
             self.images[3] = ImageTk.PhotoImage(frames[-1].to_image(height=180,width=320))
         
+        info = 'Diffs:'
+        prev = None
+        for frame in frames[-3:]:
+            c = processor.columnize_frame(frame).astype('int16')
+            if prev is None:
+                prev = c
+                continue
+            diff = prev - c
+            prev = c
+            scm = np.mean(np.std(np.abs(diff), (0)))
+            info += '\nDiff: %9.05f' % (scm,)
+        self.vinfo.configure(text=info)
+
         (f,_) = self.player.seek_exact(seconds + 5)
         if f is not None:
             self.images[4] = ImageTk.PhotoImage(f.to_image(height=180,width=320))
@@ -253,7 +273,7 @@ class Window(tk.Tk):
             self.video_labels[n].configure(image=self.images[n])
         self.pos_label.configure(text=f'{int(self.position/60):02}:{self.position%60:06.03f}')
         
-        #self.scroller.set(self.position/60)
+        self.scale_pos.set(self.position/60) #self.scroller.set(self.position/60)
         x = self.position / (self.player.duration / 1280)
         self.vidMap.coords(self.vMapPos, x, 0, x, 50)
         self.audMap.coords(self.aMapPos, x, 0, x, 50)

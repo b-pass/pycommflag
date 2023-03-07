@@ -47,6 +47,10 @@ class Scene:
             return self.start_time + (self.stop_time - self.start_time)/2
         else:
             return self.start_time
+    
+    @property
+    def duration(self):
+        return self.stop_time - self.start_time
 
     def __len__(self):
         return self.frame_count
