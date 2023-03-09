@@ -8,9 +8,11 @@ def get_options():
     parser.add_option('-f', '--file', dest="filename", type='string',
                         help="Video input file name")
     parser.add_option('--feature-log', dest="feature_log", type='string',
-                        help="Output location of feature log. If a video file is processed then this file will be overwritten. Defaults to video base name + .feat")
+                        help="In/Out location of feature log. If a video file is processed then this file will be overwritten. cf_[filename].feat")
     parser.add_option('--no-log', dest="no_feature_log", action='store_true',
                         help="Use a temporary file for the feature log and don't persist it anywhere.")
+    parser.add_option('--break-text', dest='comm_break', type='string',
+                        help="Output location for commercial break results")
     parser.add_option('-r', '--reprocess', dest="reprocess", type='string', 
                         help="Input location of feature data log to be reprocessed.")
     parser.add_option('-g', '--gui', dest='gui', action='store_true', 
@@ -23,6 +25,8 @@ def get_options():
                         help="Pull configuration from a yaml file and overwrite commandline configuration and default with that.")
     parser.add_option('--no-deinterlace', dest='no_deinterlace', action='store_true',
                         help="Never use a deinterlacing filter")
+    parser.add_option('--scene-threshold', dest='scene_threshold', type='float',
+                        help="Difference threshold (column/bar) for marking a scene change [8-30 is sane].")
     
     logo = optparse.OptionGroup(parser, 'Logo Search')
     logo.add_option('--no-logo', dest='no_logo', action='store_true', 
@@ -41,7 +45,11 @@ def get_options():
     mcf.add_option('--queue', dest="queue", action="store_true",
                     help="Insert a job into the mythtv job queue")
     mcf.add_option('--rebuild', dest="rebuild", action="store_true",
-                    help="Rebuild seek table (this just runs mythcommflag directly to do this)")
+                    help="Rebuild seek table (execs mythcommflag directly to do this)")
+    mcf.add_option('--mythtv-out', dest="mythtv_output", action="store_true",
+                    help="Write flagging output to mythtv database even though --chanid and --starttime were not specified")
+    mcf.add_option('--no-mythtv-out', dest="no_mythtv_output", action="store_true",
+                    help="Do NOT write flagging output to mythtv database even though --chanid and --starttime were specified")
     parser.add_option_group(mcf)
 
     return parser

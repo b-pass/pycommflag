@@ -25,6 +25,8 @@ def run(opts:Any) -> None|int:
     if opts.gui:
         logo = processor.read_logo(opts.feature_log) if opts.feature_log else None
         scenes = processor.process_scenes(opts.feature_log) if opts.feature_log else []
+        marks = processor.read_breaks(opts)
+        processor.update_scene_tags(scenes,marks,opts)
         w = gui.Window(video=opts.filename, scenes=scenes, logo=logo)
         return w.run()
     

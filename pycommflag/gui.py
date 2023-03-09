@@ -186,10 +186,19 @@ class Window(tk.Tk):
         self.move(abs=0)
     
     def prev(self,scene=False,blank=False,cbreak=False):
+        if cbreak:
+            want = True
+            first = True
+            for s in reversed(self.scenes):
+                if first and s.start_time <= self.position:
+                    first = False
+                    want = not s.is_break
+                if (s.stop_time - self.position) < -3/self.player.frame_rate and s.is_break == want:
+                    self.move(abs=s.stop_time-1/self.player.frame_rate)
+                    return
+        
         for s in reversed(self.scenes):
             if blank and not s.is_blank:
-                continue
-            if cbreak and not s.is_break:
                 continue
             abs = s.middle_time if blank and s.is_blank else s.start_time
             if (abs - self.position) < -3/self.player.frame_rate:
@@ -197,10 +206,19 @@ class Window(tk.Tk):
                 return
 
     def next(self,scene=False,blank=False,cbreak=False):
+        if cbreak:
+            want = True
+            first = True
+            for s in self.scenes:
+                if first and s.start_time >= self.position:
+                    first = False
+                    want = not s.is_break
+                if (s.start_time - self.position) > 3/self.player.frame_rate and s.is_break == want:
+                    self.move(abs=s.start_time)
+                    return
+        
         for s in self.scenes:
             if blank and not s.is_blank:
-                continue
-            if cbreak and not s.is_break:
                 continue
             abs = s.middle_time if blank and s.is_blank else s.start_time
             if (abs - self.position) > 3/self.player.frame_rate:
@@ -243,7 +261,7 @@ class Window(tk.Tk):
             if len(frames) >= 3 and round(f.time - self.player.vt_start, 3) > round(seconds,3) and round(frames[-2].time - self.player.vt_start, 3) >= round(seconds,3):
                 break
         
-        print([f.time - self.player.vt_start for f in frames])
+        #print([f.time - self.player.vt_start for f in frames])
         if len(frames) >= 3:
             self.images[1] = ImageTk.PhotoImage(frames[-3].to_image(height=180,width=320))
         if len(frames) >= 2:
@@ -289,7 +307,7 @@ class Window(tk.Tk):
                 continue
             startx = math.floor(s.start_time / sec_per_pix)
             stopx = math.ceil(s.stop_time / sec_per_pix)
-            fill = 'green' # TODO: show=green, comm=red, others=yellow
+            fill = 'red' if s.is_break else 'green' # TODO: others=yellow
             #if stopx - startx > 2:
             #    fill = 'light '+fill
             self.vidMap.create_rectangle(startx, 0, stopx, map_height, width=0, fill=fill)
@@ -316,7 +334,6 @@ class Window(tk.Tk):
             line = []
             bline = []
             for s in self.scenes:
-                #print(s.peak_peaks)
                 startx = math.floor(s.start_time / sec_per_pix)
                 stopx = math.ceil(s.stop_time / sec_per_pix)
 
@@ -343,21 +360,6 @@ class Window(tk.Tk):
             if line:
                 self.audMap.create_line(*line,fill='blue')
 
-        for s in self.scenes:
-            break
-            startx = math.floor(s.start_time / sec_per_pix)
-            stopx = math.ceil(s.stop_time / sec_per_pix)
-            for c in range(3):
-                top = map_height/3*c
-                bott = map_height/3*(c+1)
-                height = map_height/3
-                y = bott - (s.peak_peaks[c*2]+s.peak_peaks[c*2+1])/2 * height * scale[c]
-                self.audMap.create_line(startx,y,stopx,y,fill='green')
-                y = bott - (s.avg_peaks[c*2]+s.avg_peaks[c*2+1])/2 * height * scale[c]
-                self.audMap.create_line(startx,y,stopx,y,fill='blue')
-                y = bott - (s.valley_peaks[c*2]+s.valley_peaks[c*2+1])/2 * height * scale[c]
-                self.audMap.create_line(startx,y,stopx,y,fill='black')
-        
         # lastly, add the positional indicator
         self.aMapPos = self.audMap.create_line(0,0,0,map_height,arrow=tk.BOTH,fill='orange')
         self.vMapPos = self.vidMap.create_line(0,0,0,map_height,arrow=tk.BOTH,fill='orange')

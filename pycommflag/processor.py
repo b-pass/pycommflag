@@ -227,19 +227,19 @@ def read_breaks(opts:Any):
         return mythtv.get_breaks(opts.chanid, opts.starttime)
 
     if opts.filename:
-        if m:=re.match(r'(?:.*/|)(\d{4,6})_(\d{12,})\.[a-zA-Z0-9]{2,5}'):
+        if m:=re.match(r'(?:.*/|)(\d{4,6})_(\d{12,})\.[a-zA-Z0-9]{2,5}', opts.filename):
             mtb = mythtv.get_breaks(m[1], m[2])
             if mtb:
                 return mtb
     
     if opts.feature_log:
-        if m:=re.match(r'(?:.*/|)cf_(\d{4,6})_(\d{12,})\.[a-zA-Z0-9]{2,5}\.feat'):
+        if m:=re.match(r'(?:.*/|)cf_(\d{4,6})_(\d{12,})\.[a-zA-Z0-9]{2,5}\.feat', opts.feature_log):
             mtb = mythtv.get_breaks(m[1], m[2])
             if mtb:
                 return mtb
     
     if opts.comm_file:
-        if m:=re.search(r'\D(\d{4,6})[_.-](\d{12,})\D'):
+        if m:=re.search(r'\D(\d{4,6})[_.-](\d{12,})\D', opts.comm_file):
             mtb = mythtv.get_breaks(m[1], m[2])
             if mtb:
                 return mtb
@@ -286,7 +286,7 @@ def read_breaks(opts:Any):
     
     return None
 
-def update_scene_tags(scenes:list[Scene],marks:list[tuple(float,float)]=None,opts:Any=None)->None:
+def update_scene_tags(scenes:list[Scene],marks:list[tuple[float,float]]=None,opts:Any=None)->None:
     if marks is None:
         if opts is not None:
             marks = read_breaks(opts)
