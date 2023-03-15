@@ -10,7 +10,7 @@ class Player:
         self.container.gen_pts = True
         #self.container.discard_corrupt = True
         self.container.streams.video[0].thread_type = "AUTO"
-        #self.container.streams.video[0].thread_count = 4
+        self.container.streams.video[0].thread_count = 2
         self.container.streams.audio[0].thread_type = "AUTO"
 
         self.duration = self.container.duration / av.time_base
@@ -36,7 +36,7 @@ class Player:
         
         self.shape = (f.height, f.width)
         self.frame_rate = self.container.streams.video[0].guessed_rate
-
+        self.graph = None
         if inter*4 > ninter and not no_deinterlace:
             self.interlaced = True
             log.debug(f"{inter} interlaced frames (and {ninter} not), means we will deinterlace.")
@@ -44,7 +44,6 @@ class Player:
         else:
             log.debug(f"We will NOT deinterlace (had {inter} interlaced frames and {ninter} non-interlaced frames)")
             self.interlaced = False
-            self.graph = None
         self.vt_start = self.container.streams.video[0].start_time * self.container.streams.video[0].time_base
         self.vt_pos = self.vt_start
         log.debug(f"Video {filename} is {self.shape} at {float(self.frame_rate)} fps")
@@ -67,29 +66,30 @@ class Player:
             seconds = self.duration
         orig_ask = seconds
         vs = self.container.streams.video[self.streams.get('video', 0)]
+        self._flush()
         while True:
             if seconds <= 0.1:
                 self.vt_pos = vs.start_time
                 self.container.seek(vs.start_time, stream=vs, any_frame=True, backward=True)
-                self._flush()
                 break
             else:
                 time = int(seconds / vs.time_base) + vs.start_time
                 self.vt_pos = time
                 self.container.seek(time, stream=vs, backward=True)
-                self._flush()
                 try:
-                    f = next(self.frames())
+                    vf = next(self.container.decode(video=0))
                 except StopIteration:
-                    seconds -= 0.25
+                    seconds -= 1
                     continue
-                if (f[0].time - self.vt_start) > orig_ask:
-                    seconds -= 0.25
-                elif (f[0].time + 1.75/self.frame_rate - self.vt_start) < orig_ask:
+                if vf.time + 2/self.frame_rate - self.vt_start < orig_ask:
                     break
-                else:
-                    return f
-
+                seconds -= 0.5
+        
+        if self.graph:
+            for vf in self.container.decode(video=0):
+                if vf.time + 2/self.frame_rate - self.vt_start >= orig_ask:
+                    self.graph.push(vf)
+                    break
         for f in self.frames():
             if (f[0].time - self.vt_start) >= orig_ask:
                 return f
@@ -172,7 +172,7 @@ class Player:
     def _create_graph(self):
         self.graph = av.filter.Graph()
         buffer = self.graph.add_buffer(template=self.container.streams.video[0])
-        bwdif = self.graph.add("yadif", "")
+        bwdif = self.graph.add("bwdif", "")
         buffersink = self.graph.add("buffersink")
         buffer.link_to(bwdif)
         bwdif.link_to(buffersink)

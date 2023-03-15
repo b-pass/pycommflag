@@ -5,6 +5,7 @@ import tempfile
 from . import processor
 from . import gui
 from . import mythtv
+from .scene import *
 
 def run(opts:Any) -> None|int:
     if opts.rebuild:
@@ -13,22 +14,34 @@ def run(opts:Any) -> None|int:
         os.execvp("mythcommflag", ["mythcommflag", "--queue", "--chanid", opts.chanid, "--starttime", opts.starttime])
     
     if opts.reprocess:
-        return processor.process_scenes(opts.reprocess, out=opts.feature_log, opts=opts)
+        processor.process_scenes(opts.reprocess, opts=opts)
+        return 1
     
-    if opts.chanid and opts.starttime:
+    if opts.chanid and opts.starttime and not opts.filename:
         opts.filename = mythtv.get_filename(opts.chanid, opts.starttime)
 
     if not opts.filename:
-        print('No file to work on (need one of: -f, -r, --chanid, etc)')
+        print('No video file to work on (need one of: -f, -r, --chanid, etc)')
         return 1
 
     if opts.gui:
         logo = processor.read_logo(opts.feature_log) if opts.feature_log else None
-        scenes = processor.process_scenes(opts.feature_log) if opts.feature_log else []
-        marks = processor.read_breaks(opts)
-        processor.update_scene_tags(scenes,marks,opts)
+        scenes = processor.read_scenes(opts.feature_log) if opts.feature_log else []
+        if not scenes:
+            scenes = processor.process_scenes(opts.feature_log) if opts.feature_log else []
+        got_tags = False
+        for s in scenes:
+            if s.type != SceneType.UNKNOWN:
+                got_tags = True
+                break
+        if not got_tags:
+            processor.external_scene_tags(scenes,opts=opts)
         w = gui.Window(video=opts.filename, scenes=scenes, logo=logo)
-        return w.run()
+        res = w.run()
+        if res is None:
+            return 1
+        processor.rewrite_scenes(res, log_f=opts.feature_log)
+        return 0
     
     if opts.no_feature_log:
         feature_log = tempfile.TemporaryFile('w+b', prefix='cf_', suffix='.feat')
@@ -38,4 +51,4 @@ def run(opts:Any) -> None|int:
         feature_log = opts.feature_log
     
     processor.process_video(opts.filename, feature_log, opts)
-    return processor.process_scenes(feature_log, out=feature_log, opts=opts)
+    return processor.process_scenes(feature_log, opts=opts)

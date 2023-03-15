@@ -8,39 +8,49 @@ from av.video import VideoFrame
 from .player import Player
 _LOGO_EDGE_THRESHOLD = 85 # how strong an edge is strong enough?
 
-def search(player : Player, search_seconds: float =600, search_beginning :bool =False, opts:Any=None) -> tuple|None:
+def search(player : Player, search_beginning :bool =False, opts:Any=None) -> tuple|None:
     global _LOGO_EDGE_THRESHOLD
-    
-    logo_sum = np.ndarray(player.shape, np.uint16)
 
     skip = opts.logo_skip
     
     # search around 1/3 of the way through the show, there should be a lot of show there
-    if not search_beginning and player.duration >= search_seconds*2:
-        player.seek(player.duration/3 - search_seconds/2)
-    else:
+    if opts.logo_search_all:
+        search_seconds = player.duration
         player.seek(0)
+    else:
+        search_seconds = 600 if player.duration <= 3700 else 900
+        if not search_beginning and player.duration >= search_seconds*2:
+            player.seek(player.duration/3 - search_seconds/2)
+        else:
+            player.seek(0)
     
     fcount = 0
-    ftotal = min(int(search_seconds * player.frame_rate), 65000*skip)
-    
+    ftotal = int(search_seconds * player.frame_rate)
+    if ftotal <= 65000:
+        logo_sum = np.ndarray(player.shape, np.uint16)
+    else:
+        logo_sum = np.ndarray(player.shape, np.uint32)
+
     get_frame = player.frames()
     percent = ftotal/skip/100.0
     report = math.ceil(ftotal/250) if not opts.quiet else ftotal * 10
     p = 0
+    i = 0
     if not opts.quiet: print("Searching          ", end='\r')
-    for _ in range(ftotal):
-        (frame,audio) = next(get_frame)
-        
+    for (frame,audio) in player.frames():
+        i += 1
+        if i > ftotal:
+            break
         p += 1
         if p%skip != 0:
             continue
+        elif p >= report:
+            p = 0
+            print("Searching, %3.1f%%    " % (min(fcount/percent,100.0)), end='\r')
         data = _gray(frame)
         logo_sum += scipy.ndimage.sobel(data) > _LOGO_EDGE_THRESHOLD
         fcount += 1
-        if p >= report:
-            p = 0
-            print("Searching, %3.1f%%    " % (min(fcount/percent,100.0)), end='\r')
+    
     if not opts.quiet: print("Searching is complete.\n")
 
     # overscan, ignore 3% on each side
@@ -59,7 +69,7 @@ def search(player : Player, search_seconds: float =600, search_beginning :bool =
         best = np.max(logo_sum)
 
     if best <= fcount / 3:
-        log.info("No logo found (insufficient edges)")
+        log.info("No logo found (insufficient edge strength)")
         return None
     
     logo_mask = logo_sum >= (best - fcount*.15)
@@ -75,51 +85,43 @@ def search(player : Player, search_seconds: float =600, search_beginning :bool =
     if right - left < 5 or bottom - top < 5:
         log.info("No logo found (bounding box too narrow)")
         return None
+
+    # if the bound is more than half the image then clip it
+    if bottom-top >= player.shape[0]/2 or right-left >= player.shape[1]/2:
+        pos = np.argwhere(logo_sum >= best)[-1]
+        if pos[0] >= player.shape[0]/2:
+            top = int(player.shape[0]/2)
+        else:
+            bottom = int(player.shape[0]/2)
+        if pos[1] >= player.shape[1]/2:
+            left = int(player.shape[1]/2)
+        else:
+            right = int(player.shape[1]/2)
+        
+        log.debug(f"Pre-trunc bounding box: {top},{left}->{bottom},{right}. Max ele={pos}")
+        # recalculate after we truncated to shrink down on the real area as best we can
+        logo_mask = logo_mask[top:bottom,left:right]
+        nz = np.nonzero(logo_mask)
+        bottom = top+int(max(nz[0]))
+        right = left+int(max(nz[1]))
+        top = top+int(min(nz[0]))
+        left = left+int(min(nz[1]))
+        if right - left < 5 or bottom - top < 5:
+            log.info("No logo found (truncated bounding box too narrow)")
+            return None
     
     top -= 5
     left -= 5
     bottom += 5
     right += 5
-
-    # if the bound is more than half the image then clip it
-    trunc = False
-    if bottom-top >= player.shape[0]/2:
-        if bottom >= player.shape[0]*.75:
-            top = int(player.shape[0]/2)
-            trunc = True
-        else:
-            bottom = int(player.shape[0]/2)
-            trunc = True
-    if right-left >= player.shape[1]/2:
-        if right >= player.shape[1]*.75:
-            left = int(player.shape[1]/2)
-            trunc = True
-        else:
-            right = int(player.shape[1]/2)
-            trunc = True
     
     logo_mask = logo_mask[top:bottom,left:right]
-    if trunc:
-        # recalculate after we truncated to shrink down on the real area as best we can
-        nz = np.nonzero(logo_mask)
-        top = int(min(nz[0]))
-        left = int(min(nz[1]))
-        bottom = int(max(nz[0]))
-        right = int(max(nz[1]))
-        if right - left < 5 or bottom - top < 5:
-            log.info("No logo found (bounding box too narrow)")
-            return None
-        top -= 5
-        left -= 5
-        bottom += 5
-        right += 5
-        logo_mask = logo_mask[top:bottom,left:right]
     
     log.debug(f"Logo bounding box: {top},{left} to {bottom},{right}")
 
     lmc = np.count_nonzero(logo_mask)
     if lmc < 20:
-        log.info("No logo found (not enough edges within bounding box)")
+        log.info(f"No logo found (not enough edges within bounding box, got {lmc})")
         return None
     thresh = int(lmc * .75)
     return ((top,left), (bottom,right), logo_mask, thresh)
@@ -159,10 +161,7 @@ def write(frame_log:BinaryIO, logo:tuple) -> None:
     else:
         frame_log.write(struct.pack('IIIII', 0, 0, 0, 0, 0))
 
-def read(log_in:BinaryIO|str) -> tuple|None:
-    if type(log_in) is str:
-        with open(log_in, 'rb') as f:
-            return read(f)
+def read(log_in:BinaryIO) -> tuple|None:
     import struct
     buf = log_in.read(20)
     if len(buf) == 0:

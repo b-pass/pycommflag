@@ -7,16 +7,16 @@ def get_options():
 
     parser.add_option('-f', '--file', dest="filename", type='string',
                         help="Video input file name")
-    parser.add_option('--feature-log', dest="feature_log", type='string',
+    parser.add_option('-l', '--feature-log', dest="feature_log", type='string',
                         help="In/Out location of feature log. If a video file is processed then this file will be overwritten. cf_[filename].feat")
     parser.add_option('--no-log', dest="no_feature_log", action='store_true',
-                        help="Use a temporary file for the feature log and don't persist it anywhere.")
-    parser.add_option('--break-text', dest='comm_break', type='string',
+                        help="Use a temporary file for the feature log (which won't persist anywhere)")
+    parser.add_option('-c','--break-text', dest='comm_file', type='string',
                         help="Output location for commercial break results")
     parser.add_option('-r', '--reprocess', dest="reprocess", type='string', 
                         help="Input location of feature data log to be reprocessed.")
     parser.add_option('-g', '--gui', dest='gui', action='store_true', 
-                        help="Enable GUI editing.  Must also supply --file and --feature-log for the thing being edited in the GUI.")
+                        help="(Re)Process and then display for GUI editing.  Must also supply --file and --feature-log for the thing being edited in the GUI.")
     parser.add_option('-q', '--quiet', dest='quiet', action='store_true',
                         help="Do not print progress during processing")
     parser.add_option('--loglevel', dest='loglevel', type='string',
@@ -33,6 +33,8 @@ def get_options():
                     help="Disable logo searching")
     logo.add_option('--skip', dest="logo_skip", type="int", default=4,
                     help="Only search every Nth frame during the logo search phase.  (Speeds up searching at a slight cost to accuracy.)")
+    logo.add_option('--logo-search-all', dest="logo_search_all", action='store_true',
+                    help="Search the entire video for the logo (perfect detection)")
     #logo.add_option('--check-blanks', dest="blanks_check_logo", action="store_true",
     #                help="Include logo area when checking for blank frames (tends towards not marking frames blank if they have logo)")
     parser.add_option_group(logo)
@@ -76,8 +78,5 @@ def parse_argv():
     log.basicConfig(encoding='utf-8', 
                     level=log.getLevelName((cfg.loglevel or 'debug').upper()),
                     format='[%(asctime)s] %(levelname)s: %(message)s')
-
-    if cfg.filename and cfg.reprocess:
-        raise optparse.OptionConflictError("filename conflicts with reprocess")
 
     return cfg

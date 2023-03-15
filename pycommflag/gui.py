@@ -4,7 +4,7 @@ import time
 import numpy as np
 from PIL import ImageTk, Image
 from .player import Player
-from .scene import Scene
+from .scene import *
 from .processor import process_scenes
 from . import logo_finder
 from . import processor
@@ -13,8 +13,9 @@ class Window(tk.Tk):
     def __init__(self, video, scenes:list[Scene]=[], logo:tuple=None):
         tk.Tk.__init__(self)
         self.title("pycommflag editor")
-        self.player = Player(video)
+        self.player = Player(video, no_deinterlace=True)
 
+        self.result = None
         self.scenes = scenes
         self.position = 0
         self.prev_frame_time = 0
@@ -124,6 +125,7 @@ class Window(tk.Tk):
         
         self.vidMap = tk.Canvas(self, width=1280, height=50)
         self.vidMap.grid(row=6, column=0, columnspan=5)
+        self.vidMap.bind("<Button-1>", lambda e:self.move(abs=float(e.x)/1280.0*self.player.duration))
         
         self.audMap = tk.Canvas(self, width=1280, height=50)
         self.audMap.grid(row=7, column=0, columnspan=5)
@@ -140,23 +142,23 @@ class Window(tk.Tk):
         tags.grid(row=9, column=0, columnspan=5)
         self.misc.append(tags)
 
-        self.cur_type = tk.Label(tags, text="Current: Break")
-        self.cur_type.grid(row=0, column=0, padx=10)
-
-        self.tag_break = tk.Button(tags, text="Start Break", state='disabled', command=lambda:self.tag('break'))
+        self.tag_break = tk.Button(tags, text="Start Break", command=lambda:self.tag(SceneType.COMMERCIAL))
         self.tag_break.grid(row=0, column=1, padx=5)
         
-        self.tag_intro = tk.Button(tags, text="Start Intro", command=lambda:self.tag('intro'))
+        self.tag_intro = tk.Button(tags, text="Start Intro", command=lambda:self.tag(SceneType.INTRO))
         self.tag_intro.grid(row=0, column=2, padx=5)
         
-        self.tag_show = tk.Button(tags, text="Start Show", command=lambda:self.tag('show'))
+        self.tag_show = tk.Button(tags, text="Start Show", command=lambda:self.tag(SceneType.SHOW))
         self.tag_show.grid(row=0, column=3, padx=5)
         
-        self.tag_postroll = tk.Button(tags, text="Start Credits", command=lambda:self.tag('postroll'))
+        self.tag_postroll = tk.Button(tags, text="Start Credits", command=lambda:self.tag(SceneType.CREDITS))
         self.tag_postroll.grid(row=0, column=4, padx=5)
         
-        self.truncate_here = tk.Button(tags, text="End All Here", command=lambda:self.truncate_now())
+        self.truncate_here = tk.Button(tags, text="End Here", command=lambda:self.truncate_now())
         self.truncate_here.grid(row=0, column=5, padx=5)
+        
+        self.truncate_here = tk.Button(tags, text="Save & Exit", command=lambda:self.save_and_close())
+        self.truncate_here.grid(row=0, column=6, padx=5)
 
         self.info = tk.Label(self, text=f'File: {video}; Length:{self.player.duration/60.0:0.1f} mins; {float(self.player.frame_rate)} fps')
         self.info.grid(row=10, column=0, sticky="se", columnspan=5)
@@ -289,6 +291,10 @@ class Window(tk.Tk):
         
         for n in range(len(self.images)):
             self.video_labels[n].configure(image=self.images[n])
+            
+        self.updatePosIndicators()
+    
+    def updatePosIndicators(self):
         self.pos_label.configure(text=f'{int(self.position/60):02}:{self.position%60:06.03f}')
         
         self.scale_pos.set(self.position/60) #self.scroller.set(self.position/60)
@@ -301,16 +307,29 @@ class Window(tk.Tk):
         sec_per_pix = self.player.duration / 1280
         last = 0
 
-        # indicate logo?
+        for x in self.vidMap.find_all():
+            self.vidMap.delete(x)
+
         for s in self.scenes:
             if s.is_blank:
                 continue
             startx = math.floor(s.start_time / sec_per_pix)
             stopx = math.ceil(s.stop_time / sec_per_pix)
-            fill = 'red' if s.is_break else 'green' # TODO: others=yellow
-            #if stopx - startx > 2:
-            #    fill = 'light '+fill
-            self.vidMap.create_rectangle(startx, 0, stopx, map_height, width=0, fill=fill)
+            fill = s.type.color()
+            if s.logo > .75: # indicate logo?
+                fill = s.type.logo_color()
+            else:
+                fill = s.type.color()
+            
+            fill2 = None
+            if hasattr(s, 'newtype'):
+                fill2 = s.newtype.new_color()
+            
+            y = map_height
+            if fill2:
+                y = int(y/2)
+                self.vidMap.create_rectangle(startx, y, stopx, map_height, width=0, fill=fill2)
+            self.vidMap.create_rectangle(startx, 0, stopx, y, width=0, fill=fill)
         
         for s in self.scenes:
             if s.is_blank:
@@ -320,7 +339,6 @@ class Window(tk.Tk):
         
         # find a scale to exagerate the line graph features
         # FFmpeg channel layout for 5.1: FL+FR+FC+LFE+SL+SR
-
         maxmax = [0]*6
         for s in self.scenes:
             for c in range(6):
@@ -334,13 +352,15 @@ class Window(tk.Tk):
             line = []
             bline = []
             for s in self.scenes:
-                startx = math.floor(s.start_time / sec_per_pix)
-                stopx = math.ceil(s.stop_time / sec_per_pix)
+                startx = int(math.floor(s.start_time / sec_per_pix))
+                stopx = int(math.ceil(s.stop_time / sec_per_pix))
+                if startx == stopx:
+                    stopx += 1
 
                 y = 0
                 for c in cs:
                     y += s.peak_peaks[c] * scale[c]
-                y = bott - y/len(cs) * height
+                y = int(bott - y/len(cs) * height)
 
                 line.append(startx)
                 line.append(y)
@@ -350,7 +370,7 @@ class Window(tk.Tk):
                 y = 0
                 for c in cs:
                     y += s.valley_peaks[c] * scale[c]
-                y = bott - y/len(cs) * height
+                y = int(bott - y/len(cs) * height)
                 bline.append(startx)
                 bline.append(y)
                 bline.append(stopx)
@@ -363,6 +383,42 @@ class Window(tk.Tk):
         # lastly, add the positional indicator
         self.aMapPos = self.audMap.create_line(0,0,0,map_height,arrow=tk.BOTH,fill='orange')
         self.vMapPos = self.vidMap.create_line(0,0,0,map_height,arrow=tk.BOTH,fill='orange')
+        self.updatePosIndicators()
+
+    def tag(self, type):
+        attr = 'type'
+        old = None
+        for s in self.scenes:
+            if s.stop_time > self.position:
+                if hasattr(s,'newtype'):
+                    attr = 'newtype'
+                    old = s.newtype
+                else:
+                    old = s.type
+                break
+        for s in self.scenes:
+            if s.stop_time <= self.position:
+                continue
+            if s.start_time > self.position:
+                if getattr(s, attr, None) != old:
+                    break
+            if s.type == type:
+                if hasattr(s, 'newtype'):
+                    delattr(s, 'newtype')
+            else:
+                s.newtype = type
+        self.drawMap()
+    
+    def truncate_now(self):
+        for s in self.scenes:
+            if s.stop_time > self.position:
+                setattr(s, 'newtype', SceneType.TRUNCATED)
+        self.save_and_close()
+    
+    def save_and_close(self):
+        self.result = self.scenes
+        self.destroy()
 
     def run(self):
         tk.mainloop()
+        return self.result

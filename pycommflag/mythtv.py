@@ -56,9 +56,9 @@ def get_breaks(chanid, starttime)->list[tuple[float,float]]:
             return []
         
         c.execute("SELECT mark, type FROM recordedmarkup "\
-                    "WHERE chanid = %s AND starttime = %s AND (type = 4 OR type = 5) "\
-                    "ORDER BY mark ASC",
-                    (chanid, starttime))
+                  "WHERE chanid = %s AND starttime = %s AND (type = 4 OR type = 5) "\
+                  "ORDER BY mark ASC",
+                  (chanid, starttime))
         for (m,t) in c.fetchall():
             marks.append((m,t))
         

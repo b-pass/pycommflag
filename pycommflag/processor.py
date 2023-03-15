@@ -7,22 +7,21 @@ import numpy as np
 import math
 import time
 
-from typing import Any, Union, BinaryIO
+from typing import Any,BinaryIO
 
 from . import logo_finder, mythtv
 from .player import Player
 from .scene import Scene
 
-def process_video(video_filename:str, feature_log:Union[str,BinaryIO], opts:Any=None) -> None:
+def process_video(video_filename:str, feature_log:str|BinaryIO, opts:Any=None) -> None:
     logo = None
     if type(feature_log) is str:
         if os.path.exists(feature_log) and not opts.no_logo:
             with open(feature_log, 'r+b') as tfl:
-                tfl.seek(12)
-                if tfl.tell() == 12:
-                    logo = logo_finder.read(tfl)
-                    if logo and not opts.quiet:
-                        print(f"{feature_log} exists, re-using logo ", logo[0], logo[1])
+                tfl.seek(16)
+                logo = logo_finder.read(tfl)
+                if logo and not opts.quiet:
+                    print(f"{feature_log} exists, re-using logo ", logo[0], logo[1])
         feature_log = open(feature_log, 'w+b')
     
     player = Player(video_filename, no_deinterlace=opts.no_deinterlace)
@@ -32,7 +31,7 @@ def process_video(video_filename:str, feature_log:Union[str,BinaryIO], opts:Any=
     elif logo is not None:
         pass
     else:
-       logo = logo_finder.search(player, search_seconds=600 if player.duration <= 3700 else 900, opts=opts)
+       logo = logo_finder.search(player, opts=opts)
     
     player.seek(0)
     player.enable_audio()
@@ -53,7 +52,7 @@ def process_video(video_filename:str, feature_log:Union[str,BinaryIO], opts:Any=
 
     fcolor = None
     feature_log.seek(0)
-    feature_log.write(struct.pack('@Iff', 1, player.duration, player.frame_rate))
+    feature_log.write(struct.pack('@IffI', 1, player.duration, player.frame_rate, 0))
     logo_finder.write(feature_log, logo)
     
     for (frame,audio) in player.frames():
@@ -99,6 +98,11 @@ def process_video(video_filename:str, feature_log:Union[str,BinaryIO], opts:Any=
         audio.astype('float32').tofile(feature_log)
     
     feature_log.write(struct.pack('I', 0xFFFFFFFF))
+
+    pos = feature_log.tell()
+    feature_log.seek(12, 0)
+    feature_log.write(struct.pack('@I', pos))
+    feature_log.seek(pos)
     
     if not opts.quiet: print('Extraction complete           ')
 
@@ -121,29 +125,31 @@ def mean_axis1_float_uint8(fcolor:np.ndarray)->np.ndarray:
 def columnize_frame(frame)->np.ndarray:
     return mean_axis1_float_uint8(frame.to_ndarray(format="rgb24", height=720, width=frame.width*(720/frame.height)))
 
-def read_logo(log_in:Union[str,BinaryIO]) -> None|tuple:
+def read_logo(log_in:str|BinaryIO) -> None|tuple:
     if type(log_in) is str:
         with open(log_in, 'r+b') as fd:
-            (ver,duration,frame_rate) = struct.unpack('@Iff', fd.read(12))
             return read_logo(fd)
+    (ver,duration,frame_rate,scene_pos) = struct.unpack('@IffI', log_in.read(16))
     return logo_finder.read(log_in)
 
-def process_scenes(log_in:Union[str,BinaryIO], out=None, opts:Any=None) -> list[tuple[float,float]]:
-    if type(log_in) is str:
-        with open(log_in, 'r+b') as fd:
-            return process_scenes(fd, out=out, opts=opts)
+def process_scenes(log_f:str|BinaryIO, opts:Any=None) -> list[Scene]:
+    if type(log_f) is str:
+        with open(log_f, 'r+b') as fd:
+            return process_scenes(fd, opts=opts)
 
-    # TODO re-write log to output...?
-    scene_thresh = opts.scene_threshold if opts else 15.0
+    if opts and opts.scene_threshold:
+        scene_thresh = float(opts.scene_threshold)
+    else:
+        scene_thresh = 15.0
 
-    print("Reading feature log...")
-    log_in.seek(0)
+    print("Processing feature log into scenes...")
+    log_f.seek(0)
 
-    (ver,duration,frame_rate) = struct.unpack('@Iff', log_in.read(12))
+    (ver,duration,frame_rate,scene_pos) = struct.unpack('@IffI', log_f.read(16))
     if ver > 256:
         raise RuntimeError("Wrong endianness in feature log data.")
     
-    logo_finder.read(log_in)
+    logo_finder.read(log_f)
     
     fprev = 0
     column = None
@@ -151,7 +157,7 @@ def process_scenes(log_in:Union[str,BinaryIO], out=None, opts:Any=None) -> list[
     scene = None
     blanks = []
     while True:
-        d = log_in.read(4)
+        d = log_f.read(4)
         if len(d) < 4:
             break
         (fnum,) = struct.unpack('I', d)
@@ -163,9 +169,9 @@ def process_scenes(log_in:Union[str,BinaryIO], out=None, opts:Any=None) -> list[
         fprev = fnum
         prev_col = column
 
-        (ftime, logo_present, frame_blank, scene_change, depth, h, w, alen) = struct.unpack('f???BIII', log_in.read(20))
-        column = np.fromfile(log_in, 'uint8', depth*h*w, '').astype('int16')
-        peaks = np.fromfile(log_in, 'float32', alen, '')
+        (ftime, logo_present, frame_blank, scene_change, depth, h, w, alen) = struct.unpack('f???BIII', log_f.read(20))
+        column = np.fromfile(log_f, 'uint8', depth*h*w, '').astype('int16')
+        peaks = np.fromfile(log_f, 'float32', alen, '')
 
         column.shape = (h,w,depth)
 
@@ -215,11 +221,56 @@ def process_scenes(log_in:Union[str,BinaryIO], out=None, opts:Any=None) -> list[
     scene.finish()
     scenes.append(scene)
 
-    print("Done reading, got",len(scenes),"scenes in",fprev,"frames")
+    print("Done, got",len(scenes),"scenes in",fprev,"frames")
 
+    if scene_pos:
+        assert(log_f.tell() == scene_pos)
+        log_f.truncate(scene_pos)
+        rewrite_scenes(scenes, log_f)
+    
     return scenes
 
-def read_breaks(opts:Any):
+def read_scenes(log_f:str|BinaryIO) -> None:
+    if type(log_f) is str:
+        with open(log_f, 'r+b') as fd:
+            return read_scenes(fd)
+    
+    log_f.seek(12)
+    (scene_pos,) = struct.unpack('I', log_f.read(4))
+    if scene_pos < 20:
+        return []
+    
+    log_f.seek(scene_pos)
+    b = log_f.read(4)
+    if len(b) == 0:
+        return []
+    scenes = []
+    (count,) = struct.unpack('I', b)
+    for _ in range(count):
+        scenes.append(Scene(infile=log_f))
+    return scenes
+
+def rewrite_scenes(scenes:list[Scene], log_f:str|BinaryIO) -> None:
+    if type(log_f) is str:
+        with open(log_f, 'r+b') as fd:
+            return rewrite_scenes(scenes, fd)
+    
+    log_f.seek(12)
+    (scene_pos,) = struct.unpack('I', log_f.read(4))
+    if scene_pos < 20:
+        if not scenes:
+            return
+        log_f.seek(0, 2)
+        scene_pos = log_f.tell()
+        log_f.seek(12)
+        log_f.write(struct.pack('I', scene_pos))
+    log_f.seek(scene_pos)
+    
+    log_f.write(struct.pack('I', len(scenes)))
+    for s in scenes:
+        s.write_bin(log_f)
+
+def guess_external_breaks(opts:Any):
     if not opts:
         return None
     
@@ -227,13 +278,13 @@ def read_breaks(opts:Any):
         return mythtv.get_breaks(opts.chanid, opts.starttime)
 
     if opts.filename:
-        if m:=re.match(r'(?:.*/|)(\d{4,6})_(\d{12,})\.[a-zA-Z0-9]{2,5}', opts.filename):
+        if m:=re.match(r'(?:.*/)?(\d{4,6})_(\d{12,})\.[a-zA-Z0-9]{2,5}', opts.filename):
             mtb = mythtv.get_breaks(m[1], m[2])
             if mtb:
                 return mtb
     
     if opts.feature_log:
-        if m:=re.match(r'(?:.*/|)cf_(\d{4,6})_(\d{12,})\.[a-zA-Z0-9]{2,5}\.feat', opts.feature_log):
+        if m:=re.match(r'(?:.*/)?cf_(\d{4,6})_(\d{12,})\.[a-zA-Z0-9]{2,5}\.feat', opts.feature_log):
             mtb = mythtv.get_breaks(m[1], m[2])
             if mtb:
                 return mtb
@@ -286,11 +337,12 @@ def read_breaks(opts:Any):
     
     return None
 
-def update_scene_tags(scenes:list[Scene],marks:list[tuple[float,float]]=None,opts:Any=None)->None:
+def external_scene_tags(scenes:list[Scene],marks:list[tuple[float,float]]=None,opts:Any=None)->None:
     if marks is None:
         if opts is not None:
-            marks = read_breaks(opts)
-        else:
+            marks = guess_external_breaks(opts)
+        if marks is None:
+            log.info('No external source of marks/breaks available')
             return
     
     for (start,stop) in marks:
@@ -298,10 +350,10 @@ def update_scene_tags(scenes:list[Scene],marks:list[tuple[float,float]]=None,opt
         for s in scenes:
             if s.start_time >= stop:
                 break
-            elif s.duration > 1 and (stop - s.start_time) < s.duration/2:
+            elif s.duration >= 1 and s.duration < 10 and (stop - s.start_time) < s.duration/2:
                 # if it ends just inside this scene then don't count it
                 break
-            if s.start_time <= stop and s.stop_time >= start:
+            if s.start_time <= stop and s.stop_time > start:
                 if first and s.duration >= 1 and s.duration < 10 and (s.stop_time - start) < s.duration/2:
                     # if the tag is near the end of the scene then don't count it
                     continue
