@@ -60,26 +60,6 @@ class Scene:
 
     def __len__(self):
         return self.frame_count
-
-    def __iadd__(self, tup:tuple[float,np.ndarray,np.ndarray,bool]):
-        assert(not self.finished)
-        self.stop_time = tup[0]
-        self.frame_count += 1
-        self.barcode += tup[1] #self.barcode = np.add(self.barcode, tup[1], casting='unsafe', dtype='uint32')
-        self.avg_peaks += tup[2]
-        self.peak_peaks = np.where(self.peak_peaks > tup[2], self.peak_peaks, tup[2])
-        self.valley_peaks = np.where(self.valley_peaks < tup[2], self.valley_peaks, tup[2])
-        if tup[3]: self.logo_count += 1
-        return self
-    
-    def finish(self, next_frame_time:float=None):
-        assert(not self.finished)
-        if next_frame_time:
-            self.stop_time = max(self.stop_time, next_frame_time)
-        self.barcode = (self.barcode / self.frame_count).astype('uint8')
-        self.avg_peaks = (self.avg_peaks / self.frame_count).astype('float32')
-        self.logo = self.logo_count / self.frame_count 
-        self.finished = True
     
     @property
     def is_break(self):
@@ -122,18 +102,22 @@ class SceneType(Enum):
     UNKNOWN = 0
     SHOW = 0
     INTRO = 1
-    COMMERCIAL = 2
-    CREDITS = 3
-    TRUNCATED = 4
+    TRANSITION = 2
+    COMMERCIAL = 3
+    CREDITS = 4
+    TRUNCATED = 5
+
+    def count():
+        return SceneType.TRUNCATED.value
 
     def color(self):
-        colors = ['green','yellow','red','yellow','gray']
+        colors = ['green','yellow','blue','red','yellow','gray']
         return colors[self.value]
     
     def logo_color(self):
-        colors = ['light green','light yellow','pink','light yellow','gray']
+        colors = ['light green','light yellow','light blue','pink','light yellow','gray']
         return colors[self.value]
     
     def new_color(self):
-        colors = ['dark green','dark orange','deep pink','dark orange','gray']
+        colors = ['dark green','dark orange','dark blue','deep pink','dark orange','gray']
         return colors[self.value]

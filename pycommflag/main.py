@@ -2,9 +2,10 @@ from typing import Any
 import os
 import sys
 import tempfile
-from . import processor
 from . import gui
 from . import mythtv
+from . import neural
+from . import processor
 from .scene import *
 
 def run(opts:Any) -> None|int:
@@ -14,8 +15,15 @@ def run(opts:Any) -> None|int:
         os.execvp("mythcommflag", ["mythcommflag", "--queue", "--chanid", opts.chanid, "--starttime", opts.starttime])
     
     if opts.reprocess:
-        processor.process_scenes(opts.reprocess, opts=opts)
-        return 1
+        scenes = processor.process_scenes(opts.reprocess, opts=opts)
+        return 0
+    
+    if opts.train:
+        d = neural.load_data(opts)
+        if not d:
+            return 1
+        neural.train(d, opts)
+        return 0
     
     if opts.chanid and opts.starttime and not opts.filename:
         opts.filename = mythtv.get_filename(opts.chanid, opts.starttime)
@@ -51,4 +59,6 @@ def run(opts:Any) -> None|int:
         feature_log = opts.feature_log
     
     processor.process_video(opts.filename, feature_log, opts)
-    return processor.process_scenes(feature_log, opts=opts)
+    scenes = processor.process_scenes(feature_log, opts=opts)
+    
+    return 0

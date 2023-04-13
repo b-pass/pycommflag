@@ -315,7 +315,7 @@ def guess_external_breaks(opts:Any):
                         elif mt == 5:
                             marks[-1] = (marks[-1][0], mv)
             elif magic == 'FI':
-                if m := re.match(r'^(?:FI)LE\s*PROCESSING\s*COMPLETE\s*\d+\s*FRAMES\s*(?:AT\s*)?\s*(\d+)\s*', cf.readline()):
+                if m := re.match(r'^(?:FI)?LE\s*PROCESSING\s*COMPLETE\s*\d+\s*FRAMES\s*(?:AT\s*)?\s*(\d+).*?$', cf.readline()):
                     if m[1]:
                         fps = float(m[1])/100
                 markre = re.compile('(\d+)\s*(\d+)\s*')

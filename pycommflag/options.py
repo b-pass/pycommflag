@@ -39,6 +39,15 @@ def get_options():
     #                help="Include logo area when checking for blank frames (tends towards not marking frames blank if they have logo)")
     parser.add_option_group(logo)
     
+    ml = optparse.OptionGroup(parser, 'Machine Learning')
+    ml.add_option('--train', dest="train", action='store_true', 
+                  help="Train the ML model")
+    ml.add_option('--data', dest="ml_data", action="append",
+                  help="Data to train the model with, as a list of feature-log files")
+    ml.add_option('--batch-size', dest='tf_batch_size', type='int', default=1000,
+                  help="Model training batch size")
+    parser.add_option_group(ml)
+    
     mcf = optparse.OptionGroup(parser, 'MythTV Options', description="Commandline compatibility with mythcommflag")
     mcf.add_option('--chanid', dest='chanid', type='int', 
                     help="Channel ID of recording, filename will be fetched from the mythtv database")
@@ -70,6 +79,10 @@ def parse_argv():
     import logging as log
     opts = get_options()
     (cfg,args) = opts.parse_args()
+    if args:
+        if not cfg.ml_data:
+            cfg.ml_data = []
+        cfg.ml_data += args
 
     if cfg.yaml:
         for (k,v) in parse_yaml(cfg.yaml).items():
