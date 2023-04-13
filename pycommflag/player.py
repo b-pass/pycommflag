@@ -17,7 +17,7 @@ class Player:
         self.duration = self.container.duration / av.time_base
         self.streams = {'video':0}
         self.aq = None
-        self.vq = []
+        self._audio_res = []
 
         inter = 0
         ninter = 0
@@ -62,7 +62,7 @@ class Player:
             self.container.seek(time, stream=vs)
         self._flush()
 
-    def seek_exact(self, seconds:float)->tuple|None:
+    def seek_exact(self, seconds:float)->av.VideoFrame:
         if seconds > self.duration:
             seconds = self.duration
         orig_ask = seconds
@@ -92,9 +92,9 @@ class Player:
                     self.graph.push(vf)
                     break
         for f in self.frames():
-            if (f[0].time - self.vt_start) >= orig_ask:
+            if (f.time - self.vt_start) >= orig_ask:
                 return f
-        return (None,None)
+        return None
     
     def enable_audio(self, stream=0):
         self.streams['audio'] = stream
@@ -106,6 +106,7 @@ class Player:
         if 'audio' in self.streams:
             del self.streams['audio']
         self.aq = None
+        self._audio_res = []
 
     def _queue_audio(self, af):
         if self.aq is None:
@@ -119,74 +120,57 @@ class Player:
             nc = self.aq[0].channels
             for c in range(nc):
                 x.append(d[c::nc])
-            for c in range(6-nc):
-                x.append([])
             d = np.vstack(x)
         if d.shape[0] >= 4 or (d.shape[0] == 3 and af.layout.channels[2].name.endswith('C')):
             d = d[2,...] # grab just the center
-        elif d.shape[0] <= 1:
-            d = d[0,...] # mono, use it
-        else: #if d.shape[0] == 2:
+        elif d.shape[0] >= 2:
             # convert stereo to mono by averaging
             d = (d[0,...] + d[1,...])/2.0
+        else:
+            return
         
         #print("AQ:",d.shape,af.time-self.at_start,af.sample_rate)
         self.aq.append((d,af.time-self.at_start,af.sample_rate))
-        if len(self.aq) > 1 and self.aq[-2][1] > self.aq[-1][1]:
-            # out of order PTS, should never happen...
-            self.aq = sorted(self.aq, key=lambda x:x[1])
+        
+        if len(self.aq) >= 30:
+            self._resample_audio()
+    
+    def _resample_audio(self):
+        # resample to 16 kHz
 
-    def _get_audio(self, end):
         if not self.aq:
-            return None
+            return
         
-        if end and self.aq[-1][1] < end:
-            return None
+        # out of order PTS, should never happen...?
+        self.aq = sorted(self.aq, key=lambda x:x[1])
         
-        #print(len(self.aq), end, end - self.aq[0][1], "t=", self.aq[0][1], self.aq[0][2])
-        need = (end - self.aq[0][1]) if end else 1.0
-        if need <= 0:
-            return np.array([0], 'float32')
-        
-        psr = None
         samples = None
-        while self.aq and need > 0:
-            (d,t,sr) = self.aq[0]
+        psr = None
+        while self.aq:
+            (d,t,sr) = self.aq.pop(0)
             if psr != sr and samples is not None:
-                break
+                if sr is None or sr < 1:
+                    continue
+                self._audio_res.append(spsig.resample(samples, int(len(samples)*16000/psr)))
+                samples = None
             psr = sr
-            nsamp = int(need * sr)
-            if nsamp <= 0:
-                break
-            #print(len(self.aq),need, end, "t=", t,sr,nsamp,nsamp/sr,d.shape,t+nsamp/sr)
-            if nsamp >= len(d):
-                nsamp = len(d)
-                self.aq.pop(0)
-            else:
-                self.aq[0] = (d[..., nsamp:], t+nsamp/sr, sr)
-                d = d[..., 0:nsamp]
-            need -= nsamp/sr
             if samples is not None:
                 samples = np.append(samples, d)
             else:
                 samples = d
         
-        if samples is None:
-            return None
-
-        # resample to 16 kHz
-        return spsig.resample(samples, int(len(samples)*16000/psr))
+        if samples is not None:
+            self._audio_res.append(spsig.resample(samples, int(len(samples)*16000/psr)))
 
     def _flush(self):
         if self.graph:
             self._create_graph()
-        self.vq = []
         self.aq = [] if 'audio' in self.streams else None
     
     def _create_graph(self):
         self.graph = av.filter.Graph()
         buffer = self.graph.add_buffer(template=self.container.streams.video[0])
-        bwdif = self.graph.add("bwdif", "")
+        bwdif = self.graph.add("yadif", "")
         buffersink = self.graph.add("buffersink")
         buffer.link_to(bwdif)
         bwdif.link_to(buffersink)
@@ -200,6 +184,12 @@ class Player:
         self.container.streams.audio[0].thread_type = "AUTO"
         self.container.seek(pts, stream=self.container.streams.video[0], any_frame=True, backward=False)
         self._flush()
+
+    def all_audio(self):
+        self._resample_audio()
+        x = np.concatenate(self._audio_res, axis=None) if self._audio_res else np.array([0], 'float32')
+        self._audio_res = [] # free some memory?
+        return x
 
     def frames(self) -> iter:
         fail = 0
@@ -240,18 +230,7 @@ class Player:
                             raise
                         continue
                 self.vt_pos = frame.time
-                if self.aq is not None:
-                    self.vq.append(frame)
-                else:
-                    yield (frame,None)
-            if len(self.vq) > 1:
-                af = self._get_audio(self.vq[1].time - self.vt_start)
-                if af is None:
-                    continue
-                vf = self.vq.pop(0)
-                yield (vf,af)
-        while self.vq:
-            af = self._get_audio(self.vq[1].time - self.vt_start if len(self.vq) > 1 else None)
-            vf = self.vq.pop(0)
-            yield (vf,af)
+                yield frame
+        
+        self._resample_audio()
         return #raise StopIteration()

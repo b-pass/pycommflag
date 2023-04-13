@@ -6,12 +6,14 @@ import re
 import numpy as np
 import math
 import time
+import gc
 
 from typing import Any,BinaryIO
 
 from . import logo_finder, mythtv
 from .player import Player
 from .scene import Scene
+from .extern import ina_foss
 
 def process_video(video_filename:str, feature_log:str|BinaryIO, opts:Any=None) -> None:
     logo = None
@@ -40,7 +42,6 @@ def process_video(video_filename:str, feature_log:str|BinaryIO, opts:Any=None) -
     # not doing format/aspect because everything is widescreen all the time now (that was very early '00s)
     # except ultra wide screen movies, and sometimes ultra-wide commercials?
 
-    prev_col = None
     fcount = 0
     ftotal = int(player.duration * player.frame_rate)
 
@@ -55,15 +56,16 @@ def process_video(video_filename:str, feature_log:str|BinaryIO, opts:Any=None) -
     feature_log.write(struct.pack('@IffI', 1, player.duration, player.frame_rate, 0))
     logo_finder.write(feature_log, logo)
     
-    for (frame,audio) in player.frames():
+    for frame in player.frames():
         p += 1
         fcount += 1
         if p >= report:
             ro = rt
             rt = time.perf_counter()
             print("Extracting, %5.1f%% (%5.1f fps)           " % (min(fcount/percent,100.0), p/(rt - ro)), end='\r')
+            gc.collect()
             p = 0
-
+        
         fcolor = frame.to_ndarray(format="rgb24", height=720, width=frame.width*(720/frame.height))
         
         # trying to be fast, just look at the middle 1/4 for blank-ish-ness and then verify with the full frame
@@ -85,39 +87,44 @@ def process_video(video_filename:str, feature_log:str|BinaryIO, opts:Any=None) -
 
             # do scene detection here instead? make sure to change the output type of the stack to int16!
         
-        if audio is None:
-            audio = np.zeros((6,1), dtype='float32')
-
         feature_log.write(struct.pack(
-            'If???BIII',
+            'If???BII',
             fcount,frame.time-player.vt_start,
             logo_present,frame_blank,scene_change,
-            column.shape[2], column.shape[0], column.shape[1], audio.shape[0]
+            column.shape[2], column.shape[0], column.shape[1]
         ))
         column.astype('uint8').tofile(feature_log)
-        audio.astype('float32').tofile(feature_log)
     
     feature_log.write(struct.pack('I', 0xFFFFFFFF))
+
+    if not opts.quiet:
+        print('Extraction complete           ')
+        print('Segmenting audio...')
+    
+    aseg = ina_foss.Segmenter()
+    audio = aseg(player.all_audio())
+    
+    feature_log.write(struct.pack('I', len(audio)))
+    for (lab,start,stop) in audio:
+        feature_log.write(struct.pack('Iff', aseg.outlabels.index(lab), start, stop))
 
     pos = feature_log.tell()
     feature_log.seek(12, 0)
     feature_log.write(struct.pack('@I', pos))
     feature_log.seek(pos)
     
-    if not opts.quiet: print('Extraction complete           ')
+    if not opts.quiet: print('Video processing complete')
 
 def mean_axis1_float_uint8(fcolor:np.ndarray)->np.ndarray:
     # the below code is equivalent to:
     #   column = fcolor.mean(axis=(1),dtype='float32').astype('uint8')
     # but is almost TEN TIMES faster!
     
-    # flatten 3rd dimension (color) into contiguous 2nd dimension
-    fcolor.reshape(-1, fcolor.shape[1]*fcolor.shape[2])
-
     # pick out the individual color channels by skipping by 3, and then average them
-    cr = fcolor[...,0::3].astype('float32').mean(axis=(1))
-    cg = fcolor[...,1::3].astype('float32').mean(axis=(1))
-    cb = fcolor[...,2::3].astype('float32').mean(axis=(1))
+    #cr = fcolor[...,0::3].astype('float32').mean(axis=(1))
+    cr = fcolor[...,0::3].mean(axis=(1), dtype='float32')
+    cg = fcolor[...,1::3].mean(axis=(1), dtype='float32')
+    cb = fcolor[...,2::3].mean(axis=(1), dtype='float32')
     
     # and now convert those stacks back into a 720x3
     return np.stack((cb,cg,cr), axis=1).astype('uint8')
@@ -169,11 +176,11 @@ def process_scenes(log_f:str|BinaryIO, opts:Any=None) -> list[Scene]:
         fprev = fnum
         prev_col = column
 
-        (ftime, logo_present, frame_blank, scene_change, depth, h, w, alen) = struct.unpack('f???BIII', log_f.read(20))
+        (ftime, logo_present, frame_blank, scene_change, depth, h, w) = struct.unpack('f???BII', log_f.read(20))
         column = np.fromfile(log_f, 'uint8', depth*h*w, '').astype('int16')
-        peaks = np.fromfile(log_f, 'float32', alen, '')
-
         column.shape = (h,w,depth)
+
+        peaks = None # TODO FIXME
 
         if frame_blank:
             if scene is not None:

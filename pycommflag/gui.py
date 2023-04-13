@@ -249,16 +249,16 @@ class Window(tk.Tk):
         #print("SEEK", self.prev_frame_time, seconds, self.next_frame_time)
 
         if seconds >= 5:
-            (f,_) = self.player.seek_exact(seconds - 5)
+            f = self.player.seek_exact(seconds - 5)
             if f is not None:
                 self.images[0] = ImageTk.PhotoImage(f.to_image(height=180,width=320))
         
-        (f,_) = self.player.seek_exact(max(0, min(seconds - 7/self.player.frame_rate, self.player.duration - 10/self.player.frame_rate)))
+        f = self.player.seek_exact(max(0, min(seconds - 7/self.player.frame_rate, self.player.duration - 10/self.player.frame_rate)))
         
         frames = []
         if f is not None:
             frames.append(f)
-        for (f,_) in self.player.frames():
+        for f in self.player.frames():
             frames.append(f)
             if len(frames) >= 3 and round(f.time - self.player.vt_start, 3) > round(seconds,3) and round(frames[-2].time - self.player.vt_start, 3) >= round(seconds,3):
                 break
@@ -285,7 +285,7 @@ class Window(tk.Tk):
             info += '\nDiff: %9.05f' % (scm,)
         self.vinfo.configure(text=info)
 
-        (f,_) = self.player.seek_exact(seconds + 5)
+        f = self.player.seek_exact(seconds + 5)
         if f is not None:
             self.images[4] = ImageTk.PhotoImage(f.to_image(height=180,width=320))
         

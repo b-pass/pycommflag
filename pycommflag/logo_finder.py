@@ -31,13 +31,12 @@ def search(player : Player, search_beginning :bool =False, opts:Any=None) -> tup
     else:
         logo_sum = np.ndarray(player.shape, np.uint32)
 
-    get_frame = player.frames()
     percent = ftotal/skip/100.0
     report = math.ceil(ftotal/250) if not opts.quiet else ftotal * 10
     p = 0
     i = 0
     if not opts.quiet: print("Searching          ", end='\r')
-    for (frame,audio) in player.frames():
+    for frame in player.frames():
         i += 1
         if i > ftotal:
             break
@@ -89,6 +88,8 @@ def search(player : Player, search_beginning :bool =False, opts:Any=None) -> tup
     # if the bound is more than half the image then clip it
     if bottom-top >= player.shape[0]/2 or right-left >= player.shape[1]/2:
         pos = np.argwhere(logo_sum >= best)[-1]
+        log.debug(f"Pre-trunc bounding box: {top},{left}->{bottom},{right}. Max ele={pos}")
+        
         if pos[0] >= player.shape[0]/2:
             top = int(player.shape[0]/2)
         else:
@@ -98,10 +99,8 @@ def search(player : Player, search_beginning :bool =False, opts:Any=None) -> tup
         else:
             right = int(player.shape[1]/2)
         
-        log.debug(f"Pre-trunc bounding box: {top},{left}->{bottom},{right}. Max ele={pos}")
         # recalculate after we truncated to shrink down on the real area as best we can
-        logo_mask = logo_mask[top:bottom,left:right]
-        nz = np.nonzero(logo_mask)
+        nz = np.nonzero(logo_mask[top:bottom,left:right])
         bottom = top+int(max(nz[0]))
         right = left+int(max(nz[1]))
         top = top+int(min(nz[0]))
