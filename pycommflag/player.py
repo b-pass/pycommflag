@@ -2,6 +2,7 @@ import av
 import errno
 import logging as log
 import numpy as np
+import scipy.signal as spsig
 
 class Player:
     def __init__(self, filename:str, no_deinterlace:bool=False):
@@ -121,17 +122,21 @@ class Player:
             for c in range(6-nc):
                 x.append([])
             d = np.vstack(x)
-        if d.shape[0] < 6:
-            d = np.pad(d, [(0,6-d.shape[0]),(0,0)])
-        elif d.shape[0] > 6:
-            d = d[:6,...]
+        if d.shape[0] >= 4 or (d.shape[0] == 3 and af.layout.channels[2].name.endswith('C')):
+            d = d[2,...] # grab just the center
+        elif d.shape[0] <= 1:
+            d = d[0,...] # mono, use it
+        else: #if d.shape[0] == 2:
+            # convert stereo to mono by averaging
+            d = (d[0,...] + d[1,...])/2.0
+        
         #print("AQ:",d.shape,af.time-self.at_start,af.sample_rate)
         self.aq.append((d,af.time-self.at_start,af.sample_rate))
         if len(self.aq) > 1 and self.aq[-2][1] > self.aq[-1][1]:
             # out of order PTS, should never happen...
             self.aq = sorted(self.aq, key=lambda x:x[1])
 
-    def _get_audio_peaks(self, end):
+    def _get_audio(self, end):
         if not self.aq:
             return None
         
@@ -141,27 +146,36 @@ class Player:
         #print(len(self.aq), end, end - self.aq[0][1], "t=", self.aq[0][1], self.aq[0][2])
         need = (end - self.aq[0][1]) if end else 1.0
         if need <= 0:
-            return np.zeros((6,1))
+            return np.array([0], 'float32')
         
-        peaks = []
+        psr = None
+        samples = None
         while self.aq and need > 0:
             (d,t,sr) = self.aq[0]
+            if psr != sr and samples is not None:
+                break
+            psr = sr
             nsamp = int(need * sr)
             if nsamp <= 0:
                 break
             #print(len(self.aq),need, end, "t=", t,sr,nsamp,nsamp/sr,d.shape,t+nsamp/sr)
-            if nsamp >= d.shape[1]:
-                nsamp = d.shape[1]
+            if nsamp >= len(d):
+                nsamp = len(d)
                 self.aq.pop(0)
             else:
                 self.aq[0] = (d[..., nsamp:], t+nsamp/sr, sr)
                 d = d[..., 0:nsamp]
             need -= nsamp/sr
-            m = np.max(np.abs(d), axis=1)
-            m.resize((6,),refcheck=False)
-            peaks.append(m)
+            if samples is not None:
+                samples = np.append(samples, d)
+            else:
+                samples = d
         
-        return np.max(peaks, axis=0) if peaks else np.zeros((6,1))
+        if samples is None:
+            return None
+
+        # resample to 16 kHz
+        return spsig.resample(samples, int(len(samples)*16000/psr))
 
     def _flush(self):
         if self.graph:
@@ -231,13 +245,13 @@ class Player:
                 else:
                     yield (frame,None)
             if len(self.vq) > 1:
-                af = self._get_audio_peaks(self.vq[1].time - self.vt_start)
+                af = self._get_audio(self.vq[1].time - self.vt_start)
                 if af is None:
                     continue
                 vf = self.vq.pop(0)
                 yield (vf,af)
         while self.vq:
-            af = self._get_audio_peaks(self.vq[1].time - self.vt_start if len(self.vq) > 1 else None)
+            af = self._get_audio(self.vq[1].time - self.vt_start if len(self.vq) > 1 else None)
             vf = self.vq.pop(0)
             yield (vf,af)
         return #raise StopIteration()
