@@ -25,12 +25,15 @@ class Scene:
             self.type = SceneType.UNKNOWN
             #s.newtype = None
         
-    def __iadd__(self, tup:tuple[float,np.ndarray,Enum,bool]):
+    def __iadd__(self, tup:tuple[float,np.ndarray,Enum|int,bool]):
         assert(not self.finished)
         self.stop_time = tup[0]
         self.frame_count += 1
         self.barcode += tup[1] #self.barcode = np.add(self.barcode, tup[1], casting='unsafe', dtype='uint32')
-        self.audio_end = tup[2].value
+        if type(tup[2]) is not int:
+            self.audio_end = tup[2].value
+        else:
+            self.audio_end = tup[2]
         self.audio[self.audio_end] += 1
         if tup[3]:
             self.logo_count += 1
@@ -92,7 +95,7 @@ class Scene:
         (self.audio_start, self.audio_end, na) = struct.unpack('III',fd.read(12))
         self.audio_percent = [0.0]*na
         for i in range(na):
-            self.audio_percent[na] = struct.unpack('f',fd.read(4))
+            self.audio_percent[i] = struct.unpack('f',fd.read(4))
         (self.logo_count, isblank, type) = struct.unpack('III', fd.read(12))
         self.is_blank = bool(isblank)
         self.type = SceneType(type)

@@ -22,7 +22,7 @@ def process_video(video_filename:str, feature_log:str|BinaryIO, opts:Any=None) -
     if type(feature_log) is str:
         if os.path.exists(feature_log) and not opts.no_logo:
             with open(feature_log, 'r+b') as tfl:
-                tfl.seek(16)
+                tfl.seek(28)
                 logo = logo_finder.read(tfl)
                 if logo and not opts.quiet:
                     print(f"{feature_log} exists, re-using logo ", logo[0], logo[1])
@@ -179,11 +179,7 @@ def process_scenes(log_f:str|BinaryIO, opts:Any=None) -> list[Scene]:
     
     logo_finder.read(log_f)
 
-    audio = []
-    log_f.seek(audio_pos)
-    (na,) = struct.unpack('I', log_f.read(4))
-    for i in range(na):
-        audio.append(struct.unpack('Iff', log_f.read(12)))
+    audio = read_audio(log_f)
     if not audio:
         audio = [(ina_foss.AudioSegmentLabel.SILENCE, 0, duration)]
     audio_idx = 0
@@ -293,6 +289,24 @@ def read_scenes(log_f:str|BinaryIO) -> None:
     for _ in range(count):
         scenes.append(Scene(infile=log_f))
     return scenes
+
+def read_audio(log_f:str|BinaryIO) -> None:
+    if type(log_f) is str:
+        with open(log_f, 'r+b') as fd:
+            return read_audio(fd)
+    
+    log_f.seek(16)
+    (audio_pos,) = struct.unpack('I', log_f.read(4))
+    if audio_pos < 20:
+        return []
+    
+    log_f.seek(audio_pos)
+    (n,) = struct.unpack('I', log_f.read(4))
+    audio = []
+    for i in range(n):
+        audio.append(struct.unpack('Iff', log_f.read(12)))
+    
+    return audio
 
 def rewrite_scenes(scenes:list[Scene], log_f:str|BinaryIO) -> None:
     if type(log_f) is str:

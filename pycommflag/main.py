@@ -37,6 +37,7 @@ def run(opts:Any) -> None|int:
         scenes = processor.read_scenes(opts.feature_log) if opts.feature_log else []
         if not scenes:
             scenes = processor.process_scenes(opts.feature_log) if opts.feature_log else []
+        audio = processor.read_audio(opts.feature_log) if opts.feature_log else []
         got_tags = False
         for s in scenes:
             if s.type != SceneType.UNKNOWN:
@@ -44,7 +45,7 @@ def run(opts:Any) -> None|int:
                 break
         if not got_tags:
             processor.external_scene_tags(scenes,opts=opts)
-        w = gui.Window(video=opts.filename, scenes=scenes, logo=logo)
+        w = gui.Window(video=opts.filename, scenes=scenes, logo=logo, audio=audio)
         res = w.run()
         if res is None:
             return 1

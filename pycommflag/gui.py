@@ -8,15 +8,17 @@ from .scene import *
 from .processor import process_scenes
 from . import logo_finder
 from . import processor
+from .extern.ina_foss import AudioSegmentLabel
 
 class Window(tk.Tk):
-    def __init__(self, video, scenes:list[Scene]=[], logo:tuple=None):
+    def __init__(self, video, scenes:list[Scene]=[], logo:tuple=None, audio:list[tuple]=None):
         tk.Tk.__init__(self)
         self.title("pycommflag editor")
         self.player = Player(video, no_deinterlace=True)
 
         self.result = None
         self.scenes = scenes
+        self.audio = audio
         self.position = 0
         self.prev_frame_time = 0
         self.next_frame_time = 1/self.player.frame_rate
@@ -337,48 +339,27 @@ class Window(tk.Tk):
                 stopx = math.ceil(s.stop_time / sec_per_pix)
                 self.vidMap.create_rectangle(startx, 0, stopx, map_height, width=0, fill='black')
         
-        # find a scale to exagerate the line graph features
-        # FFmpeg channel layout for 5.1: FL+FR+FC+LFE+SL+SR
-        maxmax = [0]*6
-        for s in self.scenes:
-            for c in range(6):
-                maxmax[c] = max(maxmax[c], s.peak_peaks[c])
-        scale = [1.0/x if x > 0 else 1.0 for x in maxmax]
+        for x in self.audMap.find_all():
+            self.audMap.delete(x)
+        
+        y = map_height
+        for (lab,start_time,stop_time) in self.audio:
+            if type(lab) is int:
+                lab = AudioSegmentLabel(lab)
+            if lab == AudioSegmentLabel.SILENCE:
+                continue
+            startx = math.floor(start_time / sec_per_pix)
+            stopx = math.ceil(stop_time / sec_per_pix)
+            self.audMap.create_rectangle(startx, 0, stopx, y, width=0, fill=lab.color())
 
-        bott = 0
-        height = map_height/3
-        for cs in [(0,1),(2,),(4,5)]:
-            bott += height
-            line = []
-            bline = []
-            for s in self.scenes:
-                startx = int(math.floor(s.start_time / sec_per_pix))
-                stopx = int(math.ceil(s.stop_time / sec_per_pix))
-                if startx == stopx:
-                    stopx += 1
-
-                y = 0
-                for c in cs:
-                    y += s.peak_peaks[c] * scale[c]
-                y = int(bott - y/len(cs) * height)
-
-                line.append(startx)
-                line.append(y)
-                line.append(stopx)
-                line.append(y)
-
-                y = 0
-                for c in cs:
-                    y += s.valley_peaks[c] * scale[c]
-                y = int(bott - y/len(cs) * height)
-                bline.append(startx)
-                bline.append(y)
-                bline.append(stopx)
-                bline.append(y)
-            if bline:
-                self.audMap.create_line(*bline,fill='black')
-            if line:
-                self.audMap.create_line(*line,fill='blue')
+        for (lab,start_time,stop_time) in self.audio:
+            if type(lab) is int:
+                lab = AudioSegmentLabel(lab)
+            if lab != AudioSegmentLabel.SILENCE:
+                continue
+            startx = math.floor(start_time / sec_per_pix)
+            stopx = math.ceil(stop_time / sec_per_pix)
+            self.audMap.create_rectangle(startx, 0, stopx, y, width=0, fill=lab.color())
 
         # lastly, add the positional indicator
         self.aMapPos = self.audMap.create_line(0,0,0,map_height,arrow=tk.BOTH,fill='orange')

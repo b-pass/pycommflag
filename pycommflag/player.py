@@ -117,15 +117,15 @@ class Player:
             d = d.astype('float32') / 32767.0
         if d.shape[0] == 1:
             x = []
-            nc = self.aq[0].channels
+            nc = len(af.layout.channels)
             for c in range(nc):
                 x.append(d[c::nc])
             d = np.vstack(x)
+        
         if d.shape[0] >= 4 or (d.shape[0] == 3 and af.layout.channels[2].name.endswith('C')):
-            d = d[2,...] # grab just the center
+            d = (d[0,...] + d[1,...] + d[2,...]) / 3.0
         elif d.shape[0] >= 2:
-            # convert stereo to mono by averaging
-            d = (d[0,...] + d[1,...])/2.0
+            d = (d[0,...] + d[1,...]) / 2.0
         else:
             return
         
@@ -193,30 +193,31 @@ class Player:
 
     def frames(self) -> iter:
         fail = 0
-        vs = self.container.streams.video[self.streams.get('video', 0)]
         iter = self.container.decode(**self.streams)
         while True:
             try:
                 frame = next(iter)
-                if fail:
-                    log.debug(f"Resync'd after {fail} skipped/dropped/corrupt/whatever frames")
-                    fail = 0
-                    self._resync(frame.pts)
-                    continue
             except StopIteration:
                 break
             except av.error.InvalidDataError as e:
+                fail += 1
+                vs = self.container.streams.video[self.streams.get('video', 0)]
+                self.vt_pos = int(self.vt_pos + (2/self.frame_rate)/vs.time_base)
                 if fail%100 == 0:
                     if fail >= 10000:
                         log.critical(f"Repeated InvalidDataError, skipped {fail} frames but found nothing good")
                         break
                     log.debug(f"InvalidDataError during decode -- seeking ahead #{fail}")
-                fail += 1
-                self.vt_pos = int(self.vt_pos + (1/self.frame_rate)/vs.time_base)
-                self.container.seek(self.vt_pos, stream=vs, any_frame=True, backward=False)
-                self._flush()
+                    self._resync(self.vt_pos)
+                else:
+                    self.container.seek(self.vt_pos, stream=vs, any_frame=True, backward=False)
                 iter = self.container.decode(**self.streams)
                 continue
+            
+            if fail:
+                log.debug(f"Resync'd after {fail} skipped/dropped/corrupt/whatever frames")
+                self._flush()
+                fail = 0
             
             if type(frame) is av.AudioFrame:
                 self._queue_audio(frame)
@@ -229,7 +230,7 @@ class Player:
                         if e.errno != errno.EAGAIN:
                             raise
                         continue
-                self.vt_pos = frame.time
+                self.vt_pos = frame.pts
                 yield frame
         
         self._resample_audio()

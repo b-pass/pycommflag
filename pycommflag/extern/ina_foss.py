@@ -307,3 +307,10 @@ class AudioSegmentLabel(Enum):
 
     noise = 3
     NOISE = 3
+
+    def count():
+        return 4
+
+    def color(self):
+        colors = ['black','green','yellow','red']
+        return colors[self.value]
