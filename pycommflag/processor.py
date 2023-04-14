@@ -15,6 +15,8 @@ from .player import Player
 from .scene import Scene
 from .extern import ina_foss
 
+FLOG_VERSION = 2
+
 def process_video(video_filename:str, feature_log:str|BinaryIO, opts:Any=None) -> None:
     logo = None
     if type(feature_log) is str:
@@ -53,9 +55,16 @@ def process_video(video_filename:str, feature_log:str|BinaryIO, opts:Any=None) -
 
     fcolor = None
     feature_log.seek(0)
-    feature_log.write(struct.pack('@IffI', 1, player.duration, player.frame_rate, 0))
+    feature_log.write(struct.pack('@Iff', FLOG_VERSION, player.duration, player.frame_rate))
+    feature_log.write(struct.pack('IIII', 0, 0, 0, 0))
+
     logo_finder.write(feature_log, logo)
     
+    pos = feature_log.tell()
+    feature_log.seek(12, 0)
+    feature_log.write(struct.pack('I', pos))
+    feature_log.seek(pos)
+
     for frame in player.frames():
         p += 1
         fcount += 1
@@ -63,7 +72,7 @@ def process_video(video_filename:str, feature_log:str|BinaryIO, opts:Any=None) -
             ro = rt
             rt = time.perf_counter()
             print("Extracting, %5.1f%% (%5.1f fps)           " % (min(fcount/percent,100.0), p/(rt - ro)), end='\r')
-            gc.collect()
+            #gc.collect()
             p = 0
         
         fcolor = frame.to_ndarray(format="rgb24", height=720, width=frame.width*(720/frame.height))
@@ -97,6 +106,11 @@ def process_video(video_filename:str, feature_log:str|BinaryIO, opts:Any=None) -
     
     feature_log.write(struct.pack('I', 0xFFFFFFFF))
 
+    pos = feature_log.tell()
+    feature_log.seek(16, 0)
+    feature_log.write(struct.pack('I', pos))
+    feature_log.seek(pos)
+
     if not opts.quiet:
         print('Extraction complete           ')
         print('Segmenting audio...')
@@ -106,10 +120,10 @@ def process_video(video_filename:str, feature_log:str|BinaryIO, opts:Any=None) -
     
     feature_log.write(struct.pack('I', len(audio)))
     for (lab,start,stop) in audio:
-        feature_log.write(struct.pack('Iff', aseg.outlabels.index(lab), start, stop))
+        feature_log.write(struct.pack('Iff', ina_foss.AudioSegmentLabel[lab].value, start, stop))
 
     pos = feature_log.tell()
-    feature_log.seek(12, 0)
+    feature_log.seek(20, 0)
     feature_log.write(struct.pack('@I', pos))
     feature_log.seek(pos)
     
@@ -136,7 +150,12 @@ def read_logo(log_in:str|BinaryIO) -> None|tuple:
     if type(log_in) is str:
         with open(log_in, 'r+b') as fd:
             return read_logo(fd)
-    (ver,duration,frame_rate,scene_pos) = struct.unpack('@IffI', log_in.read(16))
+    
+    (ver,duration,frame_rate) = struct.unpack('@Iff', log_in.read(12))
+    if ver != FLOG_VERSION:
+        raise RuntimeError("Unsupported feature log version: "+str(ver))
+    log_in.read(16) # poses
+
     return logo_finder.read(log_in)
 
 def process_scenes(log_f:str|BinaryIO, opts:Any=None) -> list[Scene]:
@@ -149,15 +168,28 @@ def process_scenes(log_f:str|BinaryIO, opts:Any=None) -> list[Scene]:
     else:
         scene_thresh = 15.0
 
-    print("Processing feature log into scenes...")
+    if not opts.quiet: print("Processing feature log into scenes...")
     log_f.seek(0)
+    
+    (ver,duration,frame_rate) = struct.unpack('@Iff', log_f.read(12))
+    if ver != FLOG_VERSION:
+        raise RuntimeError("Unsupported feature log version: "+str(ver))
 
-    (ver,duration,frame_rate,scene_pos) = struct.unpack('@IffI', log_f.read(16))
-    if ver > 256:
-        raise RuntimeError("Wrong endianness in feature log data.")
+    (frame_pos,audio_pos,scene_pos,x_pos) = struct.unpack('IIII', log_f.read(16))
     
     logo_finder.read(log_f)
-    
+
+    audio = []
+    log_f.seek(audio_pos)
+    (na,) = struct.unpack('I', log_f.read(4))
+    for i in range(na):
+        audio.append(struct.unpack('Iff', log_f.read(12)))
+    if not audio:
+        audio = [(ina_foss.AudioSegmentLabel.SILENCE, 0, duration)]
+    audio_idx = 0
+
+    log_f.seek(frame_pos)
+
     fprev = 0
     column = None
     scenes = []
@@ -176,11 +208,16 @@ def process_scenes(log_f:str|BinaryIO, opts:Any=None) -> list[Scene]:
         fprev = fnum
         prev_col = column
 
-        (ftime, logo_present, frame_blank, scene_change, depth, h, w) = struct.unpack('f???BII', log_f.read(20))
+        (ftime, logo_present, frame_blank, scene_change, depth, h, w) = struct.unpack('f???BII', log_f.read(16))
         column = np.fromfile(log_f, 'uint8', depth*h*w, '').astype('int16')
         column.shape = (h,w,depth)
 
-        peaks = None # TODO FIXME
+        while audio_idx+1 < len(audio) and audio[audio_idx][2] <= ftime:
+            audio_idx += 1
+        if ftime >= audio[audio_idx][1] and ftime < audio[audio_idx][2]:
+            faudio = audio[audio_idx][0]
+        else:
+            faudio = ina_foss.AudioSegmentLabel.SILENCE
 
         if frame_blank:
             if scene is not None:
@@ -189,7 +226,7 @@ def process_scenes(log_f:str|BinaryIO, opts:Any=None) -> list[Scene]:
                 scene = None
             scene_change = True
             prev_sc = False
-            blanks.append((ftime, column, peaks, logo_present))
+            blanks.append((ftime, column, faudio, logo_present))
             continue
 
         if blanks:
@@ -199,7 +236,7 @@ def process_scenes(log_f:str|BinaryIO, opts:Any=None) -> list[Scene]:
                 scene += bf
             scene.finish()
             scenes.append(scene)
-            scene = Scene(ftime, column, peaks, logo_present)
+            scene = Scene(ftime, column, faudio, logo_present)
             blanks = []
             prev_sc = False
             scene_change = False
@@ -217,21 +254,21 @@ def process_scenes(log_f:str|BinaryIO, opts:Any=None) -> list[Scene]:
         
         #print(len(scene) if scene else '-',ftime, column, peaks, logo_present)
         if scene is not None and (prev_sc or not scene_change):
-            scene += (ftime, column, peaks, logo_present)
+            scene += (ftime, column, faudio, logo_present)
         else:
             if scene is not None:
                 scene.finish(ftime)
                 scenes.append(scene)
-            scene = Scene(ftime, column, peaks, logo_present)
+            scene = Scene(ftime, column, faudio, logo_present)
         prev_sc = scene_change
     
     scene.finish()
     scenes.append(scene)
 
-    print("Done, got",len(scenes),"scenes in",fprev,"frames")
-
+    if not opts.quiet: print("Done, got",len(scenes),"scenes in",fprev,"frames")
+    
     if scene_pos:
-        assert(log_f.tell() == scene_pos)
+        log_f.seek(scene_pos)
         log_f.truncate(scene_pos)
         rewrite_scenes(scenes, log_f)
     
@@ -242,7 +279,7 @@ def read_scenes(log_f:str|BinaryIO) -> None:
         with open(log_f, 'r+b') as fd:
             return read_scenes(fd)
     
-    log_f.seek(12)
+    log_f.seek(20)
     (scene_pos,) = struct.unpack('I', log_f.read(4))
     if scene_pos < 20:
         return []
@@ -262,14 +299,14 @@ def rewrite_scenes(scenes:list[Scene], log_f:str|BinaryIO) -> None:
         with open(log_f, 'r+b') as fd:
             return rewrite_scenes(scenes, fd)
     
-    log_f.seek(12)
+    log_f.seek(20)
     (scene_pos,) = struct.unpack('I', log_f.read(4))
     if scene_pos < 20:
         if not scenes:
             return
         log_f.seek(0, 2)
         scene_pos = log_f.tell()
-        log_f.seek(12)
+        log_f.seek(20)
         log_f.write(struct.pack('I', scene_pos))
     log_f.seek(scene_pos)
     

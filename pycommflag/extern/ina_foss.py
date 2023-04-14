@@ -29,7 +29,7 @@ import os
 import warnings
 import numpy as np
 
-#from .ina_sidekit import *
+from .ina_sidekit import *
 from .pyannote import viterbi_decoding
 
 def sample2feats(sig):
@@ -62,8 +62,6 @@ import os
 import sys
 
 import numpy as np
-from tensorflow import keras
-from keras.utils import get_file
 from skimage.util.shape import view_as_windows as vaw
 import gc
 
@@ -144,6 +142,9 @@ class DnnSegmenter:
     * outlabels: the labels associated the output of neural network models
     """
     def __init__(self, batch_size):
+        from tensorflow import keras
+        from keras.utils import get_file
+        
         # load the DNN model
         url = 'https://github.com/ina-foss/inaSpeechSegmenter/releases/download/models/'
 
@@ -291,3 +292,18 @@ class Segmenter:
         mspec, loge, difflen = sample2feats(samples)
         # do segmentation   
         return self.segment_feats(mspec, loge, difflen, 0)
+
+from enum import Enum
+class AudioSegmentLabel(Enum):
+    noEnergy = 0
+    silence = 0
+    SILENCE = 0
+
+    speech = 1
+    SPEECH = 1
+
+    music = 2
+    MUSIC = 2
+
+    noise = 3
+    NOISE = 3

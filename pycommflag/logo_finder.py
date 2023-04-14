@@ -163,7 +163,7 @@ def write(frame_log:BinaryIO, logo:tuple) -> None:
 def read(log_in:BinaryIO) -> tuple|None:
     import struct
     buf = log_in.read(20)
-    if len(buf) == 0:
+    if len(buf) != 20:
         return None
     info = struct.unpack('IIIII', buf)
     if not info[0]:
