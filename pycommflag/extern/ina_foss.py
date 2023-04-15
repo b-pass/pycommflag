@@ -201,6 +201,13 @@ class DnnSegmenter:
         return ret
 
 
+class Silence:
+    # Energetic activity detection
+    outlabels = ('noEnergy', 'energy')
+    inlabel = 'energy'
+    def __call__(self, mspec, lseg, difflen = 0):
+        return lseg
+
 class SpeechMusic(DnnSegmenter):
     # Voice activity detection: requires energetic activity detection
     outlabels = ('speech', 'music')
@@ -249,11 +256,13 @@ class Segmenter:
         self.energy_ratio = energy_ratio
 
         # select speech/music or speech/music/noise voice activity detection engine
-        assert vad_engine in ['sm', 'smn']
+        assert vad_engine in ['sm', 'smn', '']
         if vad_engine == 'sm':
             self.vad = SpeechMusic(batch_size)
         elif vad_engine == 'smn':
             self.vad = SpeechMusicNoise(batch_size)
+        elif vad_engine == '':
+            self.vad = Silence()
 
         # load gender detection NN if required
         assert detect_gender in [True, False]
@@ -282,7 +291,7 @@ class Segmenter:
         # perform voice activity detection
         lseg = self.vad(mspec, lseg, difflen)
 
-        # perform gender segmentation on speech segments
+        # perform gender identification on speech segments
         if self.detect_gender:
             lseg = self.gender(mspec, lseg, difflen)
 
@@ -299,6 +308,7 @@ class AudioSegmentLabel(Enum):
     silence = 0
     SILENCE = 0
 
+    energy = 1
     speech = 1
     SPEECH = 1
 
