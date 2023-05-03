@@ -180,8 +180,6 @@ def _process_audio(aseg, prev, segments):
             continue
         res.append((lab, start+sb, start+se))
     
-    print(len(res))
-    print(res)
     return (res, prev)
 
 def read_logo(log_in:str|BinaryIO) -> None|tuple:
@@ -314,7 +312,11 @@ def read_audio(log_f:str|BinaryIO) -> None:
     (n,) = struct.unpack('I', log_f.read(4))
     audio = []
     for i in range(n):
-        audio.append(struct.unpack('Iff', log_f.read(12)))
+        (t,b,e) = struct.unpack('Iff', log_f.read(12))
+        if audio and audio[-1][1] <= b and audio[-1][2] > b:
+            old = audio.pop()
+            audio.append((old[0],old[1],b)) # overlapping, truncate old
+        audio.append((t,b,e))
     
     return audio
 

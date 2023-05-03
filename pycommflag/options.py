@@ -23,7 +23,7 @@ def get_options():
                         help="Python logger's logging level")
     parser.add_argument('--yaml', dest='yaml', type=str,
                         help="Pull configuration from a yaml file and overwrite commandline configuration and default with that.")
-    parser.add_argument('--deinterlace', dest='no_deinterlace', action='store_false', default=False,
+    parser.add_argument('--deinterlace', dest='no_deinterlace', action='store_false',
                         help="Use a deinterlacing filter during video processing")
     parser.add_argument('--scene-threshold', dest='scene_threshold', type=float, default=15.0,
                         help="Difference threshold (column/bar) for marking a scene change [8-30 is sane].")
@@ -47,7 +47,7 @@ def get_options():
     ml = parser.add_argument_group('Machine Learning')
     ml.add_argument('--train', dest="train", action='store_true', 
                   help="Train the ML model")
-    ml.add_argument('--data', dest="ml_data", action="append",
+    ml.add_argument('--data', dest="ml_data", action="append", nargs='+',
                   help="Data to train the model with, as a list of feature-log files")
     ml.add_argument('--batch-size', dest='tf_batch_size', type=int, default=1000,
                   help="Model training batch size")
@@ -83,11 +83,7 @@ def parse_argv():
     import sys
     import logging as log
     opts = get_options()
-    (cfg,args) = opts.parse_args()
-    if args:
-        if not cfg.ml_data:
-            cfg.ml_data = []
-        cfg.ml_data += args
+    cfg = opts.parse_args()
 
     if cfg.yaml:
         for (k,v) in parse_yaml(cfg.yaml).items():
