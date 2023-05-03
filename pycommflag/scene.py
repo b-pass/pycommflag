@@ -3,9 +3,10 @@ from typing import BinaryIO
 import numpy as np
 import struct
 import pickle
+from .extern.ina_foss import AudioSegmentLabel
 
 class Scene:
-    def __init__(self,ftime:float=None,column:np.ndarray=None,audio:Enum|int=0,logo_present:bool=None,is_blank:bool=False,infile=None):
+    def __init__(self,ftime:float=None,column:np.ndarray=None,audio:Enum|int=0,logo_present:bool=None,is_blank:bool=False,is_diff:bool=False,infile=None):
         if infile is not None:
             self.read_bin(infile)
         else:
@@ -21,11 +22,12 @@ class Scene:
             self.audio_start = audio
             self.audio_end = audio
             self.logo_count = 1 if logo_present else 0
-            self.is_blank = is_blank
+            self.blank_count = 1 if is_blank else 0
+            self.diff_count = 0
             self.type = SceneType.UNKNOWN
             #s.newtype = None
         
-    def __iadd__(self, tup:tuple[float,np.ndarray,Enum|int,bool]):
+    def __iadd__(self, tup:tuple[float,np.ndarray,Enum|int,bool,bool,bool]):
         assert(not self.finished)
         self.stop_time = tup[0]
         self.frame_count += 1
@@ -37,6 +39,10 @@ class Scene:
         self.audio[self.audio_end] += 1
         if tup[3]:
             self.logo_count += 1
+        if tup[4]:
+            self.blank_count += 1
+        if tup[5]:
+            self.diff_count += 1
         return self
     
     def finish(self, next_frame_time:float=None):
@@ -46,6 +52,8 @@ class Scene:
         self.barcode = (self.barcode / self.frame_count).astype('uint8')
         self.audio = [x / self.frame_count for x in self.audio]
         self.logo = self.logo_count / self.frame_count 
+        self.blank = self.blank_count / self.frame_count
+        self.diff = self.diff_count / self.frame_count
         self.finished = True
     
     def difference(self, other:Scene):
@@ -96,11 +104,14 @@ class Scene:
         self.audio_percent = [0.0]*na
         for i in range(na):
             self.audio_percent[i] = struct.unpack('f',fd.read(4))
-        (self.logo_count, isblank, type) = struct.unpack('III', fd.read(12))
-        self.is_blank = bool(isblank)
+        (self.logo_count, self.blank_count, self.diff_count) = struct.unpack('III', fd.read(12))
+        self.logo = self.logo_count / self.frame_count 
+        self.blank = self.blank_count / self.frame_count
+        self.diff = self.diff_count / self.frame_count
+        
+        (stype,) = struct.unpack('I', fd.read(4))
         self.type = SceneType(type)
 
-        self.logo = self.logo_count / self.frame_count 
         self.finished = True
     
 

@@ -10,12 +10,12 @@ import gc
 
 from typing import Any,BinaryIO
 
-from . import logo_finder, mythtv
+from . import logo_finder, mythtv, segmenter
 from .player import Player
 from .scene import Scene
 from .extern import ina_foss
 
-FLOG_VERSION = 2
+FLOG_VERSION = 3
 
 def process_video(video_filename:str, feature_log:str|BinaryIO, opts:Any=None) -> None:
     logo = None
@@ -65,6 +65,11 @@ def process_video(video_filename:str, feature_log:str|BinaryIO, opts:Any=None) -
     feature_log.write(struct.pack('I', pos))
     feature_log.seek(pos)
 
+    audio_interval = int(player.frame_rate * 60)
+    aseg = ina_foss.Segmenter(energy_ratio=0.05)
+    aprev = None
+    audio = []
+
     for frame in player.frames():
         p += 1
         fcount += 1
@@ -75,6 +80,10 @@ def process_video(video_filename:str, feature_log:str|BinaryIO, opts:Any=None) -
             #gc.collect()
             p = 0
         
+        if fcount%audio_interval == 0:
+            (ares, aprev) = _process_audio(aseg, aprev, player.move_audio())
+            audio += ares
+
         fcolor = frame.to_ndarray(format="rgb24", height=720, width=frame.width*(720/frame.height))
         
         # trying to be fast, just look at the middle 1/4 for blank-ish-ness and then verify with the full frame
@@ -104,6 +113,8 @@ def process_video(video_filename:str, feature_log:str|BinaryIO, opts:Any=None) -
         ))
         column.astype('uint8').tofile(feature_log)
     
+    audio += _process_audio(aseg, aprev, player.move_audio())[0]
+
     feature_log.write(struct.pack('I', 0xFFFFFFFF))
 
     pos = feature_log.tell()
@@ -111,13 +122,6 @@ def process_video(video_filename:str, feature_log:str|BinaryIO, opts:Any=None) -
     feature_log.write(struct.pack('I', pos))
     feature_log.seek(pos)
 
-    if not opts.quiet:
-        print('Extraction complete           ')
-        print('Segmenting audio...')
-    
-    aseg = ina_foss.Segmenter()
-    audio = aseg(player.all_audio())
-    
     feature_log.write(struct.pack('I', len(audio)))
     for (lab,start,stop) in audio:
         feature_log.write(struct.pack('Iff', ina_foss.AudioSegmentLabel[lab].value, start, stop))
@@ -127,7 +131,8 @@ def process_video(video_filename:str, feature_log:str|BinaryIO, opts:Any=None) -
     feature_log.write(struct.pack('@I', pos))
     feature_log.seek(pos)
     
-    if not opts.quiet: print('Video processing complete')
+    if not opts.quiet:
+        print('Extraction complete           ')
 
 def mean_axis1_float_uint8(fcolor:np.ndarray)->np.ndarray:
     # the below code is equivalent to:
@@ -146,6 +151,39 @@ def mean_axis1_float_uint8(fcolor:np.ndarray)->np.ndarray:
 def columnize_frame(frame)->np.ndarray:
     return mean_axis1_float_uint8(frame.to_ndarray(format="rgb24", height=720, width=frame.width*(720/frame.height)))
 
+def _process_audio(aseg, prev, segments):
+    if not segments:
+        return ([],prev)
+    
+    #print(prev,segments)
+    isstart = False
+    if prev is None:
+        prev = segments.pop(0)
+        isstart = True
+    
+    all = prev[0]
+    start = prev[1]
+    time = prev[1] + len(prev[0])/16000
+    for s in segments:
+        missing = int(round((s[1] - time)*16000))
+        if missing > 0:
+            all = np.append(all, np.zeros(missing, 'float32'))
+        all = np.append(all, s[0])
+        time = s[1] + len(s[0])/16000
+    
+    prev = (all[-8000:], start+(len(all)-8000)/16000)
+    res = []
+
+    startbound = 0 if isstart else 0.5
+    for (lab, sb, se) in aseg(all):
+        if se <= startbound:
+            continue
+        res.append((lab, start+sb, start+se))
+    
+    print(len(res))
+    print(res)
+    return (res, prev)
+
 def read_logo(log_in:str|BinaryIO) -> None|tuple:
     if type(log_in) is str:
         with open(log_in, 'r+b') as fd:
@@ -158,18 +196,15 @@ def read_logo(log_in:str|BinaryIO) -> None|tuple:
 
     return logo_finder.read(log_in)
 
-def process_scenes(log_f:str|BinaryIO, opts:Any=None) -> list[Scene]:
+def segment_scenes(log_f:str|BinaryIO, opts:Any) -> list[Scene]:
     if type(log_f) is str:
         with open(log_f, 'r+b') as fd:
-            return process_scenes(fd, opts=opts)
+            return segment_scenes(fd, opts=opts)
 
-    if opts and opts.scene_threshold:
-        scene_thresh = float(opts.scene_threshold)
-    else:
-        scene_thresh = 15.0
-
-    if not opts.quiet: print("Processing feature log into scenes...")
+    if not opts.quiet: print("Segmenting feature log into scenes...")
     log_f.seek(0)
+
+    fseg = segmenter.parse(opts.segmeth)
     
     (ver,duration,frame_rate) = struct.unpack('@Iff', log_f.read(12))
     if ver != FLOG_VERSION:
@@ -190,7 +225,7 @@ def process_scenes(log_f:str|BinaryIO, opts:Any=None) -> list[Scene]:
     column = None
     scenes = []
     scene = None
-    blanks = []
+    prev_check = None
     while True:
         d = log_f.read(4)
         if len(d) < 4:
@@ -204,7 +239,7 @@ def process_scenes(log_f:str|BinaryIO, opts:Any=None) -> list[Scene]:
         fprev = fnum
         prev_col = column
 
-        (ftime, logo_present, frame_blank, scene_change, depth, h, w) = struct.unpack('f???BII', log_f.read(16))
+        (ftime, logo_present, frame_blank, is_diff, depth, h, w) = struct.unpack('f???BII', log_f.read(16))
         column = np.fromfile(log_f, 'uint8', depth*h*w, '').astype('int16')
         column.shape = (h,w,depth)
 
@@ -215,48 +250,23 @@ def process_scenes(log_f:str|BinaryIO, opts:Any=None) -> list[Scene]:
         else:
             faudio = ina_foss.AudioSegmentLabel.SILENCE
 
-        if frame_blank:
+        if prev_col is None:
+            is_diff = False
+        else:
+            diff = column - prev_col
+            scm = np.mean(np.std(np.abs(diff), (0)))
+            is_diff = scm >= opts.scene_threshold 
+        
+        segbreak = fseg.check(ftime=ftime, faudio=faudio, logo_present=logo_present, is_blank=frame_blank, is_diff=is_diff)
+        if segbreak != prev_check:
             if scene is not None:
                 scene.finish()
                 scenes.append(scene)
                 scene = None
-            scene_change = True
-            prev_sc = False
-            blanks.append((ftime, column, faudio, logo_present))
-            continue
-
-        if blanks:
-            assert(scene is None)
-            scene = Scene(*blanks[0], is_blank=True)
-            for bf in blanks[1:]:
-                scene += bf
-            scene.finish()
-            scenes.append(scene)
-            scene = Scene(ftime, column, faudio, logo_present)
-            blanks = []
-            prev_sc = False
-            scene_change = False
-            continue
-        
-        if prev_col is None:
-            scene_change = True
+            scene = Scene(ftime, column, faudio, logo_present, frame_blank, is_diff)
         else:
-            diff = column - prev_col
-            scm = np.mean(np.std(np.abs(diff), (0)))
-            if scm >= scene_thresh or (scm >= scene_thresh*2 and prev_sc):
-                scene_change = True
-            else:
-                scene_change = False
-        
-        #print(len(scene) if scene else '-',ftime, column, peaks, logo_present)
-        if scene is not None and (prev_sc or not scene_change):
-            scene += (ftime, column, faudio, logo_present)
-        else:
-            if scene is not None:
-                scene.finish(ftime)
-                scenes.append(scene)
-            scene = Scene(ftime, column, faudio, logo_present)
-        prev_sc = scene_change
+            scene += (ftime, column, faudio, logo_present, frame_blank, is_diff)
+        prev_check = segbreak
     
     scene.finish()
     scenes.append(scene)

@@ -322,5 +322,5 @@ class AudioSegmentLabel(Enum):
         return 4
 
     def color(self):
-        colors = ['black','green','yellow','red']
+        colors = ['black','light blue','yellow','red']
         return colors[self.value]

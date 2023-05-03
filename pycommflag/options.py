@@ -1,67 +1,72 @@
-import optparse
+import argparse
 
 # todo: automatically gz/ungz the frame logs
 
 def get_options():
-    parser = optparse.OptionParser(add_help_option=True)
+    parser = argparse.ArgumentParser(add_help=True,formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
-    parser.add_option('-f', '--file', dest="filename", type='string',
+    parser.add_argument('-f', '--file', dest="filename", type=str,
                         help="Video input file name")
-    parser.add_option('-l', '--feature-log', dest="feature_log", type='string',
+    parser.add_argument('-l', '--feature-log', dest="feature_log", type=str,
                         help="In/Out location of feature log. If a video file is processed then this file will be overwritten. cf_[filename].feat")
-    parser.add_option('--no-log', dest="no_feature_log", action='store_true',
+    parser.add_argument('--no-log', dest="no_feature_log", action='store_true',
                         help="Use a temporary file for the feature log (which won't persist anywhere)")
-    parser.add_option('-c','--break-text', dest='comm_file', type='string',
+    parser.add_argument('-c','--break-text', dest='comm_file', type=str,
                         help="Output location for commercial break results")
-    parser.add_option('-r', '--reprocess', dest="reprocess", type='string', 
+    parser.add_argument('-r', '--reprocess', dest="reprocess", type=str, 
                         help="Input location of feature data log to be reprocessed.")
-    parser.add_option('-g', '--gui', dest='gui', action='store_true', 
+    parser.add_argument('-g', '--gui', dest='gui', action='store_true', 
                         help="(Re)Process and then display for GUI editing.  Must also supply --file and --feature-log for the thing being edited in the GUI.")
-    parser.add_option('-q', '--quiet', dest='quiet', action='store_true',
+    parser.add_argument('-q', '--quiet', dest='quiet', action='store_true',
                         help="Do not print progress during processing")
-    parser.add_option('--loglevel', dest='loglevel', type='string',
+    parser.add_argument('--loglevel', dest='loglevel', type=str,
                         help="Python logger's logging level")
-    parser.add_option('--yaml', dest='yaml', type='string',
+    parser.add_argument('--yaml', dest='yaml', type=str,
                         help="Pull configuration from a yaml file and overwrite commandline configuration and default with that.")
-    parser.add_option('--no-deinterlace', dest='no_deinterlace', action='store_true',
-                        help="Never use a deinterlacing filter")
-    parser.add_option('--scene-threshold', dest='scene_threshold', type='float',
+    parser.add_argument('--deinterlace', dest='no_deinterlace', action='store_false', default=False,
+                        help="Use a deinterlacing filter during video processing")
+    parser.add_argument('--scene-threshold', dest='scene_threshold', type=float, default=15.0,
                         help="Difference threshold (column/bar) for marking a scene change [8-30 is sane].")
     
-    logo = optparse.OptionGroup(parser, 'Logo Search')
-    logo.add_option('--no-logo', dest='no_logo', action='store_true', 
+    logo = parser.add_argument_group('Logo Search')
+    logo.add_argument('--no-logo', dest='no_logo', action='store_true', 
                     help="Disable logo searching")
-    logo.add_option('--skip', dest="logo_skip", type="int", default=4,
+    logo.add_argument('--skip', dest="logo_skip", type=int, default=4,
                     help="Only search every Nth frame during the logo search phase.  (Speeds up searching at a slight cost to accuracy.)")
-    logo.add_option('--logo-search-all', dest="logo_search_all", action='store_true',
+    logo.add_argument('--logo-search-all', dest="logo_search_all", action='store_true',
                     help="Search the entire video for the logo (perfect detection)")
-    #logo.add_option('--check-blanks', dest="blanks_check_logo", action="store_true",
+    #logo.add_argument('--check-blanks', dest="blanks_check_logo", action="store_true",
     #                help="Include logo area when checking for blank frames (tends towards not marking frames blank if they have logo)")
-    parser.add_option_group(logo)
+    parser.add_argument_group(logo)
     
-    ml = optparse.OptionGroup(parser, 'Machine Learning')
-    ml.add_option('--train', dest="train", action='store_true', 
+    seg = parser.add_argument_group('Scene Segmentation')
+    seg.add_argument('--segment', dest='segmeth', type=str, default='silence|blank|logo',
+                   help="Scene segmentation instruction; split video into scenes using the demuxers.\nPlus to AND them, comma or pipe to OR them.\nSegmenters: logo,silence,audio,blank,imagediff,1s")
+    parser.add_argument_group(seg)
+
+    ml = parser.add_argument_group('Machine Learning')
+    ml.add_argument('--train', dest="train", action='store_true', 
                   help="Train the ML model")
-    ml.add_option('--data', dest="ml_data", action="append",
+    ml.add_argument('--data', dest="ml_data", action="append",
                   help="Data to train the model with, as a list of feature-log files")
-    ml.add_option('--batch-size', dest='tf_batch_size', type='int', default=1000,
+    ml.add_argument('--batch-size', dest='tf_batch_size', type=int, default=1000,
                   help="Model training batch size")
-    parser.add_option_group(ml)
+    parser.add_argument_group(ml)
     
-    mcf = optparse.OptionGroup(parser, 'MythTV Options', description="Commandline compatibility with mythcommflag")
-    mcf.add_option('--chanid', dest='chanid', type='int', 
+    mcf = parser.add_argument_group('MythTV Options', description="Commandline compatibility with mythcommflag")
+    mcf.add_argument('--chanid', dest='chanid', type=int, 
                     help="Channel ID of recording, filename will be fetched from the mythtv database")
-    mcf.add_option('--starttime', dest="starttime",
+    mcf.add_argument('--starttime', dest="starttime",
                     help="Start timestamp of recording, filename will be fetched from the mythtv database")
-    mcf.add_option('--queue', dest="queue", action="store_true",
+    mcf.add_argument('--queue', dest="queue", action="store_true",
                     help="Insert a job into the mythtv job queue")
-    mcf.add_option('--rebuild', dest="rebuild", action="store_true",
-                    help="Rebuild seek table (execs mythcommflag directly to do this)")
-    mcf.add_option('--mythtv-out', dest="mythtv_output", action="store_true",
-                    help="Write flagging output to mythtv database even though --chanid and --starttime were not specified")
-    mcf.add_option('--no-mythtv-out', dest="no_mythtv_output", action="store_true",
-                    help="Do NOT write flagging output to mythtv database even though --chanid and --starttime were specified")
-    parser.add_option_group(mcf)
+    mcf.add_argument('--rebuild', dest="rebuild", action="store_true",
+                    help="Rebuild seek table (this will just exec mythcommflag directly to do this)")
+    #mcf.add_argument('--mythtv-out', dest="mythtv_output", action="store_true",
+    #                help="Write flagging output to mythtv database even though --chanid and --starttime were not specified")
+    #mcf.add_argument('--no-mythtv-out', dest="no_mythtv_output", action="store_true",
+    #                help="Do NOT write flagging output to mythtv database even though --chanid and --starttime were specified")
+    parser.add_argument_group(mcf)
 
     return parser
 

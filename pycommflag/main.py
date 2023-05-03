@@ -15,7 +15,7 @@ def run(opts:Any) -> None|int:
         os.execvp("mythcommflag", ["mythcommflag", "--queue", "--chanid", opts.chanid, "--starttime", opts.starttime])
     
     if opts.reprocess:
-        scenes = processor.process_scenes(opts.reprocess, opts=opts)
+        scenes = processor.segment_scenes(opts.reprocess, opts=opts)
         return 0
     
     if opts.train:
@@ -36,7 +36,7 @@ def run(opts:Any) -> None|int:
         logo = processor.read_logo(opts.feature_log) if opts.feature_log else None
         scenes = processor.read_scenes(opts.feature_log) if opts.feature_log else []
         if not scenes:
-            scenes = processor.process_scenes(opts.feature_log) if opts.feature_log else []
+            scenes = processor.segment_scenes(opts.feature_log, opts=opts) if opts.feature_log else []
         audio = processor.read_audio(opts.feature_log) if opts.feature_log else []
         got_tags = False
         for s in scenes:
@@ -60,6 +60,6 @@ def run(opts:Any) -> None|int:
         feature_log = opts.feature_log
     
     processor.process_video(opts.filename, feature_log, opts)
-    scenes = processor.process_scenes(feature_log, opts=opts)
+    scenes = processor.segment_scenes(feature_log, opts=opts)
     
     return 0

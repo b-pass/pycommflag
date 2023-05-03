@@ -123,7 +123,7 @@ class Player:
             d = np.vstack(x)
         
         if d.shape[0] >= 4 or (d.shape[0] == 3 and af.layout.channels[2].name.endswith('C')):
-            d = (d[0,...] + d[1,...] + d[2,...]) / 3.0
+            d = (d[0,...] + d[1,...] + d[2,...]) / 3 #d = ((d[0,...] + d[1,...]) / 2.0 + d[2,...]) / 1.4142
         elif d.shape[0] >= 2:
             d = (d[0,...] + d[1,...]) / 2.0
         else:
@@ -131,9 +131,6 @@ class Player:
         
         #print("AQ:",d.shape,af.time-self.at_start,af.sample_rate)
         self.aq.append((d,af.time-self.at_start,af.sample_rate))
-        
-        if len(self.aq) >= 30:
-            self._resample_audio()
     
     def _resample_audio(self):
         # resample to 16 kHz
@@ -144,14 +141,15 @@ class Player:
         # out of order PTS, should never happen...?
         self.aq = sorted(self.aq, key=lambda x:x[1])
         
+        start = self.aq[0][1]
         samples = None
         psr = None
         while self.aq:
             (d,t,sr) = self.aq.pop(0)
+            #print(t,sr,len(d),t+len(d)/sr)
             if psr != sr and samples is not None:
-                if sr is None or sr < 1:
-                    continue
-                self._audio_res.append(spsig.resample(samples, int(len(samples)*16000/psr)))
+                self._audio_res.append((spsig.resample(samples, int(len(samples)*16000/psr))), start)
+                start = self.aq[0][1] if self.aq else -1
                 samples = None
             psr = sr
             if samples is not None:
@@ -160,7 +158,7 @@ class Player:
                 samples = d
         
         if samples is not None:
-            self._audio_res.append(spsig.resample(samples, int(len(samples)*16000/psr)))
+            self._audio_res.append((spsig.resample(samples, int(len(samples)*16000/psr)), start))
 
     def _flush(self):
         if self.graph:
@@ -185,10 +183,10 @@ class Player:
         self.container.seek(pts, stream=self.container.streams.video[0], any_frame=True, backward=False)
         self._flush()
 
-    def all_audio(self):
+    def move_audio(self)->list[tuple[np.ndarray,float]]:
         self._resample_audio()
-        x = np.concatenate(self._audio_res, axis=None) if self._audio_res else np.array([0], 'float32')
-        self._audio_res = [] # free some memory?
+        x = self._audio_res
+        self._audio_res = []
         return x
 
     def frames(self) -> iter:
@@ -202,7 +200,7 @@ class Player:
             except av.error.InvalidDataError as e:
                 fail += 1
                 vs = self.container.streams.video[self.streams.get('video', 0)]
-                self.vt_pos = int(self.vt_pos + (2/self.frame_rate)/vs.time_base)
+                self.vt_pos = int(self.vt_pos + (1/self.frame_rate)/vs.time_base)
                 if fail%100 == 0:
                     if fail >= 10000:
                         log.critical(f"Repeated InvalidDataError, skipped {fail} frames but found nothing good")

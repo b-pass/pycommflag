@@ -5,7 +5,6 @@ import numpy as np
 from PIL import ImageTk, Image
 from .player import Player
 from .scene import *
-from .processor import process_scenes
 from . import logo_finder
 from . import processor
 from .extern.ina_foss import AudioSegmentLabel
@@ -101,9 +100,9 @@ class Window(tk.Tk):
         b.grid(row=0, column=1, padx=5)
         self.misc.append(b)
 
-        #b = tk.Button(skips, text="|< Silence", command=lambda:self.prev(silence=True))
-        #b.grid(row=0, column=2, padx=5)
-        #self.misc.append(b)
+        b = tk.Button(skips, text="|< Silence", command=lambda:self.prev(silence=True))
+        b.grid(row=0, column=2, padx=5)
+        self.misc.append(b)
 
         b = tk.Button(skips, text="|< Scene", command=lambda:self.prev(scene=True))
         b.grid(row=0, column=3, padx=(5,10))
@@ -113,9 +112,9 @@ class Window(tk.Tk):
         b.grid(row=0, column=5, padx=(10,5))
         self.misc.append(b)
 
-        #b = tk.Button(skips, text="Silence >|", command=lambda:self.next(silence=True))
-        #b.grid(row=0, column=6, padx=5)
-        #self.misc.append(b)
+        b = tk.Button(skips, text="Silence >|", command=lambda:self.next(silence=True))
+        b.grid(row=0, column=6, padx=5)
+        self.misc.append(b)
         
         b = tk.Button(skips, text="Blank >|", command=lambda:self.next(blank=True))
         b.grid(row=0, column=7, padx=5)
@@ -129,8 +128,9 @@ class Window(tk.Tk):
         self.vidMap.grid(row=6, column=0, columnspan=5)
         self.vidMap.bind("<Button-1>", lambda e:self.move(abs=float(e.x)/1280.0*self.player.duration))
         
-        self.audMap = tk.Canvas(self, width=1280, height=50)
+        self.audMap = tk.Canvas(self, width=1280, height=25)
         self.audMap.grid(row=7, column=0, columnspan=5)
+        self.audMap.bind("<Button-1>", lambda e:self.move(abs=float(e.x)/1280.0*self.player.duration))
         
         self.scale_pos = tk.DoubleVar()
         self.scroller = tk.Scale(self, 
@@ -189,7 +189,7 @@ class Window(tk.Tk):
 
         self.move(abs=0)
     
-    def prev(self,scene=False,blank=False,cbreak=False):
+    def prev(self,scene=False,silence=False,blank=False,cbreak=False):
         if cbreak:
             want = True
             first = True
@@ -201,6 +201,17 @@ class Window(tk.Tk):
                     self.move(abs=s.stop_time-1/self.player.frame_rate)
                     return
         
+        if silence:
+            for (lab,start_time,stop_time) in reversed(self.audio):
+                if type(lab) is int:
+                    lab = AudioSegmentLabel(lab)
+                if lab != AudioSegmentLabel.SILENCE:
+                    continue
+                abs = start_time + (stop_time - start_time)/2
+                if (abs - self.position) < -3/self.player.frame_rate:
+                    self.move(abs=abs)
+                    return
+                
         for s in reversed(self.scenes):
             if blank and not s.is_blank:
                 continue
@@ -209,7 +220,7 @@ class Window(tk.Tk):
                 self.move(abs=abs)
                 return
 
-    def next(self,scene=False,blank=False,cbreak=False):
+    def next(self,scene=False,silence=False,blank=False,cbreak=False):
         if cbreak:
             want = True
             first = True
@@ -221,6 +232,17 @@ class Window(tk.Tk):
                     self.move(abs=s.start_time)
                     return
         
+        if silence:
+            for (lab,start_time,stop_time) in self.audio:
+                if type(lab) is int:
+                    lab = AudioSegmentLabel(lab)
+                if lab != AudioSegmentLabel.SILENCE:
+                    continue
+                abs = start_time + (stop_time - start_time)/2
+                if (abs - self.position) > 3/self.player.frame_rate:
+                    self.move(abs=abs)
+                    return
+
         for s in self.scenes:
             if blank and not s.is_blank:
                 continue
@@ -342,7 +364,7 @@ class Window(tk.Tk):
         for x in self.audMap.find_all():
             self.audMap.delete(x)
         
-        y = map_height
+        y = 25
         for (lab,start_time,stop_time) in self.audio:
             if type(lab) is int:
                 lab = AudioSegmentLabel(lab)
@@ -362,8 +384,8 @@ class Window(tk.Tk):
             self.audMap.create_rectangle(startx, 0, stopx, y, width=0, fill=lab.color())
 
         # lastly, add the positional indicator
-        self.aMapPos = self.audMap.create_line(0,0,0,map_height,arrow=tk.BOTH,fill='orange')
-        self.vMapPos = self.vidMap.create_line(0,0,0,map_height,arrow=tk.BOTH,fill='orange')
+        self.aMapPos = self.audMap.create_line(0,0,0,25,arrow=tk.BOTH,fill='orange')
+        self.vMapPos = self.vidMap.create_line(0,0,0,50,arrow=tk.BOTH,fill='orange')
         self.updatePosIndicators()
 
     def tag(self, type):
