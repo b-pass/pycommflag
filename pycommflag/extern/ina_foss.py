@@ -182,7 +182,7 @@ class DnnSegmenter:
 
         if len(batch) > 0:
             batch = np.concatenate(batch)
-            rawpred = self.nn.predict(batch, batch_size=self.batch_size, verbose=2)
+            rawpred = self.nn.predict(batch, batch_size=self.batch_size, verbose=0)
         gc.collect()
             
         ret = []

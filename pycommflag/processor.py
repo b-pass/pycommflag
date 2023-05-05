@@ -223,6 +223,8 @@ def segment_scenes(log_f:str|BinaryIO, opts:Any) -> list[Scene]:
     column = None
     scenes = []
     scene = None
+    temp_set = []
+    blanks = []
     prev_check = None
     while True:
         d = log_f.read(4)
@@ -255,26 +257,52 @@ def segment_scenes(log_f:str|BinaryIO, opts:Any) -> list[Scene]:
             scm = np.mean(np.std(np.abs(diff), (0)))
             is_diff = scm >= opts.scene_threshold 
         
-        segbreak = fseg.check(ftime=ftime, faudio=faudio, logo_present=logo_present, is_blank=frame_blank, is_diff=is_diff)
-        if segbreak != prev_check:
+        # When the segmenter returns True we end the scene and start another
+        # But if it returns consecutive Trues then we combine those into one Scene
+        # The subsequent Scene starts with the last True
+        # this also tends to keep the blanks together in a scene when using the 'blank' segmenter
+        # Also, Every scene should be at least 2 frames
+        if fseg.check(ftime=ftime, faudio=faudio, logo_present=logo_present, is_blank=frame_blank, is_diff=is_diff):
             if scene is not None:
                 scene.finish()
                 scenes.append(scene)
                 scene = None
-            scene = Scene(ftime, column, faudio, logo_present, frame_blank, is_diff)
+            temp_set.append((ftime, column, faudio, logo_present, frame_blank, is_diff))
+        elif scene is None:
+            if len(temp_set) > 2:
+                scene = Scene(*temp_set[0])
+                for x in temp_set[1:-1]:
+                    scene.add(*x)
+                scene.finish()
+                scenes.append(scene)
+                scene = None
+                temp_set = temp_set[-1:]
+            if temp_set:
+                scene = Scene(*temp_set[0])
+                for x in temp_set[1:]:
+                    scene.add(*x)
+                temp_set = []
+                scene.add(ftime, column, faudio, logo_present, frame_blank, is_diff)
+            else:
+                scene = Scene(ftime, column, faudio, logo_present, frame_blank, is_diff)
         else:
-            scene += (ftime, column, faudio, logo_present, frame_blank, is_diff)
-        prev_check = segbreak
+            scene.add(ftime, column, faudio, logo_present, frame_blank, is_diff)
     
+    if scene is None:
+         scene = Scene(*temp_set[0])
+         for x in temp_set[1:]:
+            scene.add(*x)
     scene.finish()
     scenes.append(scene)
 
     if not opts.quiet: print("Done, got",len(scenes),"scenes in",fprev,"frames")
+
+    #for s in scenes: print(s)
     
     if scene_pos:
         log_f.seek(scene_pos)
         log_f.truncate(scene_pos)
-        rewrite_scenes(scenes, log_f)
+        rewrite_scenes(scenes, log_f, opts=opts)
     
     return scenes
 
@@ -320,7 +348,8 @@ def read_audio(log_f:str|BinaryIO) -> None:
     
     return audio
 
-def rewrite_scenes(scenes:list[Scene], log_f:str|BinaryIO) -> None:
+def rewrite_scenes(scenes:list[Scene], log_f:str|BinaryIO, opts=None) -> None:
+    # TODO should we write the segmenter into the scenes? Training with two different segmenters might not make sense
     if type(log_f) is str:
         with open(log_f, 'r+b') as fd:
             return rewrite_scenes(scenes, fd)

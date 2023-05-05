@@ -40,14 +40,14 @@ def get_options():
     parser.add_argument_group(logo)
     
     seg = parser.add_argument_group('Scene Segmentation')
-    seg.add_argument('--segment', dest='segmeth', type=str, default='silence|blank|logo',
+    seg.add_argument('--segment', dest='segmeth', type=str, default='blank|audio',
                    help="Scene segmentation instruction; split video into scenes using the demuxers.\nPlus to AND them, comma or pipe to OR them.\nSegmenters: logo,silence,audio,blank,imagediff,1s")
     parser.add_argument_group(seg)
 
     ml = parser.add_argument_group('Machine Learning')
     ml.add_argument('--train', dest="train", action='store_true', 
                   help="Train the ML model")
-    ml.add_argument('--data', dest="ml_data", action="append", nargs='+',
+    ml.add_argument('--data', dest="ml_data", nargs='+',
                   help="Data to train the model with, as a list of feature-log files")
     ml.add_argument('--batch-size', dest='tf_batch_size', type=int, default=1000,
                   help="Model training batch size")

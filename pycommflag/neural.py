@@ -11,9 +11,13 @@ from typing import Any,BinaryIO
 from .scene import *
 
 def scenes_to_vecs(scenes:list[Scene])->tuple[list[list[float]], list[list[float]]]:
-    MAX_SCENE_LEN = 30.0 # seconds, if using blank demux (only) then this should be 600.0
+    MAX_SCENE_LEN = 300.0 # seconds
     x = []
     y = []
+
+    # TODO, do we need to handle all-blank scenes at the start/end of a block differently?
+    # the reason would be because of inconsistent training data (sometimes the blank is part of the commercial, sometimes the show)
+    # but there are blanks in the middle of both also so maybe that doesnt matter....?
 
     block_len = 0.0
     prev = SceneType.COMMERCIAL
@@ -29,11 +33,11 @@ def scenes_to_vecs(scenes:list[Scene])->tuple[list[list[float]], list[list[float
         v.append((s.start_time % 1800) / 1800.0)
         v.append(min(s.duration,MAX_SCENE_LEN)/MAX_SCENE_LEN)
         v.append(block_len/600.0)
-        v += s.avg_peaks.flatten().tolist()
-        v += s.peak_peaks.flatten().tolist()
-        v += s.valley_peaks.flatten().tolist()
+        for ax in s.audio:
+            v.append(ax)
         v.append(s.logo)
-        v.append(1.0 if s.is_blank else 0.0)
+        v.append(s.blank)
+        v.append(s.diff)
         # v += s.barcode.tolist()
         v += x[-1][0:len(v)] if x else [0.0]*(len(v)-1)+[1.0]
         #v += y[-1] if y else a
@@ -55,6 +59,7 @@ def load_data(opts)->tuple[list,list,list,list,list,list]:
     y = []
 
     data = opts.ml_data
+    #print(data)
     test = []
 
     if 'TEST' in data:

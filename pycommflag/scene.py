@@ -27,21 +27,21 @@ class Scene:
             self.type = SceneType.UNKNOWN
             #s.newtype = None
         
-    def __iadd__(self, tup:tuple[float,np.ndarray,Enum|int,bool,bool,bool]):
+    def add(self, ftime:float,column:np.ndarray,audio:Enum|int,logo_present:bool,is_blank:bool,is_diff:bool):
         assert(not self.finished)
-        self.stop_time = tup[0]
+        self.stop_time = ftime
         self.frame_count += 1
-        self.barcode += tup[1] #self.barcode = np.add(self.barcode, tup[1], casting='unsafe', dtype='uint32')
-        if type(tup[2]) is not int:
-            self.audio_end = tup[2].value
+        self.barcode += column #self.barcode = np.add(self.barcode, tup[1], casting='unsafe', dtype='uint32')
+        if type(audio) is not int:
+            self.audio_end = audio.value
         else:
-            self.audio_end = tup[2]
+            self.audio_end = audio
         self.audio[self.audio_end] += 1
-        if tup[3]:
+        if logo_present:
             self.logo_count += 1
-        if tup[4]:
+        if is_blank:
             self.blank_count += 1
-        if tup[5]:
+        if is_diff:
             self.diff_count += 1
         return self
     
@@ -76,6 +76,10 @@ class Scene:
         return self.frame_count
     
     @property
+    def is_blank(self):
+        return self.blank > .75
+    
+    @property
     def is_break(self):
         return self.type == SceneType.COMMERCIAL
 
@@ -94,25 +98,36 @@ class Scene:
         #self.barcode.astype('uint8').tofile(fd)
         fd.write(struct.pack('III', self.audio_start, self.audio_end,  len(self.audio)))
         for x in self.audio:
-            fd.write(struct.pack('f', x))
-        fd.write(struct.pack('III', self.logo_count, int(self.is_blank), getattr(self, 'newtype', self.type).value))
+            fd.write(struct.pack('f', float(x)))
+        fd.write(struct.pack('III', self.logo_count, self.blank_count, self.diff_count))
+        fd.write(struct.pack('I', getattr(self, 'newtype', self.type).value))
     
     def read_bin(self, fd:BinaryIO):
         (self.start_time, self.stop_time, self.frame_count) = struct.unpack('ffI', fd.read(12))
         self.barcode = None #self.barcode = np.fromfile(fd, dtype='uint8', count=720*3).reshape((720,3))
         (self.audio_start, self.audio_end, na) = struct.unpack('III',fd.read(12))
-        self.audio_percent = [0.0]*na
+        self.audio = [0.0]*na
         for i in range(na):
-            self.audio_percent[i] = struct.unpack('f',fd.read(4))
+            (self.audio[i],) = struct.unpack('f',fd.read(4))
         (self.logo_count, self.blank_count, self.diff_count) = struct.unpack('III', fd.read(12))
         self.logo = self.logo_count / self.frame_count 
         self.blank = self.blank_count / self.frame_count
         self.diff = self.diff_count / self.frame_count
-        
+
         (stype,) = struct.unpack('I', fd.read(4))
-        self.type = SceneType(type)
+        self.type = SceneType(stype)
 
         self.finished = True
+    
+    def __str__(self):
+        s = f'{self.start_time} {self.stop_time-self.start_time}s'
+        for x in self.audio:
+            s += f' {x*100}'
+        s += f' {self.logo*100}'
+        s += f' {self.blank*100}'
+        s += f' {self.diff*100}'
+        s += ' ' + str(self.type)
+        return s
     
 
 from enum import Enum

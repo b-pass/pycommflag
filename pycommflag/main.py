@@ -6,6 +6,7 @@ from . import gui
 from . import mythtv
 from . import neural
 from . import processor
+from .segmenter import parse as parse_segmenter
 from .scene import *
 
 def run(opts:Any) -> None|int:
@@ -14,6 +15,10 @@ def run(opts:Any) -> None|int:
     if opts.queue:
         os.execvp("mythcommflag", ["mythcommflag", "--queue", "--chanid", opts.chanid, "--starttime", opts.starttime])
     
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' # shut up, tf
+
+    parse_segmenter(opts.segmeth) # throw for validation errors
+
     if opts.reprocess:
         scenes = processor.segment_scenes(opts.reprocess, opts=opts)
         return 0
