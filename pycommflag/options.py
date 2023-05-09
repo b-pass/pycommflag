@@ -42,6 +42,8 @@ def get_options():
     parser.add_argument_group(logo)
     
     seg = parser.add_argument_group('Scene Segmentation')
+    seg.add_argument('--delay-diff', dest='delay_diff', action='store_true',
+                     help="Delay diff until scene segmentation phase; saves video column data in feature log (makes feature logs huge!)")
     seg.add_argument('--segment', dest='segmeth', type=str, default='blank|audio',
                    help="Scene segmentation instruction; split video into scenes using the demuxers.\nPlus to AND them, comma or pipe to OR them.\nSegmenters: logo,silence,audio,blank,imagediff,1s")
     parser.add_argument_group(seg)

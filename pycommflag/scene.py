@@ -6,7 +6,7 @@ import pickle
 from .extern.ina_foss import AudioSegmentLabel
 
 class Scene:
-    def __init__(self,ftime:float=None,column:np.ndarray=None,audio:Enum|int=0,logo_present:bool=None,is_blank:bool=False,is_diff:bool=False,infile=None):
+    def __init__(self,ftime:float=None,audio:Enum|int=0,logo_present:bool=None,is_blank:bool=False,is_diff:bool=False,infile=None):
         if infile is not None:
             self.read_bin(infile)
         else:
@@ -14,7 +14,6 @@ class Scene:
             self.start_time = ftime
             self.stop_time = ftime
             self.frame_count = 1
-            self.barcode = column.astype('int32')
             self.audio = [0,0,0,0]
             if type(audio) is not int:
                 audio = audio.value
@@ -27,11 +26,10 @@ class Scene:
             self.type = SceneType.UNKNOWN
             #s.newtype = None
         
-    def add(self, ftime:float,column:np.ndarray,audio:Enum|int,logo_present:bool,is_blank:bool,is_diff:bool):
+    def add(self, ftime:float,audio:Enum|int,logo_present:bool,is_blank:bool,is_diff:bool):
         assert(not self.finished)
         self.stop_time = ftime
         self.frame_count += 1
-        self.barcode += column #self.barcode = np.add(self.barcode, tup[1], casting='unsafe', dtype='uint32')
         if type(audio) is not int:
             self.audio_end = audio.value
         else:
@@ -49,17 +47,11 @@ class Scene:
         assert(not self.finished)
         if next_frame_time:
             self.stop_time = max(self.stop_time, next_frame_time)
-        self.barcode = (self.barcode / self.frame_count).astype('uint8')
         self.audio = [x / self.frame_count for x in self.audio]
         self.logo = self.logo_count / self.frame_count 
         self.blank = self.blank_count / self.frame_count
         self.diff = self.diff_count / self.frame_count
         self.finished = True
-    
-    def difference(self, other:Scene):
-        assert(self.finished and other.finished)
-        s = np.std(self.barcode.astype('int16') - other.barcode, (0))
-        return max(s)
     
     @property
     def middle_time(self):
@@ -95,7 +87,6 @@ class Scene:
     def write_bin(self, fd:BinaryIO):
         assert(self.finished)
         fd.write(struct.pack('ffI', self.start_time, self.stop_time, self.frame_count))
-        #self.barcode.astype('uint8').tofile(fd)
         fd.write(struct.pack('III', self.audio_start, self.audio_end,  len(self.audio)))
         for x in self.audio:
             fd.write(struct.pack('f', float(x)))
@@ -104,7 +95,6 @@ class Scene:
     
     def read_bin(self, fd:BinaryIO):
         (self.start_time, self.stop_time, self.frame_count) = struct.unpack('ffI', fd.read(12))
-        self.barcode = None #self.barcode = np.fromfile(fd, dtype='uint8', count=720*3).reshape((720,3))
         (self.audio_start, self.audio_end, na) = struct.unpack('III',fd.read(12))
         self.audio = [0.0]*na
         for i in range(na):
@@ -116,7 +106,6 @@ class Scene:
 
         (stype,) = struct.unpack('I', fd.read(4))
         self.type = SceneType(stype)
-
         self.finished = True
     
     def header():

@@ -22,23 +22,24 @@ class Player:
 
         inter = 0
         ninter = 0
-        f = None
-        try:
-            for f in self.container.decode(video=0):
-                if f.interlaced_frame:
-                    inter += 1
-                else:
-                    ninter += 1
-                if inter+ninter >= 360:
-                    break
-        except Exception as e:
-            log.warn("Decode failure: " + str(e))
+        self.shape = (-1,-1)
+        self.graph = None
+        
+        self.frame_rate = self.container.streams.video[0].guessed_rate
+        self.vt_start = self.container.streams.video[0].start_time * self.container.streams.video[0].time_base
+        self.vt_pos = self.vt_start
+
+        for f in self.frames():
+            self.shape = (f.height, f.width)
+            if f.interlaced_frame:
+                inter += 1
+            else:
+                ninter += 1
+            if inter+ninter >= 360:
+                break
         
         self.container.seek(self.container.streams.video[0].start_time, stream=self.container.streams.video[0])
         
-        self.shape = (f.height, f.width)
-        self.frame_rate = self.container.streams.video[0].guessed_rate
-        self.graph = None
         if inter*10 > ninter and not no_deinterlace:
             self.interlaced = True
             log.debug(f"{inter} interlaced frames (and {ninter} not), means we will deinterlace.")
@@ -46,8 +47,6 @@ class Player:
         else:
             log.debug(f"We will NOT deinterlace (had {inter} interlaced frames and {ninter} non-interlaced frames)")
             self.interlaced = False
-        self.vt_start = self.container.streams.video[0].start_time * self.container.streams.video[0].time_base
-        self.vt_pos = self.vt_start
         log.debug(f"Video {filename} is {self.shape} at {float(self.frame_rate)} fps")
     
     def seek(self, seconds:float):
@@ -197,6 +196,7 @@ class Player:
         while True:
             try:
                 frame = next(iter)
+                if frame is None: continue
             except StopIteration:
                 break
             except av.error.InvalidDataError as e:
