@@ -1,8 +1,10 @@
 import logging as log
+from queue import Queue
 import struct
 import sys
 import os
 import re
+from threading import Thread
 import numpy as np
 import math
 import time
@@ -12,7 +14,7 @@ from typing import Any,BinaryIO
 
 from . import logo_finder, mythtv, segmenter
 from .player import Player
-from .scene import Scene
+from .scene import Scene, SceneType
 from .extern import ina_foss
 
 FLOG_VERSION = 3
@@ -51,7 +53,6 @@ def process_video(video_filename:str, feature_log:str|BinaryIO, opts:Any=None) -
     report = math.ceil(ftotal/1000) if not opts.quiet else ftotal*10
     rt = time.perf_counter()
     p = 0
-    if not opts.quiet: print('Extracting features...', end='\r') 
 
     fcolor = None
     feature_log.seek(0)
@@ -66,11 +67,14 @@ def process_video(video_filename:str, feature_log:str|BinaryIO, opts:Any=None) -
     feature_log.seek(pos)
 
     audio_interval = int(player.frame_rate * 60)
-    aseg = ina_foss.Segmenter(energy_ratio=0.05)
-    aprev = None
-    audio = []
 
-    for frame in player.frames():
+    audioProc = AudioProc()
+    audioProc.start()
+    
+    if not opts.quiet: print('\nExtracting features...', end='\r') 
+
+    try:
+      for frame in player.frames():
         p += 1
         fcount += 1
         if p >= report:
@@ -81,8 +85,7 @@ def process_video(video_filename:str, feature_log:str|BinaryIO, opts:Any=None) -
             p = 0
         
         if fcount%audio_interval == 0:
-            (ares, aprev) = _process_audio(aseg, aprev, player.move_audio())
-            audio += ares
+            audioProc.add_audio(player.move_audio())
 
         fcolor = frame.to_ndarray(format="rgb24", height=720, width=frame.width*(720/frame.height))
         
@@ -112,9 +115,13 @@ def process_video(video_filename:str, feature_log:str|BinaryIO, opts:Any=None) -
             column.shape[2], column.shape[0], column.shape[1]
         ))
         column.astype('uint8').tofile(feature_log)
-    
-    audio += _process_audio(aseg, aprev, player.move_audio())[0]
+    except KeyboardInterrupt:
+        pass#audioProc.stop()
+        #raise
 
+    audioProc.add_audio(player.move_audio())
+    audioProc.stop()
+    
     feature_log.write(struct.pack('I', 0xFFFFFFFF))
 
     pos = feature_log.tell()
@@ -122,8 +129,9 @@ def process_video(video_filename:str, feature_log:str|BinaryIO, opts:Any=None) -
     feature_log.write(struct.pack('I', pos))
     feature_log.seek(pos)
 
-    feature_log.write(struct.pack('I', len(audio)))
-    for (lab,start,stop) in audio:
+    audioProc.join()
+    feature_log.write(struct.pack('I', len(audioProc.audio)))
+    for (lab,start,stop) in audioProc.audio:
         feature_log.write(struct.pack('Iff', ina_foss.AudioSegmentLabel[lab].value, start, stop))
 
     pos = feature_log.tell()
@@ -136,11 +144,10 @@ def process_video(video_filename:str, feature_log:str|BinaryIO, opts:Any=None) -
 
 def mean_axis1_float_uint8(fcolor:np.ndarray)->np.ndarray:
     # the below code is equivalent to:
-    #   column = fcolor.mean(axis=(1),dtype='float32').astype('uint8')
+    #   return fcolor.mean(axis=(1),dtype='float32').astype('uint8')
     # but is almost TEN TIMES faster!
     
     # pick out the individual color channels by skipping by 3, and then average them
-    #cr = fcolor[...,0::3].astype('float32').mean(axis=(1))
     cr = fcolor[...,0::3].mean(axis=(1), dtype='float32')
     cg = fcolor[...,1::3].mean(axis=(1), dtype='float32')
     cb = fcolor[...,2::3].mean(axis=(1), dtype='float32')
@@ -151,36 +158,61 @@ def mean_axis1_float_uint8(fcolor:np.ndarray)->np.ndarray:
 def columnize_frame(frame)->np.ndarray:
     return mean_axis1_float_uint8(frame.to_ndarray(format="rgb24", height=720, width=frame.width*(720/frame.height)))
 
-def _process_audio(aseg, prev, segments):
-    if not segments:
-        return ([],prev)
-    
-    #print(prev,segments)
-    isstart = False
-    if prev is None:
-        prev = segments.pop(0)
-        isstart = True
-    
-    all = prev[0]
-    start = prev[1]
-    time = prev[1] + len(prev[0])/16000
-    for s in segments:
-        missing = int(round((s[1] - time)*16000))
-        if missing > 0:
-            all = np.append(all, np.zeros(missing, 'float32'))
-        all = np.append(all, s[0])
-        time = s[1] + len(s[0])/16000
-    
-    prev = (all[-8000:], start+(len(all)-8000)/16000)
-    res = []
+class AudioProc(Thread):
+    def __init__(self):
+        super().__init__()
+        import tensorflow as tf
+        tf.config.threading.set_intra_op_parallelism_threads(1)
+        tf.config.threading.set_inter_op_parallelism_threads(1)
+        self.seg = ina_foss.Segmenter(energy_ratio=0.05)
+        self.queue = Queue(10)
+        self.go = True
+        self.audio = []
+        self.prev = None
 
-    startbound = 0 if isstart else 0.5
-    for (lab, sb, se) in aseg(all):
-        if se <= startbound:
-            continue
-        res.append((lab, start+sb, start+se))
+    def add_audio(self,segments):
+        self.queue.put(segments)
     
-    return (res, prev)
+    def stop(self):
+        self.go = False
+        self.queue.put([])
+        self.go = False
+    
+    def run(self):
+        while True:
+            segments = self.queue.get()
+            if not segments:
+                if self.queue.empty():
+                    if not self.go:
+                        break
+                continue
+
+            isstart = False
+            if self.prev is None:
+                self.prev = segments.pop(0)
+                isstart = True
+            
+            all = self.prev[0]
+            start = self.prev[1]
+            time = self.prev[1] + len(self.prev[0])/16000
+            for s in segments:
+                missing = int(round((s[1] - time)*16000))
+                if missing > 0:
+                    all = np.append(all, np.zeros(missing, 'float32'))
+                all = np.append(all, s[0])
+                time = s[1] + len(s[0])/16000
+            
+            self.prev = (all[-8000:], start+(len(all)-8000)/16000)
+
+            startbound = 0 if isstart else 0.5
+            for (lab, sb, se) in self.seg(all):
+                if se <= startbound:
+                    continue
+                old = self.audio[-1] if self.audio else (0,0,-1)
+                if old[1] <= (start+sb) and (start+sb) < old[2]:
+                    self.audio[-1] = (old[0],old[1],(start+sb)) # overlapping, truncate old
+                self.audio.append((lab, start+sb, start+se))
+
 
 def read_logo(log_in:str|BinaryIO) -> None|tuple:
     if type(log_in) is str:
@@ -324,6 +356,23 @@ def read_scenes(log_f:str|BinaryIO) -> None:
     (count,) = struct.unpack('I', b)
     for _ in range(count):
         scenes.append(Scene(infile=log_f))
+    
+    # Special, short scenes at the start are basically truncated so don't use them for training
+    if len(scenes) > 2:
+        if scenes[0].duration < 5:
+            scenes[0].type = SceneType.DO_NOT_USE
+        
+        # Special, blank segments at show/commercial boundaries are always counted as show for ML
+        # When we write out results for playback we choose a good break point in the middle of the blank scene
+        for i in range(1,len(scenes)-1):
+            if scenes[i].blank >= .975 and scenes[i].type == SceneType.COMMERCIAL:
+                if scenes[i-1].type == SceneType.SHOW or scenes[i+1].type == SceneType.SHOW:
+                    scenes[i].type = SceneType.SHOW
+        
+        # Special, short scenes at the end are basically truncated so don't use them for training
+        if scenes[-1].duration < 5:
+            scenes[-1].type = SceneType.DO_NOT_USE
+
     return scenes
 
 def read_audio(log_f:str|BinaryIO) -> None:
@@ -366,6 +415,11 @@ def rewrite_scenes(scenes:list[Scene], log_f:str|BinaryIO, opts=None) -> None:
     log_f.seek(scene_pos)
     
     log_f.write(struct.pack('I', len(scenes)))
+    if len(scenes) > 2:
+        if scenes[0].duration < 5:
+            scenes[0].type = scenes[0].newtype = SceneType.DO_NOT_USE
+        if scenes[-1].duration < 5:
+            scenes[-1].type = scenes[-1].newtype = SceneType.DO_NOT_USE
     for s in scenes:
         s.write_bin(log_f)
 

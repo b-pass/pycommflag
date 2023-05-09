@@ -13,6 +13,7 @@ class Player:
         self.container.streams.video[0].thread_type = "AUTO"
         self.container.streams.video[0].thread_count = 2
         self.container.streams.audio[0].thread_type = "AUTO"
+        self.container.streams.audio[0].thread_count = 2
 
         self.duration = self.container.duration / av.time_base
         self.streams = {'video':0}
@@ -38,7 +39,7 @@ class Player:
         self.shape = (f.height, f.width)
         self.frame_rate = self.container.streams.video[0].guessed_rate
         self.graph = None
-        if inter*4 > ninter and not no_deinterlace:
+        if inter*10 > ninter and not no_deinterlace:
             self.interlaced = True
             log.debug(f"{inter} interlaced frames (and {ninter} not), means we will deinterlace.")
             self._create_graph()
@@ -178,8 +179,9 @@ class Player:
         self.container = av.open(self.filename)
         self.container.gen_pts = True
         self.container.streams.video[0].thread_type = "AUTO"
-        #self.container.streams.video[0].thread_count = 4
+        self.container.streams.video[0].thread_count = 2
         self.container.streams.audio[0].thread_type = "AUTO"
+        self.container.streams.audio[0].thread_count = 2
         self.container.seek(pts, stream=self.container.streams.video[0], any_frame=True, backward=False)
         self._flush()
 

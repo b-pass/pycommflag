@@ -21,10 +21,16 @@ def scenes_to_vecs(scenes:list[Scene])->tuple[list[list[float]], list[list[float
 
     block_len = 0.0
     prev = SceneType.COMMERCIAL
+    first = True
     for s in scenes:
+        if first:
+            # don't use short scenes right at the beginning for training
+            first = False
+            if s.duration < 5:
+                continue
         st = getattr(s, 'newtype', s.type)
-        if st == SceneType.TRUNCATED:
-            break
+        if st == SceneType.DO_NOT_USE:
+            continue
         
         a = [0.0] * SceneType.count()
         a[st.value] = 1.0
@@ -132,9 +138,11 @@ def train(training:tuple, test_answers:list=None, opts:Any=None):
     callbacks = [
         GracefulStop(),
         # keras.callbacks.ModelCheckpoint('chk-'+name, monitor='val_binary_accuracy', mode='max', verbose=1, save_best_only=True)
-        keras.callbacks.EarlyStopping(monitor='loss', patience=100),
+        #keras.callbacks.EarlyStopping(monitor='loss', patience=100),
         keras.callbacks.EarlyStopping(monitor='categorical_accuracy', patience=100),
     ]
+    if test_answers:
+        callbacks.append(keras.callbacks.EarlyStopping(monitor='val_categorical_accuracy', patience=100))
     history = model.fit(train_dataset, epochs=5000, callbacks=callbacks, validation_data=test_dataset)
 
     print()
@@ -145,11 +153,15 @@ def train(training:tuple, test_answers:list=None, opts:Any=None):
     print(dmetrics)
     print(tmetrics)
 
-    #name = '%.04f-%.04f-mse%.04f-m%s'%(dmetrics[1],tmetrics[1],tmetrics[2],name)
+    name = 'blah'
+    name = '%.04f-%.04f-mse%.04f-m%s'%(dmetrics[1],tmetrics[1],tmetrics[2],name)
+    #if dmetrics[1] >= 0.95 and tmetrics[1] >= 0.95:
+    #    print('Saving as ' + name)
+    #    model.save(name)
 
     #for (f,d) in test_data.items():
     #    metrics = model.evaluate(d[0],d[1], verbose=0)
     #    print('%-30s = %8.04f' % (os.path.basename(f), metrics[1]))
 
     print()
-    print()
+    

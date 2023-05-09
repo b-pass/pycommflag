@@ -17,6 +17,8 @@ def get_options():
                         help="Input location of feature data log to be reprocessed.")
     parser.add_argument('-g', '--gui', dest='gui', action='store_true', 
                         help="(Re)Process and then display for GUI editing.  Must also supply --file and --feature-log for the thing being edited in the GUI.")
+    parser.add_argument('--dump-text', dest='dumptext', action='store_true',
+                        help="(Re)Process and Dump scene text and exit.  Must supply a --feature-log")
     parser.add_argument('-q', '--quiet', dest='quiet', action='store_true',
                         help="Do not print progress during processing")
     parser.add_argument('--loglevel', dest='loglevel', type=str,

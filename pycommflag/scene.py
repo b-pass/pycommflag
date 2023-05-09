@@ -119,6 +119,9 @@ class Scene:
 
         self.finished = True
     
+    def header():
+        return 'Start Duration A:Silence A:Speech A:Music A:Noise Logo Blank Diff SCENETYPE'
+    
     def __str__(self):
         s = f'{self.start_time} {self.stop_time-self.start_time}s'
         for x in self.audio:
@@ -138,10 +141,10 @@ class SceneType(Enum):
     TRANSITION = 2
     COMMERCIAL = 3
     CREDITS = 4
-    TRUNCATED = 5
+    DO_NOT_USE = 5
 
     def count():
-        return SceneType.TRUNCATED.value
+        return SceneType.DO_NOT_USE.value
 
     def color(self):
         colors = ['green','yellow','blue','red','yellow','gray']

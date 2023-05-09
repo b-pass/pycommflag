@@ -30,13 +30,36 @@ def run(opts:Any) -> None|int:
         neural.train(d, opts)
         return 0
     
-    if opts.chanid and opts.starttime and not opts.filename:
-        opts.filename = mythtv.get_filename(opts.chanid, opts.starttime)
-
+    if not opts.filename:
+        if not opts.chanid and not opts.starttime:
+            import re
+            if m:=re.match(r'(?:.*/)?cf_(\d{4,6})_(\d{12,})\.[a-zA-Z0-9]{2,5}\.feat', opts.feature_log):
+                opts.chanid = m[1]
+                opts.starttime = m[2]
+        if opts.chanid and opts.starttime:
+            opts.filename = mythtv.get_filename(opts.chanid, opts.starttime)
+    
+    if opts.dumptext:
+        scenes = processor.read_scenes(opts.feature_log) if opts.feature_log else []
+        got_tags = False
+        for s in scenes:
+            if s.type != SceneType.UNKNOWN:
+                got_tags = True
+                break
+        if not got_tags:
+            processor.external_scene_tags(scenes,opts=opts)
+        
+        print("\nSCENES:")
+        print(Scene.header())
+        for s in scenes:
+            print(s)
+        print(f"{len(scenes)} total.")
+        sys.exit(0)
+    
     if not opts.filename:
         print('No video file to work on (need one of: -f, -r, --chanid, etc)')
         return 1
-
+    
     if opts.gui:
         logo = processor.read_logo(opts.feature_log) if opts.feature_log else None
         scenes = processor.read_scenes(opts.feature_log) if opts.feature_log else []
@@ -45,7 +68,7 @@ def run(opts:Any) -> None|int:
         audio = processor.read_audio(opts.feature_log) if opts.feature_log else []
         got_tags = False
         for s in scenes:
-            if s.type != SceneType.UNKNOWN:
+            if s.type != SceneType.DO_NOT_USE and s.type != SceneType.UNKNOWN:
                 got_tags = True
                 break
         if not got_tags:

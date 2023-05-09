@@ -344,22 +344,15 @@ class Window(tk.Tk):
                 fill = s.type.logo_color()
             else:
                 fill = s.type.color()
-            
-            fill2 = None
+            self.vidMap.create_rectangle(startx, 0, stopx, map_height, width=0, fill=fill)
             if hasattr(s, 'newtype'):
-                fill2 = s.newtype.new_color()
-            
-            y = map_height
-            if fill2:
-                y = int(y/2)
-                self.vidMap.create_rectangle(startx, y, stopx, map_height, width=0, fill=fill2)
-            self.vidMap.create_rectangle(startx, 0, stopx, y, width=0, fill=fill)
+                self.vidMap.create_rectangle(startx, int(map_height/2), stopx, map_height, width=0, fill=s.newtype.new_color())
         
         for s in self.scenes:
             if s.is_blank:
                 startx = math.floor(s.start_time / sec_per_pix)
                 stopx = math.ceil(s.stop_time / sec_per_pix)
-                self.vidMap.create_rectangle(startx, 0, stopx, map_height, width=0, fill='black')
+                self.vidMap.create_rectangle(startx, int(map_height*.25), stopx, int(map_height*.75), width=0, fill='black')
         
         for x in self.audMap.find_all():
             self.audMap.delete(x)
@@ -415,7 +408,7 @@ class Window(tk.Tk):
     def truncate_now(self):
         for s in self.scenes:
             if s.stop_time > self.position:
-                setattr(s, 'newtype', SceneType.TRUNCATED)
+                setattr(s, 'newtype', SceneType.DO_NOT_USE)
         self.save_and_close()
     
     def save_and_close(self):
