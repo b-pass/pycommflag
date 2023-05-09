@@ -95,7 +95,7 @@ def process_video(video_filename:str, feature_log:str|BinaryIO, opts:Any=None) -
         raise
 
     videoProc.stop()
-    
+
     audioProc.add_audio(player.move_audio())
     audioProc.stop()
 
@@ -178,19 +178,16 @@ class VideoProc(Thread):
             self.prev_col = column
 
         self.feature_log.write(struct.pack(
-            'If???',
-            self.fcount, frame.time-self.vt_start,
-            logo_present, frame_blank, scene_change
+            'If???BII',
+            self.fcount,
+            frame.time-self.vt_start,
+            logo_present, frame_blank, scene_change,
+            column.shape[2] if self.opts.delay_diff else 0, 
+            column.shape[0], column.shape[1]
         ))
         
         if self.opts.delay_diff:
-            self.feature_log.write(struct.pack(
-                'BII',
-                column.shape[2], column.shape[0], column.shape[1]
-            ))
             column.astype('uint8').tofile(self.feature_log)
-        else:
-            self.feature_log.write(struct.pack('BII', 0, 0, 0))
 
 def mean_axis1_float_uint8(fcolor:np.ndarray)->np.ndarray:
     # the below code is equivalent to:
@@ -313,8 +310,8 @@ def segment_scenes(log_f:str|BinaryIO, opts:Any) -> list[Scene]:
         if len(d) < 4:
             break
         (fnum,) = struct.unpack('I', d)
-        if fnum <= fprev:
-            log.error(f'Bad frame number {fnum} (expected > {fprev})')
+        if fnum-1 != fprev:
+            log.error(f'Bad frame number {fnum} (expected {fprev+1}) at {log_f.tell()}')
         if fnum == 0xFFFFFFFF:
             break
         
