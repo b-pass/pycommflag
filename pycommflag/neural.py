@@ -65,13 +65,25 @@ def load_data(opts)->tuple[list,list,list,list,list,list]:
     y = []
 
     data = opts.ml_data
-    #print(data)
+    if not data:
+        return []
+    
     test = []
 
     if 'TEST' in data:
         i = data.index('TEST')
         test = data[i+1:]
         data = data[:i]
+
+        i = 0
+        while i < len(data):
+            if not os.path.exists(data[i]):
+                print(data[i], "does not exist!!")
+                del data[i]
+            elif data[i] in test or not os.path.isfile(data[i]):
+                del data[i]
+            else:
+                i += 1
     
     for f in data:
         print(f)
@@ -139,10 +151,10 @@ def train(training:tuple, test_answers:list=None, opts:Any=None):
         GracefulStop(),
         # keras.callbacks.ModelCheckpoint('chk-'+name, monitor='val_binary_accuracy', mode='max', verbose=1, save_best_only=True)
         #keras.callbacks.EarlyStopping(monitor='loss', patience=100),
-        keras.callbacks.EarlyStopping(monitor='categorical_accuracy', patience=100),
+        keras.callbacks.EarlyStopping(monitor='categorical_accuracy', patience=250),
     ]
     if test_answers:
-        callbacks.append(keras.callbacks.EarlyStopping(monitor='val_categorical_accuracy', patience=100))
+        callbacks.append(keras.callbacks.EarlyStopping(monitor='val_categorical_accuracy', patience=500))
     history = model.fit(train_dataset, epochs=5000, callbacks=callbacks, validation_data=test_dataset)
 
     print()
@@ -155,6 +167,8 @@ def train(training:tuple, test_answers:list=None, opts:Any=None):
 
     name = 'blah'
     name = '%.04f-%.04f-mse%.04f-m%s'%(dmetrics[1],tmetrics[1],tmetrics[2],name)
+    print()
+    print(name)
     #if dmetrics[1] >= 0.95 and tmetrics[1] >= 0.95:
     #    print('Saving as ' + name)
     #    model.save(name)

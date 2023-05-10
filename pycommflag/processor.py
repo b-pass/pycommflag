@@ -310,10 +310,10 @@ def segment_scenes(log_f:str|BinaryIO, opts:Any) -> list[Scene]:
         if len(d) < 4:
             break
         (fnum,) = struct.unpack('I', d)
-        if fnum-1 != fprev:
-            log.error(f'Bad frame number {fnum} (expected {fprev+1}) at {log_f.tell()}')
         if fnum == 0xFFFFFFFF:
             break
+        if fnum-1 != fprev:
+            log.error(f'Bad frame number {fnum} (expected {fprev+1}) at {log_f.tell()}')
         
         fprev = fnum
         prev_col = column
