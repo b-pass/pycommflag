@@ -8,9 +8,8 @@ import math
 import time
 
 from typing import Any,BinaryIO
-from .scene import *
 
-def scenes_to_vecs(scenes:list[Scene])->tuple[list[list[float]], list[list[float]]]:
+def scenes_to_vecs(scenes:list)->tuple[list[list[float]], list[list[float]]]:
     MAX_SCENE_LEN = 300.0 # seconds
     x = []
     y = []

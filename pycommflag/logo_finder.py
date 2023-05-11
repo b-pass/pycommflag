@@ -152,26 +152,30 @@ def _gray(frame:VideoFrame,box:tuple=None) -> np.ndarray:
         x = np.dot(x[...,:3], [0.2989, 0.5870, 0.1140])
         return x
 
-def write(frame_log:BinaryIO, logo:tuple) -> None:
-    import struct
-    if logo:
-        frame_log.write(struct.pack('IIIII', logo[3], logo[0][0], logo[0][1], logo[1][0], logo[1][1]))
-        logo[2].astype('uint8').tofile(frame_log)
-    else:
-        frame_log.write(struct.pack('IIIII', 0, 0, 0, 0, 0))
+import json
+def from_json(js:list|str)->tuple|None:
+    if type(js) is str:
+        js = json.loads(js)
+    if js is None:
+        return None
+    if type(js) != list:
+        raise Exception("Expected dict")
+    assert(len(js) == 4)
+    return (
+        (js[0][0], js[0][1]),
+        (js[1][0], js[1][1]),
+        np.array(js[2], 'bool'),
+        js[3]
+    )
 
-def read(log_in:BinaryIO) -> tuple|None:
-    import struct
-    buf = log_in.read(20)
-    if len(buf) != 20:
-        return None
-    info = struct.unpack('IIIII', buf)
-    if not info[0]:
-        return None
-    shape = ((info[3] - info[1]), (info[4] - info[2]))
-    data = np.fromfile(log_in, 'uint8', shape[0]*shape[1], '')
-    data.shape = shape
-    return ((info[1], info[2]), (info[3], info[4]), data.astype('bool'), info[0])
+def to_json(logo:tuple)->str:
+    # ((top,left), (bottom,right), logo_mask, thresh)
+    return json.dumps([
+        [logo[0][0], logo[0][1]],
+        [logo[1][0], logo[1][1]],
+        logo[2].astype('uint8').tolist(),
+        logo[3]
+    ])
 
 def toimage(logo):
     from PIL import Image

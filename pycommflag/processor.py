@@ -9,26 +9,40 @@ import numpy as np
 import math
 import time
 import gc
+import json
 
-from typing import Any,BinaryIO
+from typing import Any,TextIO, TextIO
 
-from . import logo_finder, mythtv, segmenter
+from . import logo_finder, mythtv
 from .player import Player
-from .scene import Scene, SceneType
 from .extern import ina_foss
+from .feature_span import *
 
 FLOG_VERSION = 3
 
-def process_video(video_filename:str, feature_log:str|BinaryIO, opts:Any=None) -> None:
+def read_feature_log(feature_log_file:str|TextIO|dict) -> dict:
+    if type(feature_log_file) is dict:
+        return feature_log_file
+    elif type(feature_log_file) is str:
+        with open(feature_log_file, 'r') as fl:
+            return read_feature_log(fl)
+    else:
+        feature_log_file.seek(0)
+        try:
+            return json.load(feature_log_file)
+        except json.JSONDecodeError:
+            # partial file, probably closed in the middle of a frame array; try to recover....
+            feature_log_file.seek(0)
+            return json.loads(feature_log_file.read() + ']}')
+
+def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> None:
     logo = None
     if type(feature_log) is str:
         if os.path.exists(feature_log) and not opts.no_logo:
-            with open(feature_log, 'r+b') as tfl:
-                tfl.seek(28)
-                logo = logo_finder.read(tfl)
-                if logo and not opts.quiet:
-                    print(f"{feature_log} exists, re-using logo ", logo[0], logo[1])
-        feature_log = open(feature_log, 'w+b')
+            logo = logo_finder.from_json(read_feature_log(feature_log).get('logo', None))
+            if logo and not opts.quiet:
+                print(f"{feature_log} exists, re-using logo ", logo[0], logo[1])
+        feature_log = open(feature_log, 'w')
     
     player = Player(video_filename, no_deinterlace=opts.no_deinterlace)
 
@@ -38,6 +52,10 @@ def process_video(video_filename:str, feature_log:str|BinaryIO, opts:Any=None) -
         pass
     else:
        logo = logo_finder.search(player, opts=opts)
+    
+    feature_log.write('{ "file_version":10\n')
+    feature_log.write(',\n"logo":')
+    feature_log.write(logo_finder.to_json(logo))
     
     player.seek(0)
     player.enable_audio()
@@ -55,17 +73,9 @@ def process_video(video_filename:str, feature_log:str|BinaryIO, opts:Any=None) -
     p = 0
 
     fcolor = None
-    feature_log.seek(0)
-    feature_log.write(struct.pack('@Iff', FLOG_VERSION, player.duration, player.frame_rate))
-    feature_log.write(struct.pack('IIII', 0, 0, 0, 0))
-
-    logo_finder.write(feature_log, logo)
+    feature_log.write(f',\n"duration":{float(player.duration)},\n"frame_rate":{round(float(player.frame_rate),2)}')
+    feature_log.write(',\n"frames":[null\n')
     
-    pos = feature_log.tell()
-    feature_log.seek(12, 0)
-    feature_log.write(struct.pack('I', pos))
-    feature_log.seek(pos)
-
     audio_interval = int(player.frame_rate * 60)
 
     audioProc = AudioProc()
@@ -76,6 +86,7 @@ def process_video(video_filename:str, feature_log:str|BinaryIO, opts:Any=None) -
 
     if not opts.quiet: print('\nExtracting features...', end='\r') 
 
+    endtime = 0
     try:
       for frame in player.frames():
         p += 1
@@ -92,7 +103,7 @@ def process_video(video_filename:str, feature_log:str|BinaryIO, opts:Any=None) -
     except KeyboardInterrupt:    
         videoProc.stop()
         audioProc.stop()
-        raise
+        #raise
 
     videoProc.stop()
 
@@ -101,22 +112,24 @@ def process_video(video_filename:str, feature_log:str|BinaryIO, opts:Any=None) -
 
     videoProc.join()
     
-    feature_log.write(struct.pack('I', 0xFFFFFFFF))
-
-    pos = feature_log.tell()
-    feature_log.seek(16, 0)
-    feature_log.write(struct.pack('I', pos))
-    feature_log.seek(pos)
+    feature_log.write("]")
+    
+    feature_log.write(',\n"logo_span":')
+    feature_log.write(videoProc.logof.to_json())
+    
+    feature_log.write(',\n"blank_span":')
+    feature_log.write(videoProc.blankf.to_json())
+    
+    feature_log.write(',\n"diff_span":')
+    feature_log.write(videoProc.difff.to_json())
 
     audioProc.join()
-    feature_log.write(struct.pack('I', len(audioProc.audio)))
-    for (lab,start,stop) in audioProc.audio:
-        feature_log.write(struct.pack('Iff', ina_foss.AudioSegmentLabel[lab].value, start, stop))
 
-    pos = feature_log.tell()
-    feature_log.seek(20, 0)
-    feature_log.write(struct.pack('@I', pos))
-    feature_log.seek(pos)
+    feature_log.write(',\n"audio":')
+    feature_log.write(audioProc.fspan.to_json())
+
+    feature_log.write('\n}\n')
+    feature_log.flush()
     
     if not opts.quiet:
         print('Extraction complete           ')
@@ -132,6 +145,14 @@ class VideoProc(Thread):
         self.logo = logo
         self.opts = opts
         self.prev_col = None
+        
+        self.lasttime = 0
+        self.logof = FeatureSpan()
+        self.logof.start(0,False)
+        self.blankf = FeatureSpan()
+        self.blankf.start(0,True)
+        self.difff = SeparatorFeatureSpan()
+        self.difff.start(0,True)
 
     def add_frame(self,frame):
         self.queue.put(frame)
@@ -150,6 +171,10 @@ class VideoProc(Thread):
                 if self.queue.empty():
                     if not self.go:
                         break
+        
+        self.logof.end(self.lasttime)
+        self.blankf.end(self.lasttime)
+        self.difff.end(self.lasttime)
 
     def _proc(self, frame):
         self.fcount += 1
@@ -157,7 +182,6 @@ class VideoProc(Thread):
         logo_present = logo_finder.check_frame(frame, self.logo)
 
         fcolor = frame.to_ndarray(format="rgb24", height=720, width=frame.width*(720/frame.height))
-        column = mean_axis1_float_uint8(fcolor)
         
         # trying to be fast, just look at the middle 1/4 for blank-ish-ness and then verify with the full frame
         x = np.max(fcolor[int(fcolor.shape[0]*3/8):int(fcolor.shape[0]*5/8)])
@@ -167,27 +191,22 @@ class VideoProc(Thread):
         else:
             frame_blank = False
 
-        if not self.opts.delay_diff:
-            column = column.astype('int16')
-            if self.prev_col is not None:
-                diff = column - self.prev_col
-                scm = np.mean(np.std(np.abs(diff), (0)))
-                scene_change = scm >= self.opts.scene_threshold 
-            else:
-                scene_change = False
-            self.prev_col = column
+        column = mean_axis1_float_uint8(fcolor).astype('int16')
+        if self.prev_col is not None:
+            diff = column - self.prev_col
+            scm = np.mean(np.std(np.abs(diff), (0)))
+            is_diff = scm >= self.opts.diff_threshold 
+        else:
+            is_diff = False
+        self.prev_col = column
 
-        self.feature_log.write(struct.pack(
-            'If???BII',
-            self.fcount,
-            frame.time-self.vt_start,
-            logo_present, frame_blank, scene_change,
-            column.shape[2] if self.opts.delay_diff else 0, 
-            column.shape[0], column.shape[1]
-        ))
-        
-        if self.opts.delay_diff:
-            column.astype('uint8').tofile(self.feature_log)
+        self.lasttime = round(frame.time-self.vt_start,4)
+        self.logof.add(self.lasttime, logo_present)
+        self.blankf.add(self.lasttime, frame_blank)
+        self.difff.add(self.lasttime, is_diff)
+        self.feature_log.write(
+            f",[{self.lasttime},{int(logo_present)},{int(frame_blank)},{int(is_diff)}]\n"
+        )
 
 def mean_axis1_float_uint8(fcolor:np.ndarray)->np.ndarray:
     # the below code is equivalent to:
@@ -216,6 +235,7 @@ class AudioProc(Thread):
         self.go = True
         self.audio = []
         self.prev = None
+        self.fspan = AudioFeatureSpan()
 
     def add_audio(self,segments):
         self.queue.put(segments)
@@ -257,223 +277,43 @@ class AudioProc(Thread):
                     continue
                 old = self.audio[-1] if self.audio else (0,0,-1)
                 if old[1] <= (start+sb) and (start+sb) < old[2]:
-                    self.audio[-1] = (old[0],old[1],(start+sb)) # overlapping, truncate old
-                self.audio.append((lab, start+sb, start+se))
-
-
-def read_logo(log_in:str|BinaryIO) -> None|tuple:
-    if type(log_in) is str:
-        with open(log_in, 'r+b') as fd:
-            return read_logo(fd)
-    
-    (ver,duration,frame_rate) = struct.unpack('@Iff', log_in.read(12))
-    if ver != FLOG_VERSION:
-        raise RuntimeError("Unsupported feature log version: "+str(ver))
-    log_in.read(16) # poses
-
-    return logo_finder.read(log_in)
-
-def segment_scenes(log_f:str|BinaryIO, opts:Any) -> list[Scene]:
-    if type(log_f) is str:
-        with open(log_f, 'r+b') as fd:
-            return segment_scenes(fd, opts=opts)
-
-    if not opts.quiet: print("Segmenting feature log into scenes...")
-    log_f.seek(0)
-
-    fseg = segmenter.parse(opts.segmeth)
-    
-    (ver,duration,frame_rate) = struct.unpack('@Iff', log_f.read(12))
-    if ver != FLOG_VERSION:
-        raise RuntimeError("Unsupported feature log version: "+str(ver))
-
-    (frame_pos,audio_pos,scene_pos,x_pos) = struct.unpack('IIII', log_f.read(16))
-    
-    logo_finder.read(log_f)
-
-    audio = read_audio(log_f)
-    if not audio:
-        audio = [(ina_foss.AudioSegmentLabel.SILENCE, 0, duration)]
-    audio_idx = 0
-
-    log_f.seek(frame_pos)
-
-    fprev = 0
-    column = None
-    scenes = []
-    scene = None
-    temp_set = []
-    blanks = []
-    prev_check = None
-    while True:
-        d = log_f.read(4)
-        if len(d) < 4:
-            break
-        (fnum,) = struct.unpack('I', d)
-        if fnum == 0xFFFFFFFF:
-            break
-        if fnum-1 != fprev:
-            log.error(f'Bad frame number {fnum} (expected {fprev+1}) at {log_f.tell()}')
+                    self.audio[-1] = (old[0],old[1],round(start+sb,4)) # overlapping, truncate old
+                self.audio.append((AudioSegmentLabel[lab], round(start+sb,4), round(start+se,4)))
         
-        fprev = fnum
-        prev_col = column
+        self.fspan.add_all(self.audio)
 
-        (ftime, logo_present, frame_blank, is_diff, depth, h, w) = struct.unpack('f???BII', log_f.read(16))
-        if depth > 0:
-            column = np.fromfile(log_f, 'uint8', depth*h*w, '').astype('int16')
-            column.shape = (h,w,depth)
-        else:
-            column = None
+def read_logo(log_in:str|TextIO|dict) -> None|tuple:
+    return logo_finder.from_json(read_feature_log(log_in).get('logo', None))
 
-        while audio_idx+1 < len(audio) and audio[audio_idx][2] <= ftime:
-            audio_idx += 1
-        if ftime >= audio[audio_idx][1] and ftime < audio[audio_idx][2]:
-            faudio = audio[audio_idx][0]
-        else:
-            faudio = ina_foss.AudioSegmentLabel.SILENCE
+def read_audio(log_f:str|TextIO|dict) -> list[tuple]:
+    audiof = AudioFeatureSpan()
+    audiof.from_json(read_feature_log(log_f)['audio'], AudioSegmentLabel)
 
-        if prev_col is None:
-            pass # use is_diff from file
-        else:
-            diff = column - prev_col
-            scm = np.mean(np.std(np.abs(diff), (0)))
-            is_diff = scm >= opts.scene_threshold 
-        
-        # When the segmenter returns True we end the scene and start another
-        # But if it returns consecutive Trues then we combine those into one Scene
-        # The subsequent Scene starts with the last True
-        # this also tends to keep the blanks together in a scene when using the 'blank' segmenter
-        # Also, Every scene should be at least 2 frames
-        if fseg.check(ftime=ftime, faudio=faudio, logo_present=logo_present, is_blank=frame_blank, is_diff=is_diff):
-            if scene is not None:
-                scene.finish()
-                scenes.append(scene)
-                scene = None
-            temp_set.append((ftime, faudio, logo_present, frame_blank, is_diff))
-        elif scene is None:
-            if len(temp_set) > 2:
-                scene = Scene(*temp_set[0])
-                for x in temp_set[1:-1]:
-                    scene.add(*x)
-                scene.finish()
-                scenes.append(scene)
-                scene = None
-                temp_set = temp_set[-1:]
-            if temp_set:
-                scene = Scene(*temp_set[0])
-                for x in temp_set[1:]:
-                    scene.add(*x)
-                temp_set = []
-                scene.add(ftime, faudio, logo_present, frame_blank, is_diff)
-            else:
-                scene = Scene(ftime, faudio, logo_present, frame_blank, is_diff)
-        else:
-            scene.add(ftime, faudio, logo_present, frame_blank, is_diff)
-    
-    if scene is None:
-         scene = Scene(*temp_set[0])
-         for x in temp_set[1:]:
-            scene.add(*x)
-    scene.finish()
-    scenes.append(scene)
+    return [(x,y,z) for (x,(y,z)) in audiof.to_list()]
 
-    if not opts.quiet: print("Done, got",len(scenes),"scenes in",fprev,"frames")
+def build_feature_spans(log:str|TextIO|dict, opts=None) -> dict[str, FeatureSpan]:
+    log = read_feature_log(log)
 
-    #for s in scenes: print(s)
-    
-    if scene_pos:
-        log_f.seek(scene_pos)
-        log_f.truncate(scene_pos)
-        rewrite_scenes(scenes, log_f, opts=opts)
-    
-    return scenes
+    audiof = AudioFeatureSpan()
+    audiof.from_json(log['audio'], AudioSegmentLabel)
 
-def read_scenes(log_f:str|BinaryIO) -> None:
-    if type(log_f) is str:
-        with open(log_f, 'r+b') as fd:
-            return read_scenes(fd)
+    logof = FeatureSpan()
+    logof.from_json(log['logo_span'], bool)
     
-    log_f.seek(20)
-    (scene_pos,) = struct.unpack('I', log_f.read(4))
-    if scene_pos < 20:
-        return []
+    blankf = FeatureSpan()
+    blankf.from_json(log['blank_span'], bool)
     
-    log_f.seek(scene_pos)
-    b = log_f.read(4)
-    if len(b) == 0:
-        return []
-    scenes = []
-    (count,) = struct.unpack('I', b)
-    for _ in range(count):
-        scenes.append(Scene(infile=log_f))
-    
-    # Special, short scenes at the start are basically truncated so don't use them for training
-    if len(scenes) > 2:
-        if scenes[0].duration < 5:
-            scenes[0].type = SceneType.DO_NOT_USE
-        
-        # Special, blank segments at show/commercial boundaries are always counted as show for ML
-        # When we write out results for playback we choose a good break point in the middle of the blank scene
-        for i in range(1,len(scenes)-1):
-            if scenes[i].blank >= .975 and scenes[i].type == SceneType.COMMERCIAL:
-                if scenes[i-1].type == SceneType.SHOW or scenes[i+1].type == SceneType.SHOW:
-                    scenes[i].type = SceneType.SHOW
-        
-        # Special, short scenes at the end are basically truncated so don't use them for training
-        if scenes[-1].duration < 5:
-            scenes[-1].type = SceneType.DO_NOT_USE
+    difff = SeparatorFeatureSpan()
+    difff.from_json(log['diff_span'], bool)
 
-    return scenes
+    return {
+        'logo':logof.to_list(),
+        'blank':blankf.to_list(),
+        'diff':difff.to_list(),
+        'audio':audiof.to_list(),
+    }
 
-def read_audio(log_f:str|BinaryIO) -> None:
-    if type(log_f) is str:
-        with open(log_f, 'r+b') as fd:
-            return read_audio(fd)
-    
-    log_f.seek(16)
-    (audio_pos,) = struct.unpack('I', log_f.read(4))
-    if audio_pos < 20:
-        return []
-    
-    log_f.seek(audio_pos)
-    (n,) = struct.unpack('I', log_f.read(4))
-    audio = []
-    for i in range(n):
-        (t,b,e) = struct.unpack('Iff', log_f.read(12))
-        if audio and audio[-1][1] <= b and audio[-1][2] > b:
-            old = audio.pop()
-            audio.append((old[0],old[1],b)) # overlapping, truncate old
-        audio.append((t,b,e))
-    
-    return audio
-
-def rewrite_scenes(scenes:list[Scene], log_f:str|BinaryIO, opts=None) -> None:
-    # TODO should we write the segmenter into the scenes? Training with two different segmenters might not make sense
-    if type(log_f) is str:
-        with open(log_f, 'r+b') as fd:
-            return rewrite_scenes(scenes, fd)
-    
-    log_f.seek(20)
-    (scene_pos,) = struct.unpack('I', log_f.read(4))
-    if scene_pos < 20:
-        if not scenes:
-            return
-        log_f.seek(0, 2)
-        scene_pos = log_f.tell()
-        log_f.seek(20)
-        log_f.write(struct.pack('I', scene_pos))
-    log_f.seek(scene_pos)
-    
-    log_f.write(struct.pack('I', len(scenes)))
-    if len(scenes) > 2:
-        if scenes[0].duration < 5:
-            scenes[0].type = scenes[0].newtype = SceneType.DO_NOT_USE
-        if scenes[-1].duration < 5:
-            scenes[-1].type = scenes[-1].newtype = SceneType.DO_NOT_USE
-    for s in scenes:
-        s.write_bin(log_f)
-
-def guess_external_breaks(opts:Any):
+def guess_external_breaks(opts:Any)->list:
     if not opts:
         return None
     
@@ -487,7 +327,7 @@ def guess_external_breaks(opts:Any):
                 return mtb
     
     if opts.feature_log:
-        if m:=re.match(r'(?:.*/)?cf_(\d{4,6})_(\d{12,})\.[a-zA-Z0-9]{2,5}\.feat', opts.feature_log):
+        if m:=re.match(r'(?:.*/)?cf_(\d{4,6})_(\d{12,})(?:\.[a-zA-Z0-9]{2,5})+', opts.feature_log):
             mtb = mythtv.get_breaks(m[1], m[2])
             if mtb:
                 return mtb
@@ -540,25 +380,19 @@ def guess_external_breaks(opts:Any):
     
     return None
 
-def external_scene_tags(scenes:list[Scene],marks:list[tuple[float,float]]=None,opts:Any=None)->None:
+def external_tags(marks:list[tuple[float,float]]=None,opts:Any=None,duration:float|None=None)->FeatureSpan:
     if marks is None:
         if opts is not None:
             marks = guess_external_breaks(opts)
         if marks is None:
             log.info('No external source of marks/breaks available')
-            return
+            return None
     
+    markf = FeatureSpan()
+    markf.start(0, SceneType.SHOW)
     for (start,stop) in marks:
-        first = True
-        for s in scenes:
-            if s.start_time >= stop:
-                break
-            elif s.duration >= 1 and s.duration < 10 and (stop - s.start_time) < s.duration/2:
-                # if it ends just inside this scene then don't count it
-                break
-            if s.start_time <= stop and s.stop_time > start:
-                if first and s.duration >= 1 and s.duration < 10 and (s.stop_time - start) < s.duration/2:
-                    # if the tag is near the end of the scene then don't count it
-                    continue
-                first = False
-                s.is_break = True
+        markf.add(start, SceneType.COMMERCIAL)
+        markf.add(stop, SceneType.SHOW)
+    if duration:
+        markf.end(duration)
+    return markf

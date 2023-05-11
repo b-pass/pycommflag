@@ -4,13 +4,12 @@ import time
 import numpy as np
 from PIL import ImageTk, Image
 from .player import Player
-from .scene import *
 from . import logo_finder
 from . import processor
 from .extern.ina_foss import AudioSegmentLabel
 
 class Window(tk.Tk):
-    def __init__(self, video, scenes:list[Scene]=[], logo:tuple=None, audio:list[tuple]=None):
+    def __init__(self, video, scenes:list=[], logo:tuple=None, audio:list[tuple]=None):
         tk.Tk.__init__(self)
         self.title("pycommflag editor")
         self.player = Player(video, no_deinterlace=True)

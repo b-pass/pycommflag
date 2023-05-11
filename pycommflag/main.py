@@ -6,8 +6,6 @@ from . import gui
 from . import mythtv
 from . import neural
 from . import processor
-from .segmenter import parse as parse_segmenter
-from .scene import *
 
 def run(opts:Any) -> None|int:
     if opts.rebuild:
@@ -17,10 +15,11 @@ def run(opts:Any) -> None|int:
     
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' # shut up, tf
 
-    parse_segmenter(opts.segmeth) # throw for validation errors
-
     if opts.reprocess:
-        scenes = processor.segment_scenes(opts.reprocess, opts=opts)
+        spans = processor.build_feature_spans(opts.reprocess, opts=opts)
+        # and run NN
+        # and save tags
+        # and write tags to DB
         return 0
     
     if opts.train:
@@ -39,55 +38,37 @@ def run(opts:Any) -> None|int:
         if opts.chanid and opts.starttime:
             opts.filename = mythtv.get_filename(opts.chanid, opts.starttime)
     
-    if opts.dumptext:
-        scenes = processor.read_scenes(opts.feature_log) if opts.feature_log else []
-        got_tags = False
-        for s in scenes:
-            if s.type != SceneType.UNKNOWN:
-                got_tags = True
-                break
-        if not got_tags:
-            processor.external_scene_tags(scenes,opts=opts)
-        
-        print("\nSCENES:")
-        print(Scene.header())
-        for s in scenes:
-            print(s)
-        print(f"{len(scenes)} total.")
-        sys.exit(0)
-    
     if not opts.filename:
         print('No video file to work on (need one of: -f, -r, --chanid, etc)')
         return 1
     
     if opts.gui:
-        logo = processor.read_logo(opts.feature_log) if opts.feature_log else None
-        scenes = processor.read_scenes(opts.feature_log) if opts.feature_log else []
-        if not scenes:
-            scenes = processor.segment_scenes(opts.feature_log, opts=opts) if opts.feature_log else []
-        audio = processor.read_audio(opts.feature_log) if opts.feature_log else []
-        got_tags = False
-        for s in scenes:
-            if s.type != SceneType.DO_NOT_USE and s.type != SceneType.UNKNOWN:
-                got_tags = True
-                break
-        if not got_tags:
-            processor.external_scene_tags(scenes,opts=opts)
-        w = gui.Window(video=opts.filename, scenes=scenes, logo=logo, audio=audio)
+        flog = processor.read_feature_log(opts.feature_log)
+        logo = processor.read_logo(flog)
+        spans = processor.build_feature_spans(flog, opts=opts) if opts.feature_log else []
+        tags = processor.read_tags(flog, opts=opts) if opts.feature_log else []
+        if not tags:
+            tags = processor.external_tags(opts=opts)
+        w = gui.Window(video=opts.filename, spans=spans, tags=tags, logo=logo)
         res = w.run()
-        if res is None:
+        if res is not None:
+            flog['tags'] = res
+            processor.write_feature_log(flog, opts.feature_log)
+            return 0
+        else:
             return 1
-        processor.rewrite_scenes(res, log_f=opts.feature_log)
-        return 0
     
     if opts.no_feature_log:
-        feature_log = tempfile.TemporaryFile('w+b', prefix='cf_', suffix='.feat')
+        feature_log = tempfile.TemporaryFile('w+', prefix='cf_', suffix='.json')
     elif not opts.feature_log:
-        feature_log = tempfile.gettempdir() + os.path.sep + 'cf_'+os.path.basename(opts.filename)+'.feat'
+        feature_log = tempfile.gettempdir() + os.path.sep + 'cf_'+os.path.basename(opts.filename)+'.json'
     else:
         feature_log = opts.feature_log
     
     processor.process_video(opts.filename, feature_log, opts)
-    scenes = processor.segment_scenes(feature_log, opts=opts)
-    
+    flog = processor.read_feature_log(feature_log)
+    spans = processor.build_feature_spans(flog, opts=opts)
+    # and then run NN...
+    # then, processor.write_tags_into(res, log_f=opts.feature_log)
+    # and then save in DB or text or whatever
     return 0

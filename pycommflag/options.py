@@ -17,8 +17,6 @@ def get_options():
                         help="Input location of feature data log to be reprocessed.")
     parser.add_argument('-g', '--gui', dest='gui', action='store_true', 
                         help="(Re)Process and then display for GUI editing.  Must also supply --file and --feature-log for the thing being edited in the GUI.")
-    parser.add_argument('--dump-text', dest='dumptext', action='store_true',
-                        help="(Re)Process and Dump scene text and exit.  Must supply a --feature-log")
     parser.add_argument('-q', '--quiet', dest='quiet', action='store_true',
                         help="Do not print progress during processing")
     parser.add_argument('--loglevel', dest='loglevel', type=str,
@@ -27,8 +25,8 @@ def get_options():
                         help="Pull configuration from a yaml file and overwrite commandline configuration and default with that.")
     parser.add_argument('--deinterlace', dest='no_deinterlace', action='store_false',
                         help="Use a deinterlacing filter during video processing")
-    parser.add_argument('--scene-threshold', dest='scene_threshold', type=float, default=15.0,
-                        help="Difference threshold (column/bar) for marking a scene change [8-30 is sane].")
+    parser.add_argument('--diff-threshold', dest='diff_threshold', type=float, default=15.0,
+                        help="Threshold (column/bar) for marking an image difference/change [8-30 is sane].")
     
     logo = parser.add_argument_group('Logo Search')
     logo.add_argument('--no-logo', dest='no_logo', action='store_true', 
@@ -40,13 +38,6 @@ def get_options():
     #logo.add_argument('--check-blanks', dest="blanks_check_logo", action="store_true",
     #                help="Include logo area when checking for blank frames (tends towards not marking frames blank if they have logo)")
     parser.add_argument_group(logo)
-    
-    seg = parser.add_argument_group('Scene Segmentation')
-    seg.add_argument('--delay-diff', dest='delay_diff', action='store_true',
-                     help="Delay diff until scene segmentation phase; saves video column data in feature log (makes feature logs huge!)")
-    seg.add_argument('--segment', dest='segmeth', type=str, default='blank|audio',
-                   help="Scene segmentation instruction; split video into scenes using the demuxers.\nPlus to AND them, comma or pipe to OR them.\nSegmenters: logo,silence,audio,blank,imagediff,1s")
-    parser.add_argument_group(seg)
 
     ml = parser.add_argument_group('Machine Learning')
     ml.add_argument('--train', dest="train", action='store_true', 
