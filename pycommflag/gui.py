@@ -31,6 +31,8 @@ class Window(tk.Tk):
         for (t,(b,e)) in tags:
             if b > p:
                 self.tags.append((SceneType.SHOW,(p,b)))
+            if type(t) is int:
+                t = SceneType(t)
             self.tags.append((t,(b,e)))
             p = e
         tags = None
@@ -217,7 +219,7 @@ class Window(tk.Tk):
     
     def prev(self,key='diff'):
         span = []
-        if key == 'diff':
+        if key == 'break':
             span = self.tags
         else:
             span = self.spans.get(key)
@@ -232,7 +234,7 @@ class Window(tk.Tk):
 
     def next(self,key='diff'):
         span = []
-        if key == 'diff':
+        if key == 'break':
             span = self.tags
         else:
             span = self.spans.get(key)
@@ -362,7 +364,12 @@ class Window(tk.Tk):
         pos += row
 
         self.drawSpan(self.spans.get('blank',[]), top=int(row*.3), bottom=pos-int(row*.3), colorMap={True:'black'})
-        
+
+        if self.settype is not None:
+            color = SceneType.color_map()[self.settype]
+            if color is not None:
+                self.vMaybe = self.mapCanvas.create_rectangle(0, 0, 0, self.map_height, width=0, fill=color, stipple='gray50')
+
         # lastly, add the positional indicator
         self.vMapPos = self.mapCanvas.create_line(0,0,0,self.map_height,arrow=tk.BOTH,fill='orange')
         self.updatePosIndicators()
@@ -379,6 +386,7 @@ class Window(tk.Tk):
         b.grid(row=0, column=1, padx=5)
 
         self.setpos = self.position
+        self.drawMap()
         self.next()
     
     def cancel_tag(self, btnIdx):
@@ -394,55 +402,44 @@ class Window(tk.Tk):
             if endpos < startpos:
                 (endpos, startpos) = (startpos, endpos)
             
-            # seek to where a tag starts BEFORE us
+            # seek to the first tag overlapping us
             b = 0
-            while b < len(self.tags) and self.tags[b][1][0] >= startpos:
+            while b < len(self.tags) and self.tags[b][1][1] <= startpos:
                 b += 1
-            
-            if b < len(self.tags):
-                if self.tags[b][1][1] < startpos:
-                    # ends before we start, so its just squarely before us
-                    b += 1
-                elif self.tags[b][1][1] <= endpos: # ends before we end, so its overlapping to the left
-                    if self.tags[b][0] == settype:
-                        # same type, just consume it
-                        startpos = self.values[b][1][0]
-                        del self.tags[b]
-                    else:
-                        # truncate it to where we are starting
-                        self.tags[b] = (self.tags[b][0], (self.tags[b][1][0], startpos))
-                        b += 1
-                else:
-                    # starts before us and ends after us, we're entirely inside
-                    if self.tags[b][0] == settype:
-                        # we're inside something of the same type, so just do nothing
-                        settype = None
-                        return self.end_tag(btnIdx)
-                    else:
-                        # we have to split it
-                        self.tags[b] = [(self.tags[b][0], (self.tags[b][1][0], startpos)), (self.tags[b][0], (endpos, self.tags[b][1][1]))]
-                        b += 1
-            
-            # seek to one that ends after us
+            if b < len(self.tags) and self.tags[b][1][0] < startpos:
+                # split the tag so our start lines up with the start of a tag
+                x = self.tags[b][1][1]
+                tt = self.tags[b][0]
+                self.tags[b] = (tt, (self.tags[b][1][0], startpos))
+                b += 1
+                self.tags[b:b] = [(tt, (startpos,x))]
+            # seek to the first tag after us
             e = b
             while e < len(self.tags) and self.tags[e][1][1] <= endpos:
                 e += 1
-            if e < len(self.tags) and self.tags[e][1][0] <= endpos:
-                # starts before we end, so its overlapping to the right
-                if self.tags[b][0] == settype or endpos == self.tags[e][1][1]:
-                    # same type, just consume it
-                    endpos = self.tags[e][1][1]
-                    del self.tags[e]
-                else:
-                    # truncate the left side of it
-                    self.tags[e] = (self.tags[e][0], (endpos, self.tags[e][1][1]))
+            if e < len(self.tags) and self.tags[e][1][0] < endpos:
+                # split the tag so our end exactly lines up with the start of a tag
+                x = self.tags[e][1][1]
+                tt = self.tags[e][0]
+                self.tags[e] = (tt, (self.tags[e][1][0], endpos))
+                e += 1
+                self.tags[e:e] = [(tt, (endpos,x))]
             
-            self.tags[b:e] = [(settype,(startpos,endpos))]
+            # if the one before is the same type, merge with that
+            if b > 0 and b-1 < len(self.tags) and self.tags[b-1][0] == settype and (startpos-self.tags[b-1][1][1]) < 0.02:
+                b -= 1
+                startpos = self.tags[b][1][0]
+            # if the one after is the same type, merge with that
+            if e > 0 and e < len(self.tags) and self.tags[e][0] == settype and (self.tags[e][1][0] - endpos) < 0.02:
+                endpos = self.tags[e][1][1]
+                e += 1
+            
+            self.tags[b:e] = [(settype, (startpos, endpos))]
             
         self.settype = None
         self.setpos = 0
         
-        if self.btnIdx is not None:
+        if btnIdx is not None:
             self.tag_cancel.grid_forget() 
             c = 0
             for (b,t,l) in self.taggers:
@@ -452,7 +449,7 @@ class Window(tk.Tk):
             (b,t,label) = self.taggers[btnIdx]
             b.configure(text=f'Flag {label}', command=lambda x=btnIdx:self.do_tag(x))
 
-            self.drawMap()
+        self.drawMap()
     
     def truncate_now(self):
         self.setpos = self.player.duration
@@ -464,7 +461,7 @@ class Window(tk.Tk):
         self.result = []
         for (t,(b,e)) in self.tags:
             if t != SceneType.SHOW:
-                self.result.append((t,(b,e)))
+                self.result.append((t.value,(b,e)))
         self.destroy()
 
     def run(self):
