@@ -1,15 +1,12 @@
+import json
 import logging as log
-from queue import Queue
-import struct
-import sys
-import os
-import re
-from threading import Thread
 import numpy as np
 import math
+import os
+from queue import Queue
+import re
+from threading import Thread
 import time
-import gc
-import json
 
 from typing import Any,TextIO, TextIO
 
@@ -41,7 +38,15 @@ def write_feature_log(flog:dict, log_file:str|TextIO):
             return write_feature_log(flog, fd)
     log_file.seek(0)
     log_file.truncate()
-    json.dump(flog, log_file,indent=' ', ensure_ascii=False, check_circular=False)
+    log_file.write('{\n')
+    first = True
+    for (k,v) in flog.items():
+        if first:
+            first = False
+        else:
+            log_file.write(',\n')
+        log_file.write(f'"{k}" : {json.dumps(v)}')
+    log_file.write("\n}\n")
 
 def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> None:
     logo = None
@@ -57,18 +62,19 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
     
     player = Player(video_filename, no_deinterlace=opts.no_deinterlace)
 
+    feature_log.write('{ "file_version":10\n')
+
     if opts.no_logo:
         logo = None
     elif logo is not None:
         pass
     else:
-       logo = logo_finder.search(player, opts=opts)
+        logo = logo_finder.search(player, opts=opts)
+        player.seek(0)
     
-    feature_log.write('{ "file_version":10\n')
     feature_log.write(',\n"logo":')
     feature_log.write(logo_finder.to_json(logo))
     
-    player.seek(0)
     player.enable_audio()
     player.seek(0)
 
@@ -137,6 +143,7 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
     feature_log.write(videoProc.difff.to_json())
 
     audioProc.join()
+    audioProc.fspan.end(player.duration)
 
     feature_log.write(',\n"audio":')
     feature_log.write(audioProc.fspan.to_json())
@@ -252,6 +259,7 @@ class AudioProc(Thread):
         self.audio = []
         self.prev = None
         self.fspan = AudioFeatureSpan()
+        self.fspan.start()
 
     def add_audio(self,segments):
         self.queue.put(segments)
@@ -289,14 +297,52 @@ class AudioProc(Thread):
 
             startbound = 0 if isstart else 0.5
             for (lab, sb, se) in self.seg(all):
-                if se <= startbound:
-                    continue
-                old = self.audio[-1] if self.audio else (0,0,-1)
-                if old[1] <= (start+sb) and (start+sb) < old[2]:
-                    self.audio[-1] = (old[0],old[1],round(start+sb,5)) # overlapping, truncate old
-                self.audio.append((AudioSegmentLabel[lab], round(start+sb,5), round(start+se,5)))
-        
-        self.fspan.add_all(self.audio)
+                if se > startbound:
+                    self.fspan.add(round(start+sb,5), round(start+se,5), AudioSegmentLabel[lab])
+
+def reprocess(feature_log_filename:str, opts:Any=None) -> dict[str, FeatureSpan]:
+    flog = read_feature_log(feature_log_filename)
+
+    lasttime = 0
+    logof = FeatureSpan()
+    logof.start(0,False)
+    blankf = FeatureSpan()
+    blankf.start(0,True)
+    difff = SeparatorFeatureSpan()
+    difff.start(0,True)
+
+    for f in flog['frames']:
+        if f is None:
+            continue
+
+        lasttime = f[0]
+        logof.add(lasttime,f[1])
+        blankf.add(lasttime, f[2])
+        difff.add(lasttime, f[3])
+    
+    logof.end(lasttime)
+    blankf.end(lasttime)
+    difff.end(lasttime)
+
+    audiof = AudioFeatureSpan()
+    audiof.start()
+    for (t,b,e) in read_audio(flog):
+        audiof.add(b,e,t)
+    audiof.end(lasttime)
+    
+    flog['logo_span'] = logof.to_list()
+    flog['blank_span'] = blankf.to_list()
+    flog['diff_span'] = difff.to_list()
+    flog['audio'] = audiof.to_list(serializable=True)
+
+    write_feature_log(flog, feature_log_filename)
+
+    return {
+        'logo':logof.to_list(),
+        'blank':blankf.to_list(),
+        'diff':difff.to_list(),
+        'audio':audiof.to_list(),
+    }
 
 def read_logo(log_in:str|TextIO|dict) -> None|tuple:
     return logo_finder.from_json(read_feature_log(log_in).get('logo', None))

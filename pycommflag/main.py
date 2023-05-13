@@ -16,7 +16,7 @@ def run(opts:Any) -> None|int:
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' # shut up, tf
 
     if opts.reprocess:
-        #spans = processor.build_feature_spans(opts.reprocess, opts=opts)
+        spans = processor.reprocess(opts.reprocess, opts=opts)
         # and run NN
         # and save tags
         # and write tags to DB

@@ -26,14 +26,12 @@ class FeatureSpan:
         if self._spans:
             self._spans[-1] = (self._spans[-1][0], when)
 
-        print(f"****** {len(self._spans)} spans ******")
         p = self._spans[0][0]
         for (v,(b,e)) in zip(self._values, self._spans):
             if b != p:
-                print(f"*** NOT CONTIGUOUS! {b-p} gap!")
+                import logging as log
+                log.warn(f"FEATURE SPAN NOT CONTIGUOUS! at {p} throguh {b}, a {b-p} gap!")
             p = e
-
-            print(f"{b} - {e} ({e-b}) = {v}")
 
     def from_json(self, js:str|list, converter):
         if type(js) is str:
@@ -72,56 +70,69 @@ class SeparatorFeatureSpan(FeatureSpan):
 class AudioFeatureSpan(FeatureSpan):
     def __init__(self):
         super().__init__()
-    
-    def add_all(self, audio:list[tuple[int,float,float]]):
-        if not audio:
-            return
-        self._spans = [(0,0.000001)]
+
+    def start(self):
         self._values = [AudioSegmentLabel.SILENCE]
-        for (t,b,e) in audio:
-            if t == self._values[-1]:
-                # not a change, just expand the existing entry
-                self._spans[-1] = (min(b,self._spans[-1][0]), max(e, self._spans[-1][1]))
-                continue
-            if b > self._spans[-1][1]:
-                # skipped a spot, add silence there
-                if t == AudioSegmentLabel.SILENCE:
-                    # will be silence, just start sooner
-                    b = self._spans[-1][1]
-                elif self._values[-1] == AudioSegmentLabel.SILENCE:
-                    # was silence, end later
-                    self._spans[-1] = (self._spans[-1][0], b)
-                else:
-                    # insert a silence between
-                    self._spans.append((self._spans[-1][1],b))
-                    self._values.append(AudioSegmentLabel.SILENCE)
-            if b < self._spans[-1][1]:
-                # going backwards, need to de-overlap the previous entry
-                if e <= self._spans[-1][0]:
-                    # would go entirely before the last entry, so just drop this
-                    continue
-                # replace the old segment 
-                b = self._spans[-1][0] # now spanning both entries
-                self._spans.pop() # drop old
-                self._values.pop() # drop old
-                if self._values and t == self._values[-1]:
-                    # not a change, just expand the entry
-                    self._spans[-1] = (min(b,self._spans[-1][0]), max(e, self._spans[-1][1]))
-                    continue
-            # add a new entry
-            self._spans.append((b,e))
-            self._values.append(t)
-        
-        p = self._spans[0][0]
-        for (t,(b,e)) in zip(self._values, self._spans):
-            if b != p:
-                print(f"*** NOT CONTIGUOUS! {b-p} gap at {p}-{b}!")
-                assert(b == p)
-            p = e
+        self._spans = [(0.0,0.0)]
     
+    # de-overlap and fill in gaps with silence as we go
+    def add(self, start, end, what):
+        #if type(what) is int: what = AudioSegmentLabel[what]
+        if self._values[-1] == what:
+            self._spans[-1] = (self._spans[-1][0], max(end, self._spans[-1][1]))
+            return
+        if self._spans[-1][1] > start:
+            # overlap with previous
+            if self._spans[-1][0] >= start:
+                # total overlap, just remove it
+                del self._spans[-1]
+                del self._values[-1]
+                if self._spans:
+                    start = max(start,self._spans[-1][1])
+                    if start < end:
+                        # retry
+                        self.add(start, end, what)
+                    return
+                else:
+                    pass
+            else:
+                # partial overlap, truncate previous
+                self._spans[-1] = (self._spans[-1][0], start)
+                pass
+        elif self._spans[-1][1] < start:
+            if what != AudioSegmentLabel.SILENCE:
+                self.add(self._spans[-1][1], start, AudioSegmentLabel.SILENCE)
+                # and retry
+                self.add(start, end, what)
+                return
+            else:
+                start = self._spans[-1][1]
+        else:
+            pass
+        
+        self._spans.append((start,end))
+        self._values.append(what)
+    
+    def end(self, when):
+        if self._spans and self._spans[-1][1] < when:
+            self.add(self._spans[-1][1], when, AudioSegmentLabel.SILENCE)
+
+        p = self._spans[0][0]
+        for (v,(b,e)) in zip(self._values, self._spans):
+            if b != p:
+                import logging as log
+                log.warn(f"FEATURE SPAN NOT CONTIGUOUS! at {p} throguh {b}, a {b-p} gap!")
+            p = e
+
     def to_json(self):
         return super().to_json(converter=lambda x:x.value)
 
+    def to_list(self,serializable=False):
+        if serializable:
+            return [(lab.value, tm) for (lab,tm) in zip(self._values, self._spans)]
+        else:
+            return [x for x in zip(self._values, self._spans)]
+    
 class SceneType(Enum):
     UNKNOWN = 0
     SHOW = 0
@@ -138,23 +149,11 @@ class SceneType(Enum):
         return {
             SceneType.SHOW : 'green',
             SceneType.INTRO : 'yellow',
-            SceneType.TRANSITION : 'blue',
+            SceneType.TRANSITION : 'pink',
             SceneType.COMMERCIAL : 'red',
             SceneType.CREDITS : 'yellow',
-            SceneType.DO_NOT_USE : 'gray',
+            SceneType.DO_NOT_USE : None,# 'dark grey',
         }
-
-    def color(self):
-        colors = ['green','yellow','blue','red','yellow','gray']
-        return colors[self.value]
-    
-    def logo_color(self):
-        colors = ['light green','light yellow','light blue','pink','light yellow','gray']
-        return colors[self.value]
-    
-    def new_color(self):
-        colors = ['dark green','dark orange','dark blue','deep pink','dark orange','gray']
-        return colors[self.value]
 
 from enum import Enum
 class AudioSegmentLabel(Enum):
@@ -175,14 +174,10 @@ class AudioSegmentLabel(Enum):
     def count():
         return 4
 
-    def color(self):
-        colors = ['black','light blue','yellow','red']
-        return colors[self.value]
-
     def color_map():
         return {
-            AudioSegmentLabel.SILENCE : 'dark grey',
-            AudioSegmentLabel.SPEECH : 'light blue',
-            AudioSegmentLabel.MUSIC : 'dark blue',
+            AudioSegmentLabel.SILENCE : None,# 'dark grey',
+            AudioSegmentLabel.SPEECH : 'dark blue',
+            AudioSegmentLabel.MUSIC : 'light blue',
             AudioSegmentLabel.NOISE : 'pink',
         }

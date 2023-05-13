@@ -174,14 +174,16 @@ class Window(tk.Tk):
         self.misc.append(save)
         c += 1
         
-        self.mapCanvas = tk.Canvas(self, width=1280, height=60)
+        self.map_height = 80
+        self.map_width = 1280
+        self.mapCanvas = tk.Canvas(self, width=self.map_width, height=self.map_height)
         self.mapCanvas.grid(row=7, column=0, columnspan=5)
-        self.mapCanvas.bind("<Button-1>", lambda e:self.move(abs=float(e.x)/1280.0*self.player.duration))
+        self.mapCanvas.bind("<Button-1>", lambda e:self.move(abs=float(e.x)/self.map_width*self.player.duration))
         
         self.scale_pos = tk.DoubleVar()
         self.scroller = tk.Scale(self, 
                                 from_=0, to_=self.player.duration/60, resolution=1/60, tickinterval=5, showvalue=False,
-                                length=1280+25, orient=tk.HORIZONTAL, sliderlength=25,
+                                length=self.map_width+25, orient=tk.HORIZONTAL, sliderlength=25,
                                 variable=self.scale_pos,
                                 command=lambda n: self.move(abs=float(n)*60))
         self.scroller.grid(row=9, column=0, columnspan=5)
@@ -221,6 +223,8 @@ class Window(tk.Tk):
             span = self.spans.get(key)
             
         for (t,(b,e)) in reversed(span):
+            if type(t) is bool and not t:
+                continue
             p = b+(e-b)/2 if key == 'blank' else b
             if (p - self.position) < -3/self.player.frame_rate:
                 self.move(abs=p)
@@ -234,6 +238,8 @@ class Window(tk.Tk):
             span = self.spans.get(key)
             
         for (t,(b,e)) in span:
+            if type(t) is bool and not t:
+                continue
             p = b+(e-b)/2 if key == 'blank' else b
             if (p - self.position) > 3/self.player.frame_rate:
                 self.move(abs=p)
@@ -313,54 +319,52 @@ class Window(tk.Tk):
         self.pos_label.configure(text=f'{int(self.position/60):02}:{self.position%60:06.03f}')
         
         self.scale_pos.set(self.position/60) #self.scroller.set(self.position/60)
-        x = math.ceil(self.position / (self.player.duration / 1280))
-        self.mapCanvas.coords(self.vMapPos, x, 0, x, 60)
+        x = math.ceil(self.position / (self.player.duration / self.map_width))
+        self.mapCanvas.coords(self.vMapPos, x, 0, x, self.map_height)
         
         if self.vMaybe is not None:
-            startx = math.floor(self.setpos / (self.player.duration / 1280))
+            startx = math.floor(self.setpos / (self.player.duration / self.map_width))
             stopx = x
             if startx > stopx:
                 (startx, stopx) = (stopx, startx)
             elif startx == stopx:
                 stopx += 1
-            self.mapCanvas.coords(self.vMaybe, startx, 0, stopx, 60)
+            self.mapCanvas.coords(self.vMaybe, startx, 0, stopx, self.map_height)
             #print(self.settype, self.vMaybe, self.setpos, self.position, startx, stopx)
 
     def drawSpan(self, span, colorMap, top, bottom, force_width=None):
-        sec_per_pix = self.player.duration / 1280
+        sec_per_pix = self.player.duration / self.map_width
         for (t,(b,e)) in span:
             startx = math.floor(b / sec_per_pix)
             if force_width is not None:
                 stopx = startx + force_width
             else:
-                stopx = math.ceil(e / sec_per_pix)
+                stopx = max(startx+1,math.ceil(e / sec_per_pix))
             color = colorMap.get(t, None)
-            print(t,startx,stopx,color)
-            if color is None:
-                continue
-            self.mapCanvas.create_rectangle(startx, top, stopx, bottom, width=0, fill=color)
+            if color is not None:
+                self.mapCanvas.create_rectangle(startx, top, stopx, bottom, width=0, fill=color)
+            #print(t,startx,stopx,color)
     
     def drawMap(self):
-        map_height = 60
         for x in self.mapCanvas.find_all():
             self.mapCanvas.delete(x)
         self.vMaybe = None
 
-        row=20
-        pos=0
+        row = self.map_height/4
+        pos = 0
         self.drawSpan(self.tags, top=pos, bottom=pos+row, colorMap=SceneType.color_map())
         pos += row
-        self.drawSpan(self.spans.get('logo',[]), top=pos, bottom=pos+row, colorMap={True:'cyan'})
+        self.drawSpan(self.spans.get('logo',[]), top=pos, bottom=pos+row, colorMap={True:'blue'})
         pos += row
-        self.drawSpan(self.spans.get('diff',[]), top=pos, bottom=pos+row, colorMap={True:'yellow'}, force_width=1)
+        self.drawSpan(self.spans.get('diff',[]), top=pos, bottom=pos+row, colorMap={True:'purple'}, force_width=1)
         pos += row
         self.drawSpan(self.spans.get('audio',[]), top=pos, bottom=pos+row, colorMap=AudioSegmentLabel.color_map())
         pos += row
 
-        self.drawSpan(self.spans.get('blanks',[]), top=int(row*.9), bottom=pos-int(row*.9), colorMap={True:'black'})
+        self.drawSpan(self.spans.get('blank',[]), top=int(row*.3), bottom=pos-int(row*.3), colorMap={True:'black'})
         
         # lastly, add the positional indicator
-        self.vMapPos = self.mapCanvas.create_line(0,0,0,map_height,arrow=tk.BOTH,fill='orange')
+        self.vMapPos = self.mapCanvas.create_line(0,0,0,self.map_height,arrow=tk.BOTH,fill='orange')
         self.updatePosIndicators()
 
     def do_tag(self, btnIdx):
@@ -375,8 +379,7 @@ class Window(tk.Tk):
         b.grid(row=0, column=1, padx=5)
 
         self.setpos = self.position
-        self.drawMap()
-        self.next(diff=True)
+        self.next()
     
     def cancel_tag(self, btnIdx):
         self.settype = None

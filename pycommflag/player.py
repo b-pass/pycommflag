@@ -25,7 +25,7 @@ class Player:
         self.shape = (-1,-1)
         self.graph = None
         
-        self.frame_rate = self.container.streams.video[0].guessed_rate
+        self.frame_rate = round(self.container.streams.video[0].guessed_rate,4)
         self.vt_start = self.container.streams.video[0].start_time * self.container.streams.video[0].time_base
         self.vt_pos = self.vt_start
 
