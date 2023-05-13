@@ -35,6 +35,14 @@ def read_feature_log(feature_log_file:str|TextIO|dict) -> dict:
             feature_log_file.seek(0)
             return json.loads(feature_log_file.read() + ']}')
 
+def write_feature_log(flog:dict, log_file:str|TextIO):
+    if type(log_file) is str:
+        with open(log_file, 'w+') as fd:
+            return write_feature_log(flog, fd)
+    log_file.seek(0)
+    log_file.truncate()
+    json.dump(flog, log_file,indent=' ', ensure_ascii=False, check_circular=False)
+
 def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> None:
     logo = None
     if type(feature_log) is str:
@@ -42,7 +50,10 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
             logo = logo_finder.from_json(read_feature_log(feature_log).get('logo', None))
             if logo and not opts.quiet:
                 print(f"{feature_log} exists, re-using logo ", logo[0], logo[1])
-        feature_log = open(feature_log, 'w')
+        feature_log = open(feature_log, 'w+')
+    else:
+        feature_log.seek(0)
+        feature_log.truncate()
     
     player = Player(video_filename, no_deinterlace=opts.no_deinterlace)
 
@@ -73,8 +84,7 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
     p = 0
 
     fcolor = None
-    feature_log.write(f',\n"duration":{float(player.duration)},\n"frame_rate":{round(float(player.frame_rate),2)}')
-    feature_log.write(',\n"frames":[null\n')
+    feature_log.write(f',\n"duration":{float(player.duration)},\n"frame_rate":{round(float(player.frame_rate),3)}')
     
     audio_interval = int(player.frame_rate * 60)
 
@@ -84,6 +94,9 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
     videoProc = VideoProc(feature_log, player.vt_start, logo, opts)
     videoProc.start()
 
+    feature_log.write(',\n"frames_header":' + videoProc.frame_header())
+    feature_log.write(',\n"frames":[null\n')
+    
     if not opts.quiet: print('\nExtracting features...', end='\r') 
 
     endtime = 0
@@ -200,13 +213,16 @@ class VideoProc(Thread):
             is_diff = False
         self.prev_col = column
 
-        self.lasttime = round(frame.time-self.vt_start,4)
+        self.lasttime = round(frame.time-self.vt_start,5)
         self.logof.add(self.lasttime, logo_present)
         self.blankf.add(self.lasttime, frame_blank)
         self.difff.add(self.lasttime, is_diff)
         self.feature_log.write(
             f",[{self.lasttime},{int(logo_present)},{int(frame_blank)},{int(is_diff)}]\n"
         )
+    
+    def frame_header(self):
+        return '["time","logo_present","is_blank","is_diff"]'
 
 def mean_axis1_float_uint8(fcolor:np.ndarray)->np.ndarray:
     # the below code is equivalent to:
@@ -277,8 +293,8 @@ class AudioProc(Thread):
                     continue
                 old = self.audio[-1] if self.audio else (0,0,-1)
                 if old[1] <= (start+sb) and (start+sb) < old[2]:
-                    self.audio[-1] = (old[0],old[1],round(start+sb,4)) # overlapping, truncate old
-                self.audio.append((AudioSegmentLabel[lab], round(start+sb,4), round(start+se,4)))
+                    self.audio[-1] = (old[0],old[1],round(start+sb,5)) # overlapping, truncate old
+                self.audio.append((AudioSegmentLabel[lab], round(start+sb,5), round(start+se,5)))
         
         self.fspan.add_all(self.audio)
 
@@ -291,7 +307,10 @@ def read_audio(log_f:str|TextIO|dict) -> list[tuple]:
 
     return [(x,y,z) for (x,(y,z)) in audiof.to_list()]
 
-def build_feature_spans(log:str|TextIO|dict, opts=None) -> dict[str, FeatureSpan]:
+def read_tags(log_f:str|TextIO|dict):
+    return read_feature_log(log_f).get('tags', [])
+
+def read_feature_spans(log:str|TextIO|dict) -> dict[str, FeatureSpan]:
     log = read_feature_log(log)
 
     audiof = AudioFeatureSpan()

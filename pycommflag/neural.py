@@ -7,7 +7,7 @@ import numpy as np
 import math
 import time
 
-from typing import Any,BinaryIO
+from typing import Any,TextIO,BinaryIO
 
 def scenes_to_vecs(scenes:list)->tuple[list[list[float]], list[list[float]]]:
     MAX_SCENE_LEN = 300.0 # seconds

@@ -16,7 +16,7 @@ def run(opts:Any) -> None|int:
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' # shut up, tf
 
     if opts.reprocess:
-        spans = processor.build_feature_spans(opts.reprocess, opts=opts)
+        #spans = processor.build_feature_spans(opts.reprocess, opts=opts)
         # and run NN
         # and save tags
         # and write tags to DB
@@ -32,7 +32,7 @@ def run(opts:Any) -> None|int:
     if not opts.filename:
         if not opts.chanid and not opts.starttime:
             import re
-            if m:=re.match(r'(?:.*/)?cf_(\d{4,6})_(\d{12,})\.[a-zA-Z0-9]{2,5}\.feat', opts.feature_log):
+            if m:=re.match(r'(?:.*/)?cf_(\d{4,6})_(\d{12,})(?:\.[a-zA-Z0-9]{2,5}){1,4}', opts.feature_log):
                 opts.chanid = m[1]
                 opts.starttime = m[2]
         if opts.chanid and opts.starttime:
@@ -45,8 +45,8 @@ def run(opts:Any) -> None|int:
     if opts.gui:
         flog = processor.read_feature_log(opts.feature_log)
         logo = processor.read_logo(flog)
-        spans = processor.build_feature_spans(flog, opts=opts) if opts.feature_log else []
-        tags = processor.read_tags(flog, opts=opts) if opts.feature_log else []
+        spans = processor.read_feature_spans(flog)
+        tags = processor.read_tags(flog)
         if not tags:
             tags = processor.external_tags(opts=opts)
         w = gui.Window(video=opts.filename, spans=spans, tags=tags, logo=logo)
@@ -67,7 +67,7 @@ def run(opts:Any) -> None|int:
     
     processor.process_video(opts.filename, feature_log, opts)
     flog = processor.read_feature_log(feature_log)
-    spans = processor.build_feature_spans(flog, opts=opts)
+    spans = processor.read_feature_spans(flog)
     # and then run NN...
     # then, processor.write_tags_into(res, log_f=opts.feature_log)
     # and then save in DB or text or whatever

@@ -301,26 +301,3 @@ class Segmenter:
         mspec, loge, difflen = sample2feats(samples)
         # do segmentation   
         return self.segment_feats(mspec, loge, difflen, 0)
-
-from enum import Enum
-class AudioSegmentLabel(Enum):
-    noEnergy = 0
-    silence = 0
-    SILENCE = 0
-
-    energy = 1
-    speech = 1
-    SPEECH = 1
-
-    music = 2
-    MUSIC = 2
-
-    noise = 3
-    NOISE = 3
-
-    def count():
-        return 4
-
-    def color(self):
-        colors = ['black','light blue','yellow','red']
-        return colors[self.value]

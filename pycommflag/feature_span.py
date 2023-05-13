@@ -1,4 +1,4 @@
-from .extern.ina_foss import AudioSegmentLabel
+from enum import Enum
 
 class FeatureSpan:
     def __init__(self):
@@ -104,7 +104,7 @@ class AudioFeatureSpan(FeatureSpan):
                 b = self._spans[-1][0] # now spanning both entries
                 self._spans.pop() # drop old
                 self._values.pop() # drop old
-                if t == self._values[-1]:
+                if self._values and t == self._values[-1]:
                     # not a change, just expand the entry
                     self._spans[-1] = (min(b,self._spans[-1][0]), max(e, self._spans[-1][1]))
                     continue
@@ -114,13 +114,14 @@ class AudioFeatureSpan(FeatureSpan):
         
         p = self._spans[0][0]
         for (t,(b,e)) in zip(self._values, self._spans):
-            assert(b == p)
+            if b != p:
+                print(f"*** NOT CONTIGUOUS! {b-p} gap at {p}-{b}!")
+                assert(b == p)
             p = e
     
     def to_json(self):
         return super().to_json(converter=lambda x:x.value)
 
-from enum import Enum
 class SceneType(Enum):
     UNKNOWN = 0
     SHOW = 0
@@ -133,6 +134,16 @@ class SceneType(Enum):
     def count():
         return SceneType.DO_NOT_USE.value
 
+    def color_map():
+        return {
+            SceneType.SHOW : 'green',
+            SceneType.INTRO : 'yellow',
+            SceneType.TRANSITION : 'blue',
+            SceneType.COMMERCIAL : 'red',
+            SceneType.CREDITS : 'yellow',
+            SceneType.DO_NOT_USE : 'gray',
+        }
+
     def color(self):
         colors = ['green','yellow','blue','red','yellow','gray']
         return colors[self.value]
@@ -144,3 +155,34 @@ class SceneType(Enum):
     def new_color(self):
         colors = ['dark green','dark orange','dark blue','deep pink','dark orange','gray']
         return colors[self.value]
+
+from enum import Enum
+class AudioSegmentLabel(Enum):
+    noEnergy = 0
+    silence = 0
+    SILENCE = 0
+
+    energy = 1
+    speech = 1
+    SPEECH = 1
+
+    music = 2
+    MUSIC = 2
+
+    noise = 3
+    NOISE = 3
+
+    def count():
+        return 4
+
+    def color(self):
+        colors = ['black','light blue','yellow','red']
+        return colors[self.value]
+
+    def color_map():
+        return {
+            AudioSegmentLabel.SILENCE : 'dark grey',
+            AudioSegmentLabel.SPEECH : 'light blue',
+            AudioSegmentLabel.MUSIC : 'dark blue',
+            AudioSegmentLabel.NOISE : 'pink',
+        }

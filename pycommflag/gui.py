@@ -6,22 +6,36 @@ from PIL import ImageTk, Image
 from .player import Player
 from . import logo_finder
 from . import processor
-from .extern.ina_foss import AudioSegmentLabel
+from .feature_span import *
 
 class Window(tk.Tk):
-    def __init__(self, video, scenes:list=[], logo:tuple=None, audio:list[tuple]=None):
+    def __init__(self, video, spans:dict={}, logo:tuple=None, tags:FeatureSpan=None):
         tk.Tk.__init__(self)
         self.title("pycommflag editor")
         self.player = Player(video, no_deinterlace=True)
 
         self.result = None
-        self.scenes = scenes
-        self.audio = audio
+        self.spans = spans
         self.position = 0
         self.prev_frame_time = 0
         self.next_frame_time = 1/self.player.frame_rate
         self.settype = None
         self.setpos = 0
+        
+        p = 0
+        self.tags = []
+        if type(tags) is FeatureSpan:
+            tags = tags.to_list()
+        if tags and len(tags[-1][1]) < 2:
+            tags[-1] = (tags[-1][0], (tags[-1][1][0], self.player.duration))
+        for (t,(b,e)) in tags:
+            if b > p:
+                self.tags.append((SceneType.SHOW,(p,b)))
+            self.tags.append((t,(b,e)))
+            p = e
+        tags = None
+        if p < self.player.duration:
+            self.tags.append((SceneType.SHOW,(p,self.player.duration)))
 
         self.misc = []
         self.video_labels = []
@@ -41,7 +55,7 @@ class Window(tk.Tk):
         a = tk.Label(self, text="-1f")
         a.grid(row=3, column=1, sticky="nswe")
         self.misc.append(a)
-            
+        
         self.pos_label = tk.Label(self, text="00:00.000")
         self.pos_label.grid(row=2, column=2, sticky="nswe")
 
@@ -93,35 +107,35 @@ class Window(tk.Tk):
         skips.grid(row=5, column=0, columnspan=5)
         self.misc.append(skips)
         
-        b = tk.Button(skips, text="|< Break", command=lambda:self.prev(cbreak=True))
+        b = tk.Button(skips, text="|< Break", command=lambda:self.prev('break'))
         b.grid(row=0, column=0, padx=5)
         self.misc.append(b)
 
-        b = tk.Button(skips, text="|< Blank", command=lambda:self.prev(blank=True))
+        b = tk.Button(skips, text="|< Blank", command=lambda:self.prev('blank'))
         b.grid(row=0, column=1, padx=5)
         self.misc.append(b)
 
-        b = tk.Button(skips, text="|< Silence", command=lambda:self.prev(silence=True))
+        b = tk.Button(skips, text="|< Silence", command=lambda:self.prev('audio'))
         b.grid(row=0, column=2, padx=5)
         self.misc.append(b)
 
-        b = tk.Button(skips, text="|< Scene", command=lambda:self.prev(scene=True))
+        b = tk.Button(skips, text="|< Diff", command=lambda:self.prev('diff'))
         b.grid(row=0, column=3, padx=(5,10))
         self.misc.append(b)
 
-        b = tk.Button(skips, text="Scene >|", command=lambda:self.next(scene=True))
+        b = tk.Button(skips, text="Diff >|", command=lambda:self.next('diff'))
         b.grid(row=0, column=5, padx=(10,5))
         self.misc.append(b)
 
-        b = tk.Button(skips, text="Silence >|", command=lambda:self.next(silence=True))
+        b = tk.Button(skips, text="Audio >|", command=lambda:self.next('audio'))
         b.grid(row=0, column=6, padx=5)
         self.misc.append(b)
         
-        b = tk.Button(skips, text="Blank >|", command=lambda:self.next(blank=True))
+        b = tk.Button(skips, text="Blank >|", command=lambda:self.next('blank'))
         b.grid(row=0, column=7, padx=5)
         self.misc.append(b)
         
-        b = tk.Button(skips, text="Break >|", command=lambda:self.next(cbreak=True))
+        b = tk.Button(skips, text="Break >|", command=lambda:self.next('break'))
         b.grid(row=0, column=8, padx=5)
         self.misc.append(b)
         
@@ -160,13 +174,9 @@ class Window(tk.Tk):
         self.misc.append(save)
         c += 1
         
-        self.vidMap = tk.Canvas(self, width=1280, height=25)
-        self.vidMap.grid(row=7, column=0, columnspan=5)
-        self.vidMap.bind("<Button-1>", lambda e:self.move(abs=float(e.x)/1280.0*self.player.duration))
-        
-        self.audMap = tk.Canvas(self, width=1280, height=25)
-        self.audMap.grid(row=8, column=0, columnspan=5)
-        self.audMap.bind("<Button-1>", lambda e:self.move(abs=float(e.x)/1280.0*self.player.duration))
+        self.mapCanvas = tk.Canvas(self, width=1280, height=60)
+        self.mapCanvas.grid(row=7, column=0, columnspan=5)
+        self.mapCanvas.bind("<Button-1>", lambda e:self.move(abs=float(e.x)/1280.0*self.player.duration))
         
         self.scale_pos = tk.DoubleVar()
         self.scroller = tk.Scale(self, 
@@ -203,66 +213,30 @@ class Window(tk.Tk):
 
         self.move(abs=0)
     
-    def prev(self,scene=False,silence=False,blank=False,cbreak=False):
-        if cbreak:
-            want = True
-            first = True
-            for s in reversed(self.scenes):
-                if first and s.start_time <= self.position:
-                    first = False
-                    want = not s.is_break
-                if (s.stop_time - self.position) < -3/self.player.frame_rate and s.is_break == want:
-                    self.move(abs=s.stop_time-1/self.player.frame_rate)
-                    return
-        
-        if silence:
-            for (lab,start_time,stop_time) in reversed(self.audio):
-                if type(lab) is int:
-                    lab = AudioSegmentLabel(lab)
-                if lab != AudioSegmentLabel.SILENCE:
-                    continue
-                abs = start_time + (stop_time - start_time)/2
-                if (abs - self.position) < -3/self.player.frame_rate:
-                    self.move(abs=abs)
-                    return
-                
-        for s in reversed(self.scenes):
-            if blank and not s.is_blank:
-                continue
-            abs = s.middle_time if blank and s.is_blank else s.start_time
-            if (abs - self.position) < -3/self.player.frame_rate:
-                self.move(abs=abs)
+    def prev(self,key='diff'):
+        span = []
+        if key == 'diff':
+            span = self.tags
+        else:
+            span = self.spans.get(key)
+            
+        for (t,(b,e)) in reversed(span):
+            p = b+(e-b)/2 if key == 'blank' else b
+            if (p - self.position) < -3/self.player.frame_rate:
+                self.move(abs=p)
                 return
 
-    def next(self,scene=False,silence=False,blank=False,cbreak=False):
-        if cbreak:
-            want = True
-            first = True
-            for s in self.scenes:
-                if first and s.start_time >= self.position:
-                    first = False
-                    want = not s.is_break
-                if (s.start_time - self.position) > 3/self.player.frame_rate and s.is_break == want:
-                    self.move(abs=s.start_time)
-                    return
-        
-        if silence:
-            for (lab,start_time,stop_time) in self.audio:
-                if type(lab) is int:
-                    lab = AudioSegmentLabel(lab)
-                if lab != AudioSegmentLabel.SILENCE:
-                    continue
-                abs = start_time + (stop_time - start_time)/2
-                if (abs - self.position) > 3/self.player.frame_rate:
-                    self.move(abs=abs)
-                    return
-
-        for s in self.scenes:
-            if blank and not s.is_blank:
-                continue
-            abs = s.middle_time if blank and s.is_blank else s.start_time
-            if (abs - self.position) > 3/self.player.frame_rate:
-                self.move(abs=abs)
+    def next(self,key='diff'):
+        span = []
+        if key == 'diff':
+            span = self.tags
+        else:
+            span = self.spans.get(key)
+            
+        for (t,(b,e)) in span:
+            p = b+(e-b)/2 if key == 'blank' else b
+            if (p - self.position) > 3/self.player.frame_rate:
+                self.move(abs=p)
                 return
 
     def move_prev_frame(self):
@@ -340,8 +314,7 @@ class Window(tk.Tk):
         
         self.scale_pos.set(self.position/60) #self.scroller.set(self.position/60)
         x = math.ceil(self.position / (self.player.duration / 1280))
-        self.vidMap.coords(self.vMapPos, x, 0, x, 25)
-        self.audMap.coords(self.aMapPos, x, 0, x, 25)
+        self.mapCanvas.coords(self.vMapPos, x, 0, x, 60)
         
         if self.vMaybe is not None:
             startx = math.floor(self.setpos / (self.player.duration / 1280))
@@ -350,65 +323,44 @@ class Window(tk.Tk):
                 (startx, stopx) = (stopx, startx)
             elif startx == stopx:
                 stopx += 1
-            self.vidMap.coords(self.vMaybe, startx, 0, stopx, 25)
+            self.mapCanvas.coords(self.vMaybe, startx, 0, stopx, 60)
             #print(self.settype, self.vMaybe, self.setpos, self.position, startx, stopx)
 
-    def drawMap(self):
-        map_height = 25
+    def drawSpan(self, span, colorMap, top, bottom, force_width=None):
         sec_per_pix = self.player.duration / 1280
-
-        for x in self.vidMap.find_all():
-            self.vidMap.delete(x)
+        for (t,(b,e)) in span:
+            startx = math.floor(b / sec_per_pix)
+            if force_width is not None:
+                stopx = startx + force_width
+            else:
+                stopx = math.ceil(e / sec_per_pix)
+            color = colorMap.get(t, None)
+            print(t,startx,stopx,color)
+            if color is None:
+                continue
+            self.mapCanvas.create_rectangle(startx, top, stopx, bottom, width=0, fill=color)
+    
+    def drawMap(self):
+        map_height = 60
+        for x in self.mapCanvas.find_all():
+            self.mapCanvas.delete(x)
         self.vMaybe = None
 
-        for s in self.scenes:
-            startx = math.floor(s.start_time / sec_per_pix)
-            stopx = math.ceil(s.stop_time / sec_per_pix)
-            fill = s.type.color()
-            if s.logo > .75: # indicate logo?
-                fill = s.type.logo_color()
-            elif hasattr(s, 'newtype'):
-                fill = s.newtype.color()
-            else:
-                fill = s.type.color()
-            
-            self.vidMap.create_rectangle(startx, 0, stopx, map_height, width=0, fill=fill)
-            #self.vidMap.create_rectangle(startx, int(map_height/2), stopx, map_height, width=0, fill=s.newtype.new_color())
-        
-        if self.settype is not None:
-            self.vMaybe = self.vidMap.create_rectangle(0,0,1,1, width=0, fill=self.settype.new_color(), stipple='gray50')
+        row=20
+        pos=0
+        self.drawSpan(self.tags, top=pos, bottom=pos+row, colorMap=SceneType.color_map())
+        pos += row
+        self.drawSpan(self.spans.get('logo',[]), top=pos, bottom=pos+row, colorMap={True:'cyan'})
+        pos += row
+        self.drawSpan(self.spans.get('diff',[]), top=pos, bottom=pos+row, colorMap={True:'yellow'}, force_width=1)
+        pos += row
+        self.drawSpan(self.spans.get('audio',[]), top=pos, bottom=pos+row, colorMap=AudioSegmentLabel.color_map())
+        pos += row
 
-        for s in self.scenes:
-            if s.is_blank:
-                startx = math.floor(s.start_time / sec_per_pix)
-                stopx = math.ceil(s.stop_time / sec_per_pix)
-                self.vidMap.create_rectangle(startx, int(map_height*.25), stopx, int(map_height*.75), width=0, fill='black')
+        self.drawSpan(self.spans.get('blanks',[]), top=int(row*.9), bottom=pos-int(row*.9), colorMap={True:'black'})
         
-        for x in self.audMap.find_all():
-            self.audMap.delete(x)
-        
-        y = 25
-        for (lab,start_time,stop_time) in self.audio:
-            if type(lab) is int:
-                lab = AudioSegmentLabel(lab)
-            if lab == AudioSegmentLabel.SILENCE:
-                continue
-            startx = math.floor(start_time / sec_per_pix)
-            stopx = math.ceil(stop_time / sec_per_pix)
-            self.audMap.create_rectangle(startx, 0, stopx, y, width=0, fill=lab.color())
-
-        for (lab,start_time,stop_time) in self.audio:
-            if type(lab) is int:
-                lab = AudioSegmentLabel(lab)
-            if lab != AudioSegmentLabel.SILENCE:
-                continue
-            startx = math.floor(start_time / sec_per_pix)
-            stopx = math.ceil(stop_time / sec_per_pix)
-            self.audMap.create_rectangle(startx, 0, stopx, y, width=0, fill=lab.color())
-
         # lastly, add the positional indicator
-        self.aMapPos = self.audMap.create_line(0,0,0,25,arrow=tk.BOTH,fill='orange')
-        self.vMapPos = self.vidMap.create_line(0,0,0,25,arrow=tk.BOTH,fill='orange')
+        self.vMapPos = self.mapCanvas.create_line(0,0,0,map_height,arrow=tk.BOTH,fill='orange')
         self.updatePosIndicators()
 
     def do_tag(self, btnIdx):
@@ -422,57 +374,94 @@ class Window(tk.Tk):
         b.configure(state='normal', text=f'Stop {label}', command=lambda x=btnIdx:self.end_tag(x))
         b.grid(row=0, column=1, padx=5)
 
-        self.setpos = 0
-        for s in self.scenes:
-            if s.stop_time > self.position:
-                self.setpos = s.start_time
-                break
+        self.setpos = self.position
         self.drawMap()
-        self.next(scene=True)
+        self.next(diff=True)
     
     def cancel_tag(self, btnIdx):
         self.settype = None
         self.end_tag(btnIdx)
 
     def end_tag(self, btnIdx):
-        if self.settype is not None:
+        if self.settype is not None and self.setpos != self.position:
             settype = self.settype
             startpos = self.setpos
-            endpos = startpos
-            for s in self.scenes:
-                if s.stop_time >= self.position:
-                    endpos = s.stop_time
-                    break
-            
+            endpos = self.position
+
             if endpos < startpos:
                 (endpos, startpos) = (startpos, endpos)
             
-            for s in self.scenes:
-                if s.stop_time >= startpos and s.start_time <= endpos:
-                    s.newtype = settype
-        
+            # seek to where a tag starts BEFORE us
+            b = 0
+            while b < len(self.tags) and self.tags[b][1][0] >= startpos:
+                b += 1
+            
+            if b < len(self.tags):
+                if self.tags[b][1][1] < startpos:
+                    # ends before we start, so its just squarely before us
+                    b += 1
+                elif self.tags[b][1][1] <= endpos: # ends before we end, so its overlapping to the left
+                    if self.tags[b][0] == settype:
+                        # same type, just consume it
+                        startpos = self.values[b][1][0]
+                        del self.tags[b]
+                    else:
+                        # truncate it to where we are starting
+                        self.tags[b] = (self.tags[b][0], (self.tags[b][1][0], startpos))
+                        b += 1
+                else:
+                    # starts before us and ends after us, we're entirely inside
+                    if self.tags[b][0] == settype:
+                        # we're inside something of the same type, so just do nothing
+                        settype = None
+                        return self.end_tag(btnIdx)
+                    else:
+                        # we have to split it
+                        self.tags[b] = [(self.tags[b][0], (self.tags[b][1][0], startpos)), (self.tags[b][0], (endpos, self.tags[b][1][1]))]
+                        b += 1
+            
+            # seek to one that ends after us
+            e = b
+            while e < len(self.tags) and self.tags[e][1][1] <= endpos:
+                e += 1
+            if e < len(self.tags) and self.tags[e][1][0] <= endpos:
+                # starts before we end, so its overlapping to the right
+                if self.tags[b][0] == settype or endpos == self.tags[e][1][1]:
+                    # same type, just consume it
+                    endpos = self.tags[e][1][1]
+                    del self.tags[e]
+                else:
+                    # truncate the left side of it
+                    self.tags[e] = (self.tags[e][0], (endpos, self.tags[e][1][1]))
+            
+            self.tags[b:e] = [(settype,(startpos,endpos))]
+            
         self.settype = None
         self.setpos = 0
         
-        self.tag_cancel.grid_forget() 
-        c = 0
-        for (b,t,l) in self.taggers:
-            b.configure(state='normal')
-            b.grid(row=0, column=c, padx=5)
-            c += 1
-        (b,t,label) = self.taggers[btnIdx]
-        b.configure(text=f'Flag {label}', command=lambda x=btnIdx:self.do_tag(x))
+        if self.btnIdx is not None:
+            self.tag_cancel.grid_forget() 
+            c = 0
+            for (b,t,l) in self.taggers:
+                b.configure(state='normal')
+                b.grid(row=0, column=c, padx=5)
+                c += 1
+            (b,t,label) = self.taggers[btnIdx]
+            b.configure(text=f'Flag {label}', command=lambda x=btnIdx:self.do_tag(x))
 
-        self.drawMap()
+            self.drawMap()
     
     def truncate_now(self):
-        for s in self.scenes:
-            if s.stop_time > self.position:
-                setattr(s, 'newtype', SceneType.DO_NOT_USE)
+        self.setpos = self.player.duration
+        self.settype = SceneType.DO_NOT_USE
+        self.end_tag(None)
         self.save_and_close()
     
     def save_and_close(self):
-        self.result = self.scenes
+        self.result = []
+        for (t,(b,e)) in self.tags:
+            if t != SceneType.SHOW:
+                self.result.append((t,(b,e)))
         self.destroy()
 
     def run(self):
