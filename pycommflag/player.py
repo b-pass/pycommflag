@@ -25,7 +25,7 @@ class Player:
         self.shape = (-1,-1)
         self.graph = None
         
-        self.frame_rate = round(self.container.streams.video[0].guessed_rate,4)
+        self.frame_rate = round(self.container.streams.video[0].guessed_rate,3)
         self.vt_start = self.container.streams.video[0].start_time * self.container.streams.video[0].time_base
         self.vt_pos = self.vt_start
 
@@ -35,17 +35,20 @@ class Player:
                 inter += 1
             else:
                 ninter += 1
-            if inter+ninter >= 360:
+            if inter+ninter >= 360 or no_deinterlace:
                 break
         
-        self.container.seek(self.container.streams.video[0].start_time, stream=self.container.streams.video[0])
+        self.seek(0)
         
-        if inter*10 > ninter and not no_deinterlace:
-            self.interlaced = True
-            log.debug(f"{inter} interlaced frames (and {ninter} not), means we will deinterlace.")
-            self._create_graph()
+        if not no_deinterlace:
+            if inter*10 > ninter:
+                self.interlaced = True
+                log.debug(f"{inter} interlaced frames (and {ninter} not), means we will deinterlace.")
+                self._create_graph()
+            else:
+                log.debug(f"We will NOT deinterlace (had {inter} interlaced frames and {ninter} non-interlaced frames)")
+                self.interlaced = False
         else:
-            log.debug(f"We will NOT deinterlace (had {inter} interlaced frames and {ninter} non-interlaced frames)")
             self.interlaced = False
         log.debug(f"Video {filename} is {self.shape} at {float(self.frame_rate)} fps")
     
@@ -100,7 +103,7 @@ class Player:
         self.streams['audio'] = stream
         self._flush()
         self.vt_start = self.container.streams.video[self.streams['video']].start_time * self.container.streams.video[self.streams['video']].time_base
-        self.at_start = self.container.streams.audio[self.streams['audio']].start_time * self.container.streams.video[self.streams['audio']].time_base
+        self.at_start = self.container.streams.audio[self.streams['audio']].start_time * self.container.streams.audio[self.streams['audio']].time_base
     
     def disable_audio(self):
         if 'audio' in self.streams:
@@ -109,7 +112,7 @@ class Player:
         self._audio_res = []
 
     def _queue_audio(self, af):
-        if self.aq is None:
+        if self.aq is None or af is None or af.time is None:
             return
         d = af.to_ndarray()
         # av.AudioResampler doesn't actually work, so we have to do it manually:
@@ -199,14 +202,14 @@ class Player:
                 if frame is None: continue
             except StopIteration:
                 break
-            except av.error.InvalidDataError as e:
+            except (av.error.InvalidDataError,av.error.UndefinedError) as e:
                 fail += 1
                 vs = self.container.streams.video[self.streams.get('video', 0)]
-                self.vt_pos = int(self.vt_pos + (1/self.frame_rate)/vs.time_base)
+                self.vt_pos = int(self.vt_pos + (1.5/self.frame_rate)/vs.time_base)
                 if fail%100 == 0:
                     if fail >= 10000:
                         log.critical(f"Repeated InvalidDataError, skipped {fail} frames but found nothing good")
-                        break
+                        raise
                     log.debug(f"InvalidDataError during decode -- seeking ahead #{fail}")
                     self._resync(self.vt_pos)
                 else:

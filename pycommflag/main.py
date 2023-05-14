@@ -1,7 +1,8 @@
-from typing import Any
 import os
+import re
 import sys
 import tempfile
+from typing import Any
 from . import gui
 from . import mythtv
 from . import neural
@@ -31,7 +32,6 @@ def run(opts:Any) -> None|int:
     
     if not opts.filename:
         if not opts.chanid and not opts.starttime:
-            import re
             if m:=re.match(r'(?:.*/)?cf_(\d{4,6})_(\d{12,})(?:\.[a-zA-Z0-9]{2,5}){1,4}', opts.feature_log):
                 opts.chanid = m[1]
                 opts.starttime = m[2]
@@ -41,7 +41,15 @@ def run(opts:Any) -> None|int:
     if not opts.filename:
         print('No video file to work on (need one of: -f, -r, --chanid, etc)')
         return 1
+    elif not os.path.exists(opts.filename) or os.path.isdir(opts.filename):
+        print(f'No such video file "{opts.filename}"')
+        return 1
     
+    if not opts.chanid and not opts.starttime:
+        if m:=re.match(r'(?:.*/)?(\d{4,6})_(\d{12,})(?:\.[a-zA-Z0-9]{2,5}){1,4}', os.path.realpath(opts.filename)):
+            opts.chanid = m[1]
+            opts.starttime = m[2]
+            
     if opts.gui:
         flog = processor.read_feature_log(opts.feature_log)
         logo = processor.read_logo(flog)
@@ -61,7 +69,7 @@ def run(opts:Any) -> None|int:
     if opts.no_feature_log:
         feature_log = tempfile.TemporaryFile('w+', prefix='cf_', suffix='.json')
     elif not opts.feature_log:
-        feature_log = tempfile.gettempdir() + os.path.sep + 'cf_'+os.path.basename(opts.filename)+'.json'
+        feature_log = tempfile.gettempdir() + os.path.sep + 'cf_'+os.path.basename(os.path.realpath(opts.filename))+'.json'
     else:
         feature_log = opts.feature_log
     

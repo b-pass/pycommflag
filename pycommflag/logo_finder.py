@@ -169,6 +169,9 @@ def from_json(js:list|str)->tuple|None:
     )
 
 def to_json(logo:tuple)->str:
+    if logo is None:
+        return json.dumps(None)
+    
     # ((top,left), (bottom,right), logo_mask, thresh)
     return json.dumps([
         [logo[0][0], logo[0][1]],

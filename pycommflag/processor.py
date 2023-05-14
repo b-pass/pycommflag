@@ -7,15 +7,12 @@ from queue import Queue
 import re
 from threading import Thread
 import time
-
 from typing import Any,TextIO, TextIO
 
 from . import logo_finder, mythtv
 from .player import Player
 from .extern import ina_foss
 from .feature_span import *
-
-FLOG_VERSION = 3
 
 def read_feature_log(feature_log_file:str|TextIO|dict) -> dict:
     if type(feature_log_file) is dict:
@@ -59,10 +56,17 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
     else:
         feature_log.seek(0)
         feature_log.truncate()
-    
-    player = Player(video_filename, no_deinterlace=opts.no_deinterlace)
 
-    feature_log.write('{ "file_version":10\n')
+    feature_log.write('{ "file_version":10')
+
+    if opts.chanid: feature_log.write(f',\n"chanid":"{opts.chanid}"')
+    if opts.starttime: feature_log.write(f',\n"starttime":"{opts.starttime}"')
+    try:
+        feature_log.write(f',\n"filename":"{os.path.realpath(opts.filename)}"')
+    except:
+        pass
+
+    player = Player(video_filename, no_deinterlace=opts.no_deinterlace)
 
     if opts.no_logo:
         logo = None
@@ -72,14 +76,13 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
         logo = logo_finder.search(player, opts=opts)
         player.seek(0)
     
+    player.enable_audio()
+
+    feature_log.write(f',\n"duration":{float(player.duration)}')
+    feature_log.write(f',\n"frame_rate":{round(float(player.frame_rate),4)}')
+
     feature_log.write(',\n"logo":')
     feature_log.write(logo_finder.to_json(logo))
-    
-    player.enable_audio()
-    player.seek(0)
-
-    # not doing format/aspect because everything is widescreen all the time now (that was very early '00s)
-    # except ultra wide screen movies, and sometimes ultra-wide commercials?
 
     fcount = 0
     ftotal = int(player.duration * player.frame_rate)
@@ -88,9 +91,6 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
     report = math.ceil(ftotal/1000) if not opts.quiet else ftotal*10
     rt = time.perf_counter()
     p = 0
-
-    fcolor = None
-    feature_log.write(f',\n"duration":{float(player.duration)},\n"frame_rate":{round(float(player.frame_rate),3)}')
     
     audio_interval = int(player.frame_rate * 60)
 
@@ -105,7 +105,9 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
     
     if not opts.quiet: print('\nExtracting features...', end='\r') 
 
-    endtime = 0
+    # not doing format/aspect because everything is widescreen all the time now (that was very early '00s)
+    # except ultra wide screen movies, and sometimes ultra-wide commercials?
+
     try:
       for frame in player.frames():
         p += 1
@@ -122,7 +124,10 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
     except KeyboardInterrupt:    
         videoProc.stop()
         audioProc.stop()
-        #raise
+        videoProc.join()
+        audioProc.join()
+        feature_log.write("\n]}")
+        raise
 
     videoProc.stop()
 
@@ -174,19 +179,17 @@ class VideoProc(Thread):
         self.difff = SeparatorFeatureSpan()
         self.difff.start(0,True)
 
-    def add_frame(self,frame):
-        self.queue.put(frame)
-    
     def stop(self):
         self.go = False
         self.queue.put(None)
         self.go = False
     
     def run(self):
+        self.name = 'videoProc'
         while True:
-            frame = self.queue.get()
-            if frame is not None:
-                self._proc(frame)
+            x = self.queue.get()
+            if x is not None:
+                self._proc(*x)
             else:
                 if self.queue.empty():
                     if not self.go:
@@ -196,13 +199,15 @@ class VideoProc(Thread):
         self.blankf.end(self.lasttime)
         self.difff.end(self.lasttime)
 
-    def _proc(self, frame):
+    def add_frame(self, frame):
+        fcolor = frame.to_ndarray(format="rgb24", height=720, width=frame.width*(720/frame.height))
+        self.queue.put((frame,fcolor))
+    
+    def _proc(self, frame, fcolor):
         self.fcount += 1
         
         logo_present = logo_finder.check_frame(frame, self.logo)
 
-        fcolor = frame.to_ndarray(format="rgb24", height=720, width=frame.width*(720/frame.height))
-        
         # trying to be fast, just look at the middle 1/4 for blank-ish-ness and then verify with the full frame
         x = np.max(fcolor[int(fcolor.shape[0]*3/8):int(fcolor.shape[0]*5/8)])
         if x < 64:
@@ -270,6 +275,7 @@ class AudioProc(Thread):
         self.go = False
     
     def run(self):
+        self.name = 'audioProc'
         while True:
             segments = self.queue.get()
             if not segments:

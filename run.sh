@@ -1,3 +1,3 @@
 #!/bin/sh
-python3 -m pycommflag $@
+python3 -m pycommflag "$@"
 

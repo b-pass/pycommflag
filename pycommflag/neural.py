@@ -1,16 +1,15 @@
 import logging as log
-import struct
-import sys
 import os
-import re
 import numpy as np
-import math
+import re
 import time
-
+import sys
 from typing import Any,TextIO,BinaryIO
 
-def scenes_to_vecs(scenes:list)->tuple[list[list[float]], list[list[float]]]:
-    MAX_SCENE_LEN = 300.0 # seconds
+from .feature_span import *
+
+def flog_to_vecs(flog:dict)->tuple[list[list[float]], list[list[float]]]:
+    MAX_BLOCK_LEN = 600.0 # seconds
     x = []
     y = []
 
@@ -18,44 +17,90 @@ def scenes_to_vecs(scenes:list)->tuple[list[list[float]], list[list[float]]]:
     # the reason would be because of inconsistent training data (sometimes the blank is part of the commercial, sometimes the show)
     # but there are blanks in the middle of both also so maybe that doesnt matter....?
 
-    block_len = 0.0
-    prev = SceneType.COMMERCIAL
-    first = True
-    for s in scenes:
-        if first:
-            # don't use short scenes right at the beginning for training
-            first = False
-            if s.duration < 5:
+    # ok so how this is supposed to work:
+    # each feature has 2 things
+    # time since last change
+    # time to next change, when active/true this will be zero
+
+    frame_rate = flog['frame_rate']
+    equal = lambda a,b, n=1.0: abs(a - b) < (n/frame_rate)
+    less_equal = lambda a,b: a - b < 1.0/frame_rate
+
+    tags = flog.get('tags', [])
+    endtime = flog['duration']
+
+    feat = [ 
+        flog.get('audio', []),
+        flog.get('logo_span', []),
+        flog.get('diff_span', []),
+        flog.get('blank_span', [])
+        ]
+    fidx = [0]*len(feat)
+    aidx = 0
+
+    data = []
+    answers = []
+    while True:
+        now = None
+        for (i,f) in zip(fidx,feat):
+            if i < len(f):
+                if now is None or abs(f[i][1][1] - now) < (2.0/frame_rate):
+                    now = f[i][1][1]
+        if now is None or now >= endtime:
+            break
+
+        a = SceneType.SHOW.value
+        while aidx < len(tags):
+            (t,(b,e)) = tags[aidx]
+            if e < now:
+                aidx += 1
                 continue
-        st = getattr(s, 'newtype', s.type)
-        if st == SceneType.DO_NOT_USE:
-            continue
+            if b <= now:
+                a = t
+            break
+
+        entry = []
+        entry.append((now%1800) / 1800.0)
+
+        for mi in range(len(fidx)):
+            i = fidx[mi]
+            f = feat[mi]
+            if i < len(f):
+                if mi == 0:
+                    # audio is a one-hot
+                    oh = [0.0] * AudioSegmentLabel.count()
+                    oh[f[i][0]] = 1.0
+                    entry += oh
+                else:
+                    # everything else is a integerized-boolean
+                    entry.append(f[i][0])
+                elapsed = now - f[i][1][0]
+                entry.append(min(max(0,elapsed),MAX_BLOCK_LEN)/MAX_BLOCK_LEN)
+                timeleft = f[i][1][1] - now
+                if abs(timeleft) < 2.0/frame_rate:
+                    timeleft = 0.0
+                    fidx[mi] += 1
+                entry.append(min(max(0,timeleft),MAX_BLOCK_LEN)/MAX_BLOCK_LEN)
+            else:
+                if mi == 0:
+                    # audio is a one-hot
+                    oh = [0.0] * AudioSegmentLabel.count()
+                    entry += oh
+                else:
+                    # everything else is a integerized-boolean
+                    entry.append(0.0)
+                entry += [0.4, 0.6] # not really half way, not at the beginning or the end, just somewhere.
         
-        a = [0.0] * SceneType.count()
-        a[st.value] = 1.0
+        if a == SceneType.DO_NOT_USE.value:
+            continue
 
-        v = []
-        v.append((s.start_time % 1800) / 1800.0)
-        v.append(min(s.duration,MAX_SCENE_LEN)/MAX_SCENE_LEN)
-        v.append(block_len/600.0)
-        for ax in s.audio:
-            v.append(ax)
-        v.append(s.logo)
-        v.append(s.blank)
-        v.append(s.diff)
-        # v += s.barcode.tolist()
-        v += x[-1][0:len(v)] if x else [0.0]*(len(v)-1)+[1.0]
-        #v += y[-1] if y else a
+        data.append(entry)
 
-        x.append(v)
-        y.append(a)
-        if st != prev:
-            block_len = 0.0
-            prev = st
-        else:
-            block_len = min(block_len+s.duration, 600.0)
-    
-    return (x,y)
+        aoh = [0.0] * SceneType.count()
+        aoh[a] = 1.0
+        answers.append(aoh)
+
+    return (data,answers)
 
 def load_data(opts)->tuple[list,list,list,list,list,list]:
     from . import processor
@@ -86,9 +131,9 @@ def load_data(opts)->tuple[list,list,list,list,list,list]:
     
     for f in data:
         print(f)
-        s = processor.read_scenes(f)
-        if s:
-            (a,b) = scenes_to_vecs(s)
+        flog = processor.read_feature_log(f)
+        if flog:
+            (a,b) = flog_to_vecs(flog)
             n += [os.path.basename(f)] * len(a)
             x += a
             y += b
@@ -97,9 +142,10 @@ def load_data(opts)->tuple[list,list,list,list,list,list]:
     xt = []
     yt = []
     for f in test:
-        s = processor.read_scenes(f)
-        if s:
-            (a,b) = scenes_to_vecs(s)
+        print(f)
+        flog = processor.read_feature_log(f)
+        if flog:
+            (a,b) = flog_to_vecs(flog)
             nt += [os.path.basename(f)] * len(a)
             xt += a
             yt += b
@@ -107,7 +153,7 @@ def load_data(opts)->tuple[list,list,list,list,list,list]:
     return (n,x,y,nt,xt,yt)
 
 def train(training:tuple, test_answers:list=None, opts:Any=None):
-    import numpy as np
+    # imort these here because their imports are slow 
     import tensorflow as tf
     import keras
     from keras import layers
@@ -133,9 +179,10 @@ def train(training:tuple, test_answers:list=None, opts:Any=None):
 
     inputs = keras.Input(shape=(len(data[0]),))
     n = inputs
-    if DROPOUT > 0:
-        n = layers.Dropout(DROPOUT)(n)
-    n = layers.Dense(len(data[0]))(n)
+    #if DROPOUT > 0:
+    #    n = layers.Dropout(DROPOUT)(n)
+    for i in range(10):
+        n = layers.Dense(len(data[0]))(n)
     n = layers.Dense(len(data[0]))(n)
     outputs = layers.Dense(SceneType.count(), activation='softmax')(n)
     model = keras.Model(inputs, outputs)
