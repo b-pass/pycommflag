@@ -17,7 +17,8 @@ def run(opts:Any) -> None|int:
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' # shut up, tf
 
     if opts.reprocess:
-        spans = processor.reprocess(opts.reprocess, opts=opts)
+        processor.reprocess(opts.reprocess, opts=opts)
+        result = neural.predict(opts.reprocess, opts=opts)
         # and run NN
         # and save tags
         # and write tags to DB
@@ -74,9 +75,7 @@ def run(opts:Any) -> None|int:
         feature_log = opts.feature_log
     
     processor.process_video(opts.filename, feature_log, opts)
-    flog = processor.read_feature_log(feature_log)
-    spans = processor.read_feature_spans(flog)
-    # and then run NN...
-    # then, processor.write_tags_into(res, log_f=opts.feature_log)
+    result = neural.predict(feature_log, opts=opts)
+    # then, processor.write_tags_into(result, log_f=feature_log)
     # and then save in DB or text or whatever
     return 0
