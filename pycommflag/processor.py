@@ -365,6 +365,9 @@ def read_tags(log_f:str|TextIO|dict):
 def read_feature_spans(log:str|TextIO|dict) -> dict[str, FeatureSpan]:
     log = read_feature_log(log)
 
+    if 'audio' not in log:
+        return {}
+
     audiof = AudioFeatureSpan()
     audiof.from_json(log['audio'], AudioSegmentLabel)
 

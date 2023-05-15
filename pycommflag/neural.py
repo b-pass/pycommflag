@@ -268,6 +268,8 @@ def predict(feature_log:str|TextIO|dict, opts:Any=None)->list:
         results.append(result)
         prev = result
     
+    correct = 0
+    incorrect = 0
     for i in range(len(results)):
         actual = 0
         expected = 0
@@ -278,8 +280,11 @@ def predict(feature_log:str|TextIO|dict, opts:Any=None)->list:
                 expected = j
         
         if actual != expected:
-            #print(f"{times[i]} matched result type {actual} at strength {results[i][actual]}")
             print(f"{times[i]} MISMATCHED result type {actual} was not {expected} at strength {results[i][actual]} vs {results[i][expected]}")
             print(results[i])
-    
+            incorrect += 1
+        else:
+            #print(f"{times[i]} matched result type {actual} at strength {results[i][actual]}")
+            correct += 1
+    print(f"{round(correct*100/(correct+incorrect),2)}% accurate")
     sys.exit(1)

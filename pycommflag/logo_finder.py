@@ -8,19 +8,18 @@ from av.video import VideoFrame
 from .player import Player
 _LOGO_EDGE_THRESHOLD = 85 # how strong an edge is strong enough?
 
-def search(player : Player, search_beginning :bool =False, opts:Any=None) -> tuple|None:
+def search(player:Player, search_beginning:bool=False, opts:Any=None) -> tuple|None:
     global _LOGO_EDGE_THRESHOLD
 
     skip = opts.logo_skip
     
-    # search around 1/3 of the way through the show, there should be a lot of show there
     if opts.logo_search_all:
         search_seconds = player.duration
         player.seek(0)
     else:
         search_seconds = 600 if player.duration <= 3700 else 900
         if not search_beginning and player.duration >= search_seconds*2:
-            player.seek(player.duration/3 - search_seconds/2)
+            player.seek(player.duration/2-search_seconds/2)
         else:
             player.seek(0)
     
@@ -63,12 +62,13 @@ def search(player : Player, search_beginning :bool =False, opts:Any=None) -> tup
 
     # in case we found something stuck on the screen, try to look beyond that
     best = np.max(logo_sum)
+    #print(f"(best={best}, fcount={fcount}, %={best*100/fcount})")
     if best > fcount*.95:
         logo_sum = np.where(logo_sum <= fcount*.85, logo_sum, 0)
         best = np.max(logo_sum)
 
     if best <= fcount / 3:
-        log.info("No logo found (insufficient edge strength)")
+        log.info(f"No logo found (insufficient edge strength, best={best*100/fcount})")
         return None
     
     logo_mask = logo_sum >= (best - fcount*.15)
