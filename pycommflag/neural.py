@@ -19,9 +19,27 @@ def flog_to_vecs(flog:dict)->tuple[list[list[float]], list[list[float]]]:
     # but there are blanks in the middle of both also so maybe that doesnt matter....?
 
     frame_rate = flog['frame_rate']
-
-    tags = flog.get('tags', [])
     endtime = flog['duration']
+
+    # clean up tags so they start/end exactly in the middle of the blank block
+    tags = flog.get('tags', [])
+    if tags and 'blank_span' in flog:
+        blanks = flog.get('blank_span', [])
+        for (bv,(bs,be)) in blanks:
+            if not bv or bs == 0.0 or be >= endtime:
+                continue
+            half = bs + (be - bs)
+            for ti in range(len(tags)):
+                (tt, (tb, te)) = tags[ti]
+                fixb = bs <= tb and tb < be and abs(tb-half) >= 1.5/frame_rate
+                fixe = bs <= te and te < be and abs(te-half) >= 1.5/frame_rate
+                if fixe and fixb:
+                    pass
+                elif fixb and not fixe:
+                    tags[ti] = (tt, (half, te))
+                elif fixe and not fixb:
+                    tags[ti] = (tt, (tags[ti][1][0], half))
+
 
     feat = [ 
         flog.get('audio', []),
