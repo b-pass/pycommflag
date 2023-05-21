@@ -25,11 +25,7 @@ def search(player:Player, search_beginning:bool=False, opts:Any=None) -> tuple|N
     
     fcount = 0
     ftotal = int(search_seconds * player.frame_rate)
-    if ftotal <= 65000:
-        logo_sum = np.ndarray(player.shape, np.uint16)
-    else:
-        logo_sum = np.ndarray(player.shape, np.uint32)
-
+    logo_sum = np.zeros(player.shape, np.uint32)
     percent = ftotal/skip/100.0
     report = math.ceil(ftotal/250) if not opts.quiet else ftotal * 10
     p = 0
@@ -62,9 +58,8 @@ def search(player:Player, search_beginning:bool=False, opts:Any=None) -> tuple|N
 
     # in case we found something stuck on the screen, try to look beyond that
     best = np.max(logo_sum)
-    #print(f"(best={best}, fcount={fcount}, %={best*100/fcount})")
     if best > fcount*.95:
-        logo_sum = np.where(logo_sum <= fcount*.85, logo_sum, 0)
+        logo_sum = np.where(logo_sum <= fcount*.9, logo_sum, 0)
         best = np.max(logo_sum)
 
     if best <= fcount / 3:

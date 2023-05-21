@@ -71,31 +71,53 @@ class Player:
         orig_ask = seconds
         vs = self.container.streams.video[self.streams.get('video', 0)]
         self._flush()
+        reseek = 0.5
         while True:
             if seconds <= 0.1:
                 self.vt_pos = vs.start_time
-                self.container.seek(vs.start_time, stream=vs, any_frame=True, backward=True)
+                self.container.seek(vs.start_time, stream=vs)
                 break
             else:
                 time = int(seconds / vs.time_base) + vs.start_time
                 self.vt_pos = time
-                self.container.seek(time, stream=vs, backward=True)
-                try:
-                    vf = next(self.container.decode(video=0))
-                except StopIteration:
-                    seconds -= 1
-                    continue
-                if vf.time + 2/self.frame_rate - self.vt_start < orig_ask:
+                self.container.seek(time, stream=vs, any_frame=True)
+                vf = next(self.frames())
+                if vf and ((vf.time + 1/self.frame_rate) - self.vt_start) <= orig_ask:
                     break
-                seconds -= 0.5
+                print(f"trying to get to {orig_ask} at {seconds} got {vf.time-self.vt_start}")
+                seconds -= reseek
+                reseek += 0.5
         
-        if self.graph:
-            for vf in self.container.decode(video=0):
-                if vf.time + 2/self.frame_rate - self.vt_start >= orig_ask:
-                    self.graph.push(vf)
-                    break
         for f in self.frames():
             if (f.time - self.vt_start) >= orig_ask:
+                return f
+        return None
+    
+    def ______maybe_new_seek_exact(self, seconds:float)->av.VideoFrame:
+        old_pos = self.vt_pos
+        if seconds > self.duration:
+            seconds = self.duration
+        orig_ask = seconds
+        vs = self.container.streams.video[self.streams.get('video', 0)]
+        while True:
+            time = int(seconds / vs.time_base) + vs.start_time
+            self.vt_pos = time
+            self.container.seek(time, stream=vs, any_frame=True)
+            self._flush()
+            f = next(self.frames())
+            print(f"trying to get to {seconds} got {f.time-self.vt_start}")
+            if (f.time-self.vt_start) > orig_ask and seconds > 1:
+                seconds -= 0.5
+            elif (f.time-self.vt_start) == orig_ask:
+                return f
+            else:
+                break
+        
+        for f in self.frames():
+            print(f"Check seek to {seconds}, got {f.time - self.vt_start} (old pos {old_pos - self.vt_start})")
+            if f.time == old_pos and (old_pos - self.vt_start) != seconds:
+                continue
+            if (f.time - self.vt_start) >= seconds:
                 return f
         return None
     
