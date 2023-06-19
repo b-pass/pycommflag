@@ -1,5 +1,4 @@
 import logging as log
-from math import ceil, floor
 import os
 import numpy as np
 import re
@@ -41,45 +40,101 @@ def flog_to_vecs(flog:dict)->tuple[list[list[float]], list[list[float]]]:
                 elif fixe and not fixb:
                     tags[ti] = (tt, (tags[ti][1][0], half))
 
-    audios = flog.get('audio', [])
-    ai = 0
-    ti = 0
 
-    frames = []
-    ftags = []
-    ftimes = []
-    for f in flog['frames']:
-        if f is None or not f:
-            continue
-        ftime = f[0]
-        
-        while ai < len(audios) and ftime < audios[ai][1][0]:
-            ai += 1
-        av = [0] * AudioSegmentLabel.count() 
-        if ai < len(audios) and ftime < audios[ai][1][1]:
-            av[audios[ai][0]] = 1.0
-        else:
-            av[AudioSegmentLabel.SILENCE.value] = 1.0
-        
-        while ti < len(tags) and ftime < tags[ti][1][0]:
-            ti += 1
-        ftags.append(tags[ti][0] if ti < len(tags) and ftime < tags[ti][1][1] else SceneType.UNKNOWN.value)
-        if ftags[-1] == SceneType.DO_NOT_USE:
-            ftags.pop()
-            continue
-        
-        f[0] = (f[0] % 1800) / 1800.0
-        frames.append(f + av)
-        ftimes.append(ftime)
+    feat = [ 
+        flog.get('audio', []),
+        flog.get('logo_span', []),
+        flog.get('diff_span', []),
+        flog.get('blank_span', [])
+        ]
+    fidx = [0]*len(feat)
+    aidx = 0
 
     timestamps = []
     data = []
     answers = []
-    for middle in range(len(frames)):
-        timestamps.append(ftimes[middle])
-        data.append(frames[max(0,middle - floor(30*frame_rate)) : min(middle + ceil(30*frame_rate), len(frames))])
-        answers.append(ftags[middle])
-    
+    aprev = [0] * SceneType.count()
+    aprev[SceneType.SHOW.value] = 1.0
+    alast_end = 0
+    alast_val = SceneType.SHOW.value
+    while True:
+        now = None
+        for (i,f) in zip(fidx,feat):
+            if i < len(f):
+                if now is None or abs(f[i][1][1] - now) < (2.0/frame_rate):
+                    now = f[i][1][1]
+        if now is None or now >= endtime:
+            break
+
+        entry = []
+        entry.append((now%1800) / 1800.0)
+        
+        for mi in range(len(fidx)):
+            i = fidx[mi]
+            f = feat[mi]
+            if i < len(f):
+                if mi == 0:
+                    # audio is a one-hot
+                    oh = [0.0] * AudioSegmentLabel.count()
+                    oh[f[i][0]] = 1.0
+                    entry += oh
+                else:
+                    # everything else is a integerized-boolean
+                    entry.append(int(f[i][0]))
+                elapsed = now - f[i][1][0]
+                entry.append(min(max(0,elapsed),MAX_BLOCK_LEN)/MAX_BLOCK_LEN)
+                timeleft = f[i][1][1] - now
+                if abs(timeleft) < 2.0/frame_rate:
+                    timeleft = 0.0
+                    fidx[mi] += 1
+                entry.append(min(max(0,timeleft),MAX_BLOCK_LEN)/MAX_BLOCK_LEN)
+            else:
+                if mi == 0:
+                    # audio is a one-hot
+                    oh = [0.0] * AudioSegmentLabel.count()
+                    entry += oh
+                else:
+                    # everything else is a integerized-boolean
+                    entry.append(0.0)
+                entry += [0.4, 0.6] # not really half way, not at the beginning or the end, just somewhere.
+        
+        entry.append(min(max(0,now - alast_end),MAX_BLOCK_LEN)/MAX_BLOCK_LEN)
+        entry.append(alast_val)
+
+        if aidx >= len(tags):
+            anewval = SceneType.SHOW.value
+            alast_val = anewval
+            alast_end = tags[aidx-1][1][1] if tags else 0
+        else:
+            while aidx < len(tags):
+                (t,(b,e)) = tags[aidx]
+                if e <= now:
+                    aidx += 1
+                    continue
+                if b <= now:
+                    anewval = t
+                    if anewval != alast_val:
+                        alast_val = anewval
+                        alast_end = b
+                else:
+                    anewval = SceneType.SHOW.value
+                    alast_val = anewval
+                    alast_end = tags[aidx-1][1][1]
+                break
+            
+        if anewval == SceneType.DO_NOT_USE.value:
+            continue
+        
+        timestamps.append(now)
+
+        data.append(entry + aprev)
+        #print(entry)
+        #print(aprev)
+
+        aprev = [0.0] * SceneType.count()
+        aprev[anewval] = 1.0
+        answers.append(aprev)
+
     return (timestamps,data,answers)
 
 def load_data(opts)->tuple[list,list,list,list,list,list]:
@@ -155,16 +210,15 @@ def train(training:tuple, test_answers:list=None, opts:Any=None):
                 print("\nGraceful stop\n")
                 self.model.stop_training = True
 
-    DROPOUT = 0 #0.05
+    DROPOUT = 0.05
 
-    inputs = keras.Input(shape=(None,len(data[0][0])), dtype='float')
+    inputs = keras.Input(shape=(len(data[0]),))
     n = inputs
     if DROPOUT > 0:
         n = layers.Dropout(DROPOUT)(n)
-    
-    n = layers.LSTM(64, return_sequences=True)(n)
-    n = layers.LSTM(64)(n)
-    n = layers.Dense(SceneType.count(), activation='elu')(n)
+    n = layers.Dense(len(data[0]))(n)
+    n = layers.Dense(len(data[0]))(n)
+    n = layers.Dense(len(data[0]))(n)
     outputs = layers.Dense(SceneType.count(), activation='softmax')(n)
     model = keras.Model(inputs, outputs)
     model.summary()
