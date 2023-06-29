@@ -1,4 +1,4 @@
-from .extern.ina_foss import AudioSegmentLabel
+from .feature_span import AudioSegmentLabel
 
 class SceneSegmenter:
     def check(self, ftime:float, faudio:AudioSegmentLabel, logo_present:bool, is_blank:bool, is_diff:bool)->bool:
@@ -11,6 +11,7 @@ class NoneSegmenter(SceneSegmenter):
     def __str__(self): 
         return 'none'
 
+
 class OrSegmenter(SceneSegmenter):
     def __init__(self, a, b):
         self._subs = []
@@ -22,15 +23,17 @@ class OrSegmenter(SceneSegmenter):
             self._subs.append(sub)
 
     def check(self, **kwargs):
+        ok = False
         for s in self._subs:
-            if s.check(**kwargs):
-                return True
-        return False
+            res = s.check(**kwargs)
+            ok = ok or res
+            #if res: print("OR",s,"returned true on",kwargs)
+        return ok
 
     def __str__(self): 
         return '(' + ' | '.join([str(x) for x in self._subs]) + ')'
     
-class AndSegmenter(SceneSegmenter):
+class Fuzz_AndSegmenter(SceneSegmenter):
     def __init__(self, a, b):
         self._subs = []
         self._prev = []
@@ -53,6 +56,26 @@ class AndSegmenter(SceneSegmenter):
 
     def __str__(self) -> str:
         return '(' + ' & '.join([str(x) for x in self._subs]) + ')'
+    
+class AndSegmenter(SceneSegmenter):
+    def __init__(self, a, b):
+        self._subs = []
+        self.add(a)
+        self.add(b)
+    
+    def add(self, sub):
+        if sub is not None:
+            self._subs.append(sub)
+
+    def check(self, **kwargs):
+        ok = True
+        for s in self._subs:
+            res = s.check(**kwargs)
+            ok = ok and res
+        return ok
+
+    def __str__(self) -> str:
+        return '(' + ' & '.join([str(x) for x in self._subs]) + ')'
 
 class TimeSegmenter(SceneSegmenter):
     def __init__(self, duration=1.0):
@@ -71,7 +94,9 @@ class TimeSegmenter(SceneSegmenter):
         return str(int(self._dur)) + 's'
 
 class SilenceSegmenter(SceneSegmenter):
-    def check(self, faudio, **kwargs):
+    def check(self, faudio=None, **kwargs):
+        if faudio is None:
+            return False
         if type(faudio) is int:
             faudio = AudioSegmentLabel(faudio)
         return faudio == AudioSegmentLabel.SILENCE
@@ -83,7 +108,9 @@ class AudioSegmenter(SceneSegmenter):
     def __init__(self):
         self._prev = AudioSegmentLabel.SILENCE
     
-    def check(self, faudio, **kwargs):
+    def check(self, faudio=None, **kwargs):
+        if faudio is None:
+            return False
         if type(faudio) is int:
             faudio = AudioSegmentLabel(faudio)
         if faudio != self._prev:
@@ -99,7 +126,9 @@ class LogoSegmenter(SceneSegmenter):
     def __init__(self):
         self._prev = [False]*30
     
-    def check(self, logo_present, **kwargs):
+    def check(self, logo_present=None, **kwargs):
+        if logo_present is None:
+            return False
         res = logo_present not in self._prev
         self._prev.append(logo_present)
         self._prev.pop(0)
@@ -109,13 +138,13 @@ class LogoSegmenter(SceneSegmenter):
         return 'logo'
     
 class BlankSegmenter(SceneSegmenter):
-    def check(self, is_blank, **kwargs):
+    def check(self, is_blank=False, **kwargs):
         return is_blank
     def __str__(self) -> str:
         return 'blank'
 
 class DiffSegmenter(SceneSegmenter):
-    def check(self, is_diff, **kwargs):
+    def check(self, is_diff=False, **kwargs):
         return is_diff
     def __str__(self) -> str:
         return 'diff'

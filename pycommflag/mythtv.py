@@ -1,9 +1,8 @@
 import sys
 import os
-import xml.etree.ElementTree as xml
-import MySQLdb as mysql
 import logging as log
 import av
+from .feature_span import SceneType
 
 def _open():
     dbc = {}
@@ -11,8 +10,10 @@ def _open():
     if not os.path.exists(cfgfile):
         log.debug(f"No mythtv config file at '{cfgfile}', so no mythtv extensions will work")
         return None
+    import xml.etree.ElementTree as xml
     for e in xml.parse(cfgfile).find('Database').iter():
         dbc[e.tag.lower()] = e.text
+    import MySQLdb as mysql
     return mysql.connect(
         host=dbc.get('host', "localhost"),
         user=dbc.get('username', "mythtv"),
@@ -85,3 +86,41 @@ def get_breaks(chanid, starttime)->list[tuple[float,float]]:
         else:
             result[-1] = (result[-1][0], v)
     return result
+
+def set_breaks(chanid, starttime, marks)->None:
+    filename = None
+    
+    conn = _open()
+    if conn is None:
+        return
+    
+    rate = 29.97
+    with conn.cursor() as c:
+        filename = _get_filename(c, chanid, starttime)
+        if not filename:
+            return
+        with av.open(filename) as container:
+            try:
+                n = 0
+                for _ in container.decode(video=0):
+                    n += 1
+                    if n >= 300:
+                        break
+            except:
+                pass
+            #duration = container.duration / av.time_base
+            rate = container.streams.video[0].guessed_rate
+        
+        c.execute("DELETE FROM recordedmarkup "\
+                  "WHERE chanid = %s AND starttime = %s AND (type = 4 OR type = 5) ",
+                  (chanid, starttime))
+        
+        # TODO: other tag types (intro, outro, etc)?? are they chapters? commercials?
+        for (st,(b,e)) in marks:
+            if st in [st == SceneType.COMMERCIAL,SceneType.COMMERCIAL.value]:
+                fb = round(b*rate)
+                fe = round(e*rate)
+                c.execute("INSERT INTO recordedmarkup (chanid,starttime,mark,type) "\
+                          "VALUES(%s,%s,%s,4), VALUES(%s,%s,%s,5);",
+                          (chanid, starttime, fb, chanid, starttime, fe))
+        

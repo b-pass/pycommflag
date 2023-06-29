@@ -18,23 +18,32 @@ def read_feature_log(feature_log_file:str|TextIO|dict) -> dict:
     if type(feature_log_file) is dict:
         return feature_log_file
     elif type(feature_log_file) is str:
-        with open(feature_log_file, 'r') as fl:
-            return read_feature_log(fl)
+        if feature_log_file.endswith('.gz'):
+            import gzip
+            feature_log_file = gzip.open(feature_log_file, 'r')
+        else:
+            feature_log_file = open(feature_log_file, 'r')
     else:
         feature_log_file.seek(0)
-        try:
-            return json.load(feature_log_file)
-        except json.JSONDecodeError:
-            # partial file, probably closed in the middle of a frame array; try to recover....
-            feature_log_file.seek(0)
-            return json.loads(feature_log_file.read() + ']}')
+    
+    try:
+        return json.load(feature_log_file)
+    except json.JSONDecodeError:
+        # partial file, probably closed in the middle of a frame array; try to recover....
+        feature_log_file.seek(0)
+        return json.loads(feature_log_file.read() + ']}')
 
 def write_feature_log(flog:dict, log_file:str|TextIO):
     if type(log_file) is str:
-        with open(log_file, 'w+') as fd:
-            return write_feature_log(flog, fd)
-    log_file.seek(0)
-    log_file.truncate()
+        if log_file.endswith('.gz'):
+            import gzip
+            log_file = gzip.open(log_file, 'w')
+        else:
+            log_file = open(log_file, 'w+')
+    else:
+        log_file.seek(0)
+        log_file.truncate()
+    
     log_file.write('{\n')
     first = True
     for (k,v) in flog.items():
@@ -52,7 +61,12 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
             logo = logo_finder.from_json(read_feature_log(feature_log).get('logo', None))
             if logo and not opts.quiet:
                 print(f"{feature_log} exists, re-using logo ", logo[0], logo[1])
-        feature_log = open(feature_log, 'w+')
+        
+        if feature_log.endswith('.gz'):
+            import gzip
+            feature_log = gzip.open(feature_log, 'w')
+        else:
+            feature_log = open(feature_log, 'w+')
     else:
         feature_log.seek(0)
         feature_log.truncate()
@@ -105,8 +119,8 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
     
     if not opts.quiet: print('\nExtracting features...', end='\r') 
 
-    # not doing format/aspect because everything is widescreen all the time now (that was very early '00s)
-    # except ultra wide screen movies, and sometimes ultra-wide commercials?
+    # not doing format/aspect because everything is widescreen all the time now
+    # that was very early '00s... except ultra wide screen movies, and sometimes ultra-wide commercials?
 
     try:
       for frame in player.frames():
@@ -126,7 +140,7 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
         audioProc.stop()
         videoProc.join()
         audioProc.join()
-        feature_log.write("\n]}")
+        feature_log.write("\n],\"EARLY_STOP_TRUNCATION\":true}")
         raise
 
     videoProc.stop()
@@ -155,6 +169,7 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
 
     feature_log.write('\n}\n')
     feature_log.flush()
+    feature_log.close()
     
     if not opts.quiet:
         print('Extraction complete           ')
@@ -306,7 +321,7 @@ class AudioProc(Thread):
                 if se > startbound:
                     self.fspan.add(round(start+sb,5), round(start+se,5), AudioSegmentLabel[lab])
 
-def reprocess(feature_log_filename:str, opts:Any=None) -> dict[str, FeatureSpan]:
+def reprocess(feature_log_filename:str, opts:Any=None) -> dict:
     flog = read_feature_log(feature_log_filename)
 
     lasttime = 0
@@ -343,12 +358,7 @@ def reprocess(feature_log_filename:str, opts:Any=None) -> dict[str, FeatureSpan]
 
     write_feature_log(flog, feature_log_filename)
 
-    return {
-        'logo':logof.to_list(),
-        'blank':blankf.to_list(),
-        'diff':difff.to_list(),
-        'audio':audiof.to_list(),
-    }
+    return flog
 
 def read_logo(log_in:str|TextIO|dict) -> None|tuple:
     return logo_finder.from_json(read_feature_log(log_in).get('logo', None))

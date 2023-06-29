@@ -1,6 +1,6 @@
 import argparse
 
-# todo: automatically gz/ungz the frame logs
+# todo: automatically gz/ungz the feaature logs
 
 def get_options():
     parser = argparse.ArgumentParser(add_help=True,formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -8,7 +8,7 @@ def get_options():
     parser.add_argument('-f', '--file', dest="filename", type=str,
                         help="Video input file name")
     parser.add_argument('-l', '--feature-log', dest="feature_log", type=str,
-                        help="In/Out location of feature log. If a video file is processed then this file will be overwritten. cf_[filename].feat")
+                        help="In/Out location of feature log. If a video file is processed then this file will be overwritten. cf_[filename].json")
     parser.add_argument('--no-log', dest="no_feature_log", action='store_true',
                         help="Use a temporary file for the feature log (which won't persist anywhere)")
     parser.add_argument('-c','--break-text', dest='comm_file', type=str,
@@ -50,6 +50,10 @@ def get_options():
                   help="Path to use for models (output for training, input for infrencing)")
     ml.add_argument('--model', dest='model_file', default='',
                   help="Path to model to use for inference/prediction")
+    ml.add_argument('--segmenter', dest='segmeth', default='blank|(audio+diff)',
+                    help="Scene segmentation instruction; split video into scenes using the demuxers.\n"+
+                         "Plus to AND them, comma or pipe to OR them.\n"+
+                         "Segmenters: logo,silence,audio,blank,imagediff,1s")
     parser.add_argument_group(ml)
     
     mcf = parser.add_argument_group('MythTV Options', description="Commandline compatibility with mythcommflag")
@@ -61,6 +65,9 @@ def get_options():
                     help="Insert a job into the mythtv job queue")
     mcf.add_argument('--rebuild', dest="rebuild", action="store_true",
                     help="Rebuild seek table (this will just exec mythcommflag directly to do this)")
+    mcf.add_argument('-j','--job', dest="mythjob", type=int,
+                    help="Run a job from the mythtv job queue (this will populate chanid and starttime from the job entry)")
+    # progress? quiet? logs?
     #mcf.add_argument('--mythtv-out', dest="mythtv_output", action="store_true",
     #                help="Write flagging output to mythtv database even though --chanid and --starttime were not specified")
     #mcf.add_argument('--no-mythtv-out', dest="no_mythtv_output", action="store_true",

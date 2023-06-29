@@ -7,28 +7,21 @@ import scipy.signal as spsig
 class Player:
     def __init__(self, filename:str, no_deinterlace:bool=False):
         self.filename = filename
-        self.container = av.open(self.filename)
-        self.container.gen_pts = True
-        #self.container.discard_corrupt = True
-        self.container.streams.video[0].thread_type = "AUTO"
-        self.container.streams.video[0].thread_count = 2
-        self.container.streams.audio[0].thread_type = "AUTO"
-        self.container.streams.audio[0].thread_count = 2
-
+        self.graph = None
+        self._resync()
+        
         self.duration = self.container.duration / av.time_base
         self.streams = {'video':0}
         self.aq = None
         self._audio_res = []
 
-        inter = 0
-        ninter = 0
         self.shape = (-1,-1)
-        self.graph = None
-        
         self.frame_rate = round(self.container.streams.video[0].guessed_rate,3)
         self.vt_start = self.container.streams.video[0].start_time * self.container.streams.video[0].time_base
         self.vt_pos = self.vt_start
-
+        
+        inter = 0
+        ninter = 0
         for f in self.frames():
             self.shape = (f.height, f.width)
             if f.interlaced_frame:
@@ -202,6 +195,7 @@ class Player:
     def _resync(self, pts):
         self.container = av.open(self.filename)
         self.container.gen_pts = True
+        self.container.discard_corrupt = True
         self.container.streams.video[0].thread_type = "AUTO"
         self.container.streams.video[0].thread_count = 2
         self.container.streams.audio[0].thread_type = "AUTO"

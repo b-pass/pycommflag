@@ -7,23 +7,24 @@ import sys
 from typing import Any,TextIO,BinaryIO
 
 from .feature_span import *
-from . import processor
+from . import processor, segmenter
 
-def flog_to_vecs(flog:dict)->tuple[list[list[float]], list[list[float]]]:
+def flog_to_vecs(flog:dict, seg:segmenter.SceneSegmenter=None)->tuple[list[list[float]], list[list[float]]]:
     MAX_BLOCK_LEN = 300.0 # seconds
     x = []
     y = []
 
+    frame_rate = flog.get('frame_rate', 29.97)
+    endtime = flog.get('duration', 0)
+
+    tags = flog.get('tags', [])
+    
+    # clean up tags so they start/end exactly in the middle of the blank block
+    # this is because the training data is supplied by humans, and might be off a bit
     # TODO, do we need to handle all-blank scenes at the start/end of a block differently?
     # the reason would be because of inconsistent training data (sometimes the blank is part of the commercial, sometimes the show)
     # but there are blanks in the middle of both also so maybe that doesnt matter....?
-
-    frame_rate = flog['frame_rate']
-    endtime = flog['duration']
-
-    # clean up tags so they start/end exactly in the middle of the blank block
-    tags = flog.get('tags', [])
-    if tags and 'blank_span' in flog:
+    if tags and 'blank_span' in flog :
         blanks = flog.get('blank_span', [])
         for (bv,(bs,be)) in blanks:
             if not bv or bs == 0.0 or be >= endtime:
@@ -40,108 +41,152 @@ def flog_to_vecs(flog:dict)->tuple[list[list[float]], list[list[float]]]:
                 elif fixe and not fixb:
                     tags[ti] = (tt, (tags[ti][1][0], half))
 
+    feat_info = [('audio','faudio'),('logo_span','logo_present'),('blank_span','is_blank'),('diff_span','is_diff')]
 
-    feat = [ 
-        flog.get('audio', []),
-        flog.get('logo_span', []),
-        flog.get('diff_span', []),
-        flog.get('blank_span', [])
-        ]
-    fidx = [0]*len(feat)
-    aidx = 0
-
+    # put all the features in a flat array
+    flat = []
+    for (fn,pn) in feat_info:
+        for (v,(b,e)) in flog.get(fn, []):
+            flat.append({'ftime':b, pn:v})
+    # sort if by time
+    flat.sort(key=lambda x: x['ftime'])
+    # combine features if they have the same timestamp
+    i = 0
+    while i+1 < len(flat):
+        if flat[i]['ftime'] + (1.0/frame_rate) > flat[i+1]['ftime']:
+            nope = False
+            for k in flat[i].keys():
+                if k != 'ftime' and k in flat[i+1]:
+                    nope = True
+                    break
+            if not nope:
+                del flat[i+1]['ftime']
+                flat[i].update(flat[i+1])
+                del flat[i+1]
+                continue
+        i += 1
+    
+    # now segment based on features and record the timestamps of each segment
+    value = {'ftime':'0','faudio':AudioSegmentLabel.SILENCE,'logo_present':False,'is_blank':True,'is_diff':False}
     timestamps = []
+    for x in flat:
+        value.update(x)
+        if seg.check(**value):
+            timestamps.append(value['ftime'])
+    
+    # get rid of any empty 0 timestamps at the start
+    while timestamps[0] == 0.0:
+        timestamps.pop(0)
+    # the upper bound
+    timestamps.append(endtime)
+    
     data = []
-    answers = []
-    aprev = [0] * SceneType.count()
-    aprev[SceneType.SHOW.value] = 1.0
-    alast_end = 0
-    alast_val = SceneType.SHOW.value
-    while True:
-        now = None
-        for (i,f) in zip(fidx,feat):
-            if i < len(f):
-                if now is None or abs(f[i][1][1] - now) < (2.0/frame_rate):
-                    now = f[i][1][1]
-        if now is None or now >= endtime:
-            break
+    for _ in range(len(timestamps)):
+        data.append([0] * (AudioSegmentLabel.count() + 2))
 
-        entry = []
-        entry.append((now%1800) / 1800.0)
-        
-        for mi in range(len(fidx)):
-            i = fidx[mi]
-            f = feat[mi]
-            if i < len(f):
-                if mi == 0:
-                    # audio is a one-hot
-                    oh = [0.0] * AudioSegmentLabel.count()
-                    oh[f[i][0]] = 1.0
-                    entry += oh
-                else:
-                    # everything else is a integerized-boolean
-                    entry.append(int(f[i][0]))
-                elapsed = now - f[i][1][0]
-                entry.append(min(max(0,elapsed),MAX_BLOCK_LEN)/MAX_BLOCK_LEN)
-                timeleft = f[i][1][1] - now
-                if abs(timeleft) < 2.0/frame_rate:
-                    timeleft = 0.0
-                    fidx[mi] += 1
-                entry.append(min(max(0,timeleft),MAX_BLOCK_LEN)/MAX_BLOCK_LEN)
-            else:
-                if mi == 0:
-                    # audio is a one-hot
-                    oh = [0.0] * AudioSegmentLabel.count()
-                    entry += oh
-                else:
-                    # everything else is a integerized-boolean
-                    entry.append(0.0)
-                entry += [0.4, 0.6] # not really half way, not at the beginning or the end, just somewhere.
-        
-        entry.append(min(max(0,now - alast_end),MAX_BLOCK_LEN)/MAX_BLOCK_LEN)
-        entry.append(alast_val)
-
-        if aidx >= len(tags):
-            anewval = SceneType.SHOW.value
-            alast_val = anewval
-            alast_end = tags[aidx-1][1][1] if tags else 0
-        else:
-            while aidx < len(tags):
-                (t,(b,e)) = tags[aidx]
-                if e <= now:
-                    aidx += 1
-                    continue
-                if b <= now:
-                    anewval = t
-                    if anewval != alast_val:
-                        alast_val = anewval
-                        alast_end = b
-                else:
-                    anewval = SceneType.SHOW.value
-                    alast_val = anewval
-                    alast_end = tags[aidx-1][1][1]
+    # Save duration of each audio type
+    didx = 0
+    for (v,(b,e)) in flog.get('audio',[]):
+        while didx < len(timestamps) and b - 0.5/frame_rate > timestamps[didx]:
+            didx += 1
+        if didx >= len(timestamps): didx = len(timestamps)-1
+        #print(v,b,e,didx,timestamps[didx])
+        fi = v if type(v) is int else v.value
+        data[didx][fi] += min(e,timestamps[didx]) - b
+        for j in range(didx+1,len(timestamps)):
+            if e <= timestamps[j-1]:
                 break
-            
-        if anewval == SceneType.DO_NOT_USE.value:
+            data[j][fi] += min(e,timestamps[j]) - timestamps[j-1]
+            #print('X',timestamps[j-1],min(e,timestamps[j]),j,timestamps[j])
+
+    # count the diffs
+    didx = 0
+    for (v,(b,e)) in flog.get('diff_span',[]):
+        while didx < len(timestamps) and b - 0.5/frame_rate > timestamps[didx]:
+            didx += 1
+        if didx >= len(timestamps): didx = len(timestamps)-1
+        data[didx][AudioSegmentLabel.count()+0] += 1
+    
+    # sum the logo time
+    didx = 0
+    for (v,(b,e)) in flog.get('logo_span',[]):
+        if not v:
             continue
+        while didx < len(timestamps) and b - 0.5/frame_rate > timestamps[didx]:
+            didx += 1
+        if didx >= len(timestamps): didx = len(timestamps)-1
         
-        timestamps.append(now)
+        data[didx][AudioSegmentLabel.count()+1] += min(e,timestamps[didx]) - b
+        for j in range(didx+1,len(timestamps)):
+            if e <= timestamps[j-1]:
+                break
+            data[j][AudioSegmentLabel.count()+1] += min(e,timestamps[j]) - timestamps[j-1]
 
-        data.append(entry + aprev)
-        #print(entry)
-        #print(aprev)
+    # now associate labels/tags with the segments we have identified (based on timestamps)
+    answers = []
+    dstart = 0
+    prev_tag = SceneType.COMMERCIAL.value
+    delete_me = []
+    for (dend,d) in zip(timestamps,data):
+        ddur = dend - dstart
+        d.append(min(ddur/300,1.0)) # length indicator
+        d.append((dstart%1800)/1800.0) # position indicator
+        d.append(max(d[-1],(dend%1800)/1800.0)) # end position indicator
 
-        aprev = [0.0] * SceneType.count()
-        aprev[anewval] = 1.0
-        answers.append(aprev)
+        oh = [0]*SceneType.count()
+        oh[prev_tag if type(prev_tag) is int else prev_tag.value] = 1.0
+        d += oh # basic recurrent NN, this is the answer from the previous sample
 
+        next_tag = None
+        for (tt,(tb,te)) in tags:
+            if dstart >= te or dend <= tb:
+                continue # tag doesn't overlap segment
+            
+            if ddur > 1 and (dstart + ddur/2 < tb or dstart+ddur/2 > te):
+                #print(dstart,dend,"mostly outside of tag",tt,"which is at",tb,te," -- ignoring the tag")
+                continue
+            if next_tag is not None:
+                if dstart + ddur/2 >= te:
+                    #print(dstart,dend,"straddles tag",tt,"which is at",tb,te," -- but not using it")
+                    break
+                #else: print(dstart,dend,"straddles tag",tt,"which is at",tb,te," -- overwriting", next_tag)
+            next_tag = tt
+            #print(dstart,dend,"matches tag",tt,"which is at",tb,te)
+        if next_tag is None:
+            next_tag = SceneType.UNKNOWN
+            #print("missing next tag at",tstart,tend)
+        
+        if next_tag == SceneType.DO_NOT_USE or next_tag == SceneType.DO_NOT_USE.value:
+            delete_me.append(dend)
+            answers.append(None)
+        else:
+            oh = [0]*SceneType.count()
+            oh[next_tag if type(next_tag) is int else next_tag.value] = 1.0
+            answers.append(oh)
+            prev_tag = next_tag
+        dstart = dend
+    
+    for d in reversed(delete_me):
+        for i in range(len(timestamps)):
+            if timestamps[i] == d:
+                del timestamps[i]
+                del data[i]
+                del answers[i]
+                break
+
+    pt = 0
+    for (t,x,a) in zip(timestamps,data,answers):
+        print(a,pt,t,x)
+        pt = t
+    
     return (timestamps,data,answers)
 
 def load_data(opts)->tuple[list,list,list,list,list,list]:
-    from . import processor
     n = []
     x = []
     y = []
+
+    seg = segmenter.parse(opts.segmeth)
 
     data = opts.ml_data
     if not data:
@@ -168,7 +213,7 @@ def load_data(opts)->tuple[list,list,list,list,list,list]:
         print(f)
         flog = processor.read_feature_log(f)
         if flog:
-            (t,a,b) = flog_to_vecs(flog)
+            (t,a,b) = flog_to_vecs(flog, seg=seg)
             n += [os.path.basename(f)] * len(a)
             x += a
             y += b
@@ -180,7 +225,7 @@ def load_data(opts)->tuple[list,list,list,list,list,list]:
         print(f)
         flog = processor.read_feature_log(f)
         if flog:
-            (t,a,b) = flog_to_vecs(flog)
+            (t,a,b) = flog_to_vecs(flog, seg=seg)
             nt += [os.path.basename(f)] * len(a)
             xt += a
             yt += b
@@ -195,6 +240,27 @@ def train(training:tuple, test_answers:list=None, opts:Any=None):
 
     (names,data,answers,test_names,test_data,test_answers) = training
 
+    DROPOUT = 0.05
+
+    nfeat = len(data[0])
+    inputs = keras.Input(shape=(nfeat,))
+    n = inputs
+    if DROPOUT > 0:
+        n = layers.Dropout(DROPOUT)(n)
+    # don't know which activation to use? no problem, just use them all
+    n = layers.Dense(nfeat, activation='relu')(n)
+    n = layers.Dense(nfeat, activation='tanh')(n)
+    n = layers.Dense(nfeat, activation='elu')(n)
+    outputs = layers.Dense(SceneType.count(), activation='softmax')(n)
+    model = keras.Model(inputs, outputs)
+    model.summary()
+
+    model.compile(optimizer="adam", loss="categorical_crossentropy", metrics=['categorical_accuracy', 'mean_squared_error'])
+
+    batch_size = opts.tf_batch_size if opts else 1000
+    train_dataset = tf.data.Dataset.from_tensor_slices((data, answers)).batch(batch_size)
+    test_dataset = tf.data.Dataset.from_tensor_slices((test_data, test_answers)).batch(batch_size)
+    
     class GracefulStop(keras.callbacks.Callback):
         def __init__(self):
             super(keras.callbacks.Callback, self).__init__()
@@ -210,24 +276,6 @@ def train(training:tuple, test_answers:list=None, opts:Any=None):
                 print("\nGraceful stop\n")
                 self.model.stop_training = True
 
-    DROPOUT = 0.05
-
-    inputs = keras.Input(shape=(len(data[0]),))
-    n = inputs
-    if DROPOUT > 0:
-        n = layers.Dropout(DROPOUT)(n)
-    n = layers.Dense(len(data[0]))(n)
-    n = layers.Dense(len(data[0]))(n)
-    n = layers.Dense(len(data[0]))(n)
-    outputs = layers.Dense(SceneType.count(), activation='softmax')(n)
-    model = keras.Model(inputs, outputs)
-    model.summary()
-
-    model.compile(optimizer="adam", loss="categorical_crossentropy", metrics=['categorical_accuracy', 'mean_squared_error'])
-
-    batch_size = opts.tf_batch_size if opts else 1000
-    train_dataset = tf.data.Dataset.from_tensor_slices((data, answers)).batch(batch_size)
-    test_dataset = tf.data.Dataset.from_tensor_slices((test_data, test_answers)).batch(batch_size)
     callbacks = [
         GracefulStop(),
         # keras.callbacks.ModelCheckpoint('chk-'+name, monitor='val_binary_accuracy', mode='max', verbose=1, save_best_only=True)
@@ -236,6 +284,7 @@ def train(training:tuple, test_answers:list=None, opts:Any=None):
     ]
     if test_answers:
         callbacks.append(keras.callbacks.EarlyStopping(monitor='val_categorical_accuracy', patience=500))
+    
     history = model.fit(train_dataset, epochs=5000, callbacks=callbacks, validation_data=test_dataset)
 
     print()
@@ -246,13 +295,8 @@ def train(training:tuple, test_answers:list=None, opts:Any=None):
     print(dmetrics)
     print(tmetrics)
 
-    if opts and opts.models_dir:
-        dir = opts.models_dir
-        if dir and dir[-1] != '/':
-            dir += '/'
-    else:
-        dir = './'
-    name = f'{dir}pycf-{dmetrics[1]:.04f}-{tmetrics[1]:.04f}-mse{tmetrics[2]:.04f}-{int(time.time())}.h5'
+    dir = opts.model_dir if opts and opts.models_dir else '.'
+    name = f'{dir}{os.pathsep}pycf-{dmetrics[1]:.04f}-{tmetrics[1]:.04f}-mse{tmetrics[2]:.04f}-{int(time.time())}.h5'
     #if dmetrics[1] >= 0.95 and tmetrics[1] >= 0.95:
     print('Saving as ' + name)
     model.save(name)
@@ -272,7 +316,7 @@ def predict(feature_log:str|TextIO|dict, opts:Any=None)->list:
 
     mf = opts.model_file
     if not mf and opts:
-        mf = f'{opts.models_dir or "."}/model.h5'
+        mf = f'{opts.models_dir or "."}{os.pathsep}model.h5'
     if not os.path.exists(mf):
         raise Exception(f"Model file '{mf}' does not exist")
     model:tf.keras.Model = keras.models.load_model(mf)
@@ -280,21 +324,30 @@ def predict(feature_log:str|TextIO|dict, opts:Any=None)->list:
     results = []
     prev = [0] * SceneType.count()
     prev[SceneType.COMMERCIAL.value] = 1.0
-    for entry in data:
-        entry[-len(prev):] = prev
-        result = model.predict([entry], verbose=False)[0].tolist()
-        results.append(result)
+    prevtime = 0
+    for (when,entry) in zip(times,data):
+        result = model.predict([entry+prev], verbose=False)[0].tolist()
+        ans = 0
+        for i in range(result):
+            if result[i] >= result[ans]:
+                ans = i
+        if ans != SceneType.UNKNOWN.value:
+            results.append((SceneType[ans], (prevtime,when)))
+        prevtime = when
         prev = result
     
+    flog['tags'] = results
+    processor.write_feature_log(flog, feature_log)
+
     correct = 0
     incorrect = 0
-    for i in range(len(results)):
-        actual = 0
-        expected = 0
+    for i in range(min(len(results),len(answers))):
+        actual = None
+        expected = None
         for j in range(len(results[i])):
             if results[i][actual] < results[i][j]:
                 actual = j
-            if  answers[i][expected] < answers[i][j]:
+            if answers[i] is not None and answers[i][expected] < answers[i][j]:
                 expected = j
         
         if actual != expected:
@@ -304,5 +357,7 @@ def predict(feature_log:str|TextIO|dict, opts:Any=None)->list:
         else:
             #print(f"{times[i]} matched result type {actual} at strength {results[i][actual]}")
             correct += 1
-    print(f"{round(correct*100/(correct+incorrect),2)}% accurate")
-    sys.exit(1)
+    if correct+incorrect > 0:
+        print(f"{round(correct*100/(correct+incorrect),2)}% accurate")
+    
+    return results
