@@ -129,9 +129,12 @@ def flog_to_vecs(flog:dict, seg:segmenter.SceneSegmenter=None)->tuple[list[list[
     delete_me = []
     for (dend,d) in zip(timestamps,data):
         ddur = dend - dstart
+        for i in range(len(d)):
+            d[i] = d[i] / ddur if d[i] > 0 else 0.0
         d.append(min(ddur/300,1.0)) # length indicator
         d.append((dstart%1800)/1800.0) # position indicator
-        d.append(max(d[-1],(dend%1800)/1800.0)) # end position indicator
+        d.append((dend%1800)/1800.0) # end position indicator
+        if d[-1] < d[-2]: d[-1] = 1.0 # position wrap
 
         oh = [0]*SceneType.count()
         oh[prev_tag if type(prev_tag) is int else prev_tag.value] = 1.0
@@ -174,10 +177,10 @@ def flog_to_vecs(flog:dict, seg:segmenter.SceneSegmenter=None)->tuple[list[list[
                 del answers[i]
                 break
 
-    pt = 0
-    for (t,x,a) in zip(timestamps,data,answers):
-        print(a,pt,t,x)
-        pt = t
+    #pt = 0
+    #for (t,x,a) in zip(timestamps,data,answers):
+    #    print(a,pt,t,x)
+    #    pt = t
     
     return (timestamps,data,answers)
 
@@ -187,6 +190,7 @@ def load_data(opts)->tuple[list,list,list,list,list,list]:
     y = []
 
     seg = segmenter.parse(opts.segmeth)
+    print(seg)
 
     data = opts.ml_data
     if not data:
@@ -210,7 +214,9 @@ def load_data(opts)->tuple[list,list,list,list,list,list]:
                 i += 1
     
     for f in data:
-        print(f)
+        if os.path.isdir(f):
+            continue
+        #print(f)
         flog = processor.read_feature_log(f)
         if flog:
             (t,a,b) = flog_to_vecs(flog, seg=seg)
@@ -222,7 +228,9 @@ def load_data(opts)->tuple[list,list,list,list,list,list]:
     xt = []
     yt = []
     for f in test:
-        print(f)
+        if os.path.isdir(f):
+            continue
+        #print(f)
         flog = processor.read_feature_log(f)
         if flog:
             (t,a,b) = flog_to_vecs(flog, seg=seg)
@@ -230,6 +238,19 @@ def load_data(opts)->tuple[list,list,list,list,list,list]:
             xt += a
             yt += b
     
+    if not xt:
+        import random
+        need = int(len(x)/10)
+        while need:
+            need -= 1
+            i = random.randint(0,len(x)-1)
+            nt.append(n[i])
+            xt.append(x[i])
+            yt.append(y[i])
+            del n[i]
+            del x[i]
+            del y[i]
+
     return (n,x,y,nt,xt,yt)
 
 def train(training:tuple, test_answers:list=None, opts:Any=None):
@@ -296,7 +317,7 @@ def train(training:tuple, test_answers:list=None, opts:Any=None):
     print(tmetrics)
 
     dir = opts.model_dir if opts and opts.models_dir else '.'
-    name = f'{dir}{os.pathsep}pycf-{dmetrics[1]:.04f}-{tmetrics[1]:.04f}-mse{tmetrics[2]:.04f}-{int(time.time())}.h5'
+    name = f'{dir}{os.sep}pycf-{dmetrics[1]:.04f}-{tmetrics[1]:.04f}-mse{tmetrics[2]:.04f}-{int(time.time())}.h5'
     #if dmetrics[1] >= 0.95 and tmetrics[1] >= 0.95:
     print('Saving as ' + name)
     model.save(name)
@@ -307,16 +328,16 @@ def train(training:tuple, test_answers:list=None, opts:Any=None):
 
     print()
 
-def predict(feature_log:str|TextIO|dict, opts:Any=None)->list:
+def predict(feature_log:str|TextIO|dict, opts:Any)->list:
     import tensorflow as tf
     import keras
 
     flog = processor.read_feature_log(feature_log)
-    (times,data,answers) = flog_to_vecs(flog)
+    (times,data,answers) = flog_to_vecs(flog, segmenter.parse(opts.segmeth))
 
     mf = opts.model_file
     if not mf and opts:
-        mf = f'{opts.models_dir or "."}{os.pathsep}model.h5'
+        mf = f'{opts.models_dir or "."}{os.sep}model.h5'
     if not os.path.exists(mf):
         raise Exception(f"Model file '{mf}' does not exist")
     model:tf.keras.Model = keras.models.load_model(mf)
@@ -326,25 +347,33 @@ def predict(feature_log:str|TextIO|dict, opts:Any=None)->list:
     prev[SceneType.COMMERCIAL.value] = 1.0
     prevtime = 0
     for (when,entry) in zip(times,data):
-        result = model.predict([entry+prev], verbose=False)[0].tolist()
+        entry[-len(prev):] = prev
+        #print(len(entry), entry)
+        result = model.predict([entry], verbose=False)[0].tolist()
         ans = 0
-        for i in range(result):
+        #print(result)
+        for i in range(len(result)):
             if result[i] >= result[ans]:
                 ans = i
         if ans != SceneType.UNKNOWN.value:
-            results.append((SceneType[ans], (prevtime,when)))
+            results.append((ans, (prevtime,when)))
         prevtime = when
         prev = result
     
     flog['tags'] = results
     processor.write_feature_log(flog, feature_log)
 
+    raise Exception("TODO: need to coalesce the guesses into ranges, and apply limits and sanity (max 5 min breaks, etc)")
+
+    '''
+    this is broken because results[i] is a tuple of (t,(b,e)) and answers is a one-hot vector without time in it at all
     correct = 0
     incorrect = 0
     for i in range(min(len(results),len(answers))):
-        actual = None
-        expected = None
+        actual = 0
+        expected = 0
         for j in range(len(results[i])):
+            print(i,j,actual,expected,results[i])
             if results[i][actual] < results[i][j]:
                 actual = j
             if answers[i] is not None and answers[i][expected] < answers[i][j]:
@@ -359,5 +388,5 @@ def predict(feature_log:str|TextIO|dict, opts:Any=None)->list:
             correct += 1
     if correct+incorrect > 0:
         print(f"{round(correct*100/(correct+incorrect),2)}% accurate")
-    
+    '''
     return results

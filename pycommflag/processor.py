@@ -223,14 +223,6 @@ class VideoProc(Thread):
         
         logo_present = logo_finder.check_frame(frame, self.logo)
 
-        # trying to be fast, just look at the middle 1/4 for blank-ish-ness and then verify with the full frame
-        x = np.max(fcolor[int(fcolor.shape[0]*3/8):int(fcolor.shape[0]*5/8)])
-        if x < 64:
-            m = np.median(fcolor, (0,1))
-            frame_blank = max(m) < 24 and np.std(m) < 3 and np.std(fcolor) < 6
-        else:
-            frame_blank = False
-
         column = mean_axis1_float_uint8(fcolor).astype('int16')
         if self.prev_col is not None:
             diff = column - self.prev_col
@@ -239,6 +231,15 @@ class VideoProc(Thread):
         else:
             is_diff = False
         self.prev_col = column
+
+        # trying to be fast, just look at the middle 1/4 for blank-ish-ness and then verify with the full frame
+        x = np.max(fcolor[int(fcolor.shape[0]*3/8):int(fcolor.shape[0]*5/8)])
+        if x < 64:
+            fcolor = logo_finder.subtract(fcolor, self.logo)
+            m = np.median(fcolor, (0,1))
+            frame_blank = max(m) < 24 and np.std(m) < 3 and np.std(fcolor) < 6
+        else:
+            frame_blank = False
 
         self.lasttime = round(frame.time-self.vt_start,5)
         self.logof.add(self.lasttime, logo_present)
@@ -322,6 +323,8 @@ class AudioProc(Thread):
                     self.fspan.add(round(start+sb,5), round(start+se,5), AudioSegmentLabel[lab])
 
 def reprocess(feature_log_filename:str, opts:Any=None) -> dict:
+    if feature_log_filename is None:
+        raise Exception('missing feature_log_filename')
     flog = read_feature_log(feature_log_filename)
 
     lasttime = 0

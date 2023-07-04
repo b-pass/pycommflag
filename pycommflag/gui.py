@@ -452,6 +452,10 @@ class Window(tk.Tk):
         self.drawMap()
     
     def truncate_now(self):
+        if self.settype is not None:
+            savepos = self.position
+            self.end_tag(None)
+            self.position = savepos
         self.setpos = self.player.duration
         self.settype = SceneType.DO_NOT_USE
         self.end_tag(None)

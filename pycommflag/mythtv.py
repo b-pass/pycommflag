@@ -56,31 +56,40 @@ def get_breaks(chanid, starttime)->list[tuple[float,float]]:
         if not filename:
             return []
         
+        rate = 29.97
+        with av.open(filename) as container:
+            try:
+                for f in container.decode(video=0):
+                    break
+            except:
+                pass
+            #duration = container.duration / av.time_base
+            rate = container.streams.video[0].average_rate
+        
         c.execute("SELECT mark, type FROM recordedmarkup "\
                   "WHERE chanid = %s AND starttime = %s AND (type = 4 OR type = 5) "\
                   "ORDER BY mark ASC",
                   (chanid, starttime))
         for (m,t) in c.fetchall():
-            marks.append((m,t))
+            guess = 0
+            with conn.cursor() as tc:
+                tc.execute("SELECT `offset`,mark AS o FROM recordedseek "\
+                           "WHERE chanid = %s and starttime = %s AND type = 33 "\
+                           "ORDER BY ABS(mark - "+str(int(m))+") ASC "\
+                           "LIMIT 1",
+                           (chanid,starttime))
+                for (o,om) in tc.fetchall():
+                    guess = float(o)/1000 + (int(m) - int(om))/rate
+                    break
+            if not guess and m >= 30:
+                guess = m/rate
+            marks.append((guess,t))
         
         if not marks:
             return []
     
-    with av.open(filename) as container:
-        try:
-            n = 0
-            for _ in container.decode(video=0):
-                n += 1
-                if n >= 300:
-                    break
-        except:
-            pass
-        #duration = container.duration / av.time_base
-        rate = container.streams.video[0].guessed_rate
-    
     result = []
-    for (m,t) in marks:
-        v = float(m/rate)
+    for (v,t) in marks:
         if t == 4:
             result.append((v,None))
         else:
@@ -88,39 +97,56 @@ def get_breaks(chanid, starttime)->list[tuple[float,float]]:
     return result
 
 def set_breaks(chanid, starttime, marks)->None:
-    filename = None
-    
     conn = _open()
     if conn is None:
         return
     
-    rate = 29.97
     with conn.cursor() as c:
         filename = _get_filename(c, chanid, starttime)
         if not filename:
             return
+
+        rate = 29.97
         with av.open(filename) as container:
             try:
-                n = 0
-                for _ in container.decode(video=0):
-                    n += 1
-                    if n >= 300:
-                        break
+                for f in container.decode(video=0):
+                    break
             except:
                 pass
             #duration = container.duration / av.time_base
-            rate = container.streams.video[0].guessed_rate
+            rate = container.streams.video[0].average_rate
         
         c.execute("DELETE FROM recordedmarkup "\
                   "WHERE chanid = %s AND starttime = %s AND (type = 4 OR type = 5) ",
                   (chanid, starttime))
         
-        # TODO: other tag types (intro, outro, etc)?? are they chapters? commercials?
         for (st,(b,e)) in marks:
-            if st in [st == SceneType.COMMERCIAL,SceneType.COMMERCIAL.value]:
-                fb = round(b*rate)
-                fe = round(e*rate)
-                c.execute("INSERT INTO recordedmarkup (chanid,starttime,mark,type) "\
-                          "VALUES(%s,%s,%s,4), VALUES(%s,%s,%s,5);",
-                          (chanid, starttime, fb, chanid, starttime, fe))
+            if st not in [st == SceneType.COMMERCIAL,SceneType.COMMERCIAL.value]:
+                # TODO: other tag types (intro, outro, etc)?? are they chapters? commercials?
+                continue
+            c.execute("SELECT `offset`,mark FROM recordedseek "\
+                      "WHERE chanid = %s AND starttime = %s AND type = 33 "\
+                      "ORDER BY ABS(offset - "+str(int(e*1000))+") ASC "\
+                      "LIMIT 1",
+                      (chanid, starttime))
+            o = 0
+            m = 0
+            for (o,m) in c.fetchall():
+                break
+            fb = int(m) + round((b - float(o)/1000) * rate)
+
+            c.execute("SELECT `offset`,mark FROM recordedseek "\
+                      "WHERE chanid = %s AND starttime = %s AND type = 33 "\
+                      "ORDER BY ABS(offset - "+str(int(e*1000))+") ASC "\
+                      "LIMIT 1",
+                      (chanid, starttime))
+            o = 0
+            m = 0
+            for (o,m) in c.fetchall():
+                break
+            fe = m + round((e - o/1000) * rate)
+            
+            c.execute("INSERT INTO recordedmarkup (chanid,starttime,mark,type) "\
+                      "VALUES(%s,%s,%s,4), VALUES(%s,%s,%s,5);",
+                      (chanid, starttime, fb, chanid, starttime, fe))
         

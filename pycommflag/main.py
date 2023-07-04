@@ -7,12 +7,15 @@ from . import gui
 from . import mythtv
 from . import neural
 from . import processor
+from . import segmenter
 
 def run(opts:Any) -> None|int:
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' # shut up, tf
 
     if opts.rebuild or opts.queue:
         os.execvp("mythcommflag", ["mythcommflag"] + sys.argv[1:])
+    
+    segmenter.parse(opts.segmeth) # parse early to detect raised parse exceptions
 
     if opts.train:
         d = neural.load_data(opts)
@@ -41,15 +44,18 @@ def run(opts:Any) -> None|int:
             mythtv.set_breaks(opts.chanid, opts.starttime, result)
         return 0
     
-    if not opts.filename:
-        print('No video file was found in the options')
-        return 1
-    elif not os.path.exists(opts.filename) or os.path.isdir(opts.filename):
-        print(f'No such video file "{opts.filename}"')
-        return 1
-            
     if opts.gui:
         flog = processor.reprocess(opts.feature_log, opts=opts)
+        if not opts.filename:
+            opts.filename = flog.get('filename','')
+            
+        if not opts.filename:
+            print('No video file was found in the options')
+            return 1
+        elif not os.path.exists(opts.filename) or os.path.isdir(opts.filename):
+            print(f'No such video file "{opts.filename}"')
+            return 1
+        
         logo = processor.read_logo(flog)
         spans = processor.read_feature_spans(flog)
         tags = processor.read_tags(flog)
@@ -65,6 +71,13 @@ def run(opts:Any) -> None|int:
             return 0
         else:
             return 1
+    
+    if not opts.filename:
+        print('No video file was found in the options')
+        return 1
+    elif not os.path.exists(opts.filename) or os.path.isdir(opts.filename):
+        print(f'No such video file "{opts.filename}"')
+        return 1
     
     if opts.no_feature_log:
         feature_log = tempfile.TemporaryFile('w+', prefix='cf_', suffix='.json')
