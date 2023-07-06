@@ -44,16 +44,16 @@ def get_options():
                   help="Train the ML model")
     ml.add_argument('--data', dest="ml_data", nargs='+',
                   help="Data to train the model with, as a list of feature-log files")
-    ml.add_argument('--batch-size', dest='tf_batch_size', type=int, default=1000,
+    ml.add_argument('--batch-size', dest='tf_batch_size', type=int, default=500,
                   help="Model training batch size")
     ml.add_argument('--models', dest='models_dir', default='./models/',
                   help="Path to use for models (output for training, input for infrencing)")
     ml.add_argument('--model', dest='model_file', default='',
                   help="Path to model to use for inference/prediction")
-    ml.add_argument('--segmenter', dest='segmeth', default='blank|(audio+diff)',
+    ml.add_argument('--segmenter', dest='segmeth', default='blank|(diff&(audio|logo))',
                     help="Scene segmentation instruction; split video into scenes using the demuxers.\n"+
-                         "Plus to AND them, comma or pipe to OR them.\n"+
-                         "Segmenters: logo,silence,audio,blank,imagediff,1s")
+                         "Plus/Amp to AND them, comma/pipe to OR them.\n"+
+                         "Segmenters: logo,silence,audio,blank,diff")
     parser.add_argument_group(ml)
     
     mcf = parser.add_argument_group('MythTV Options', description="Commandline compatibility with mythcommflag")
@@ -74,6 +74,15 @@ def get_options():
     #                help="Do NOT write flagging output to mythtv database even though --chanid and --starttime were specified")
     parser.add_argument_group(mcf)
 
+    tune = parser.add_argument_group('Fine Tuning')
+    tune.add_argument('--break-max-len', dest="break_max_len", type=int, default=360,
+                      help="Longest allowed commercial break (in seconds)")
+    tune.add_argument('--break-min-len', dest="break_min_len", type=int, default=59,
+                      help="Shortest allowed commercial break (in seconds)")
+    tune.add_argument('--show-min-len', dest="show_min_len", type=int, default=59,
+                      help="Shortest allowed show segment (in seconds)")
+    parser.add_argument_group(tune)
+
     return parser
 
 def parse_yaml(filename:str):
@@ -89,6 +98,9 @@ def parse_argv():
     import sys
     import logging as log
     opts = get_options()
+    if len(sys.argv) <= 1:
+        opts.print_help()
+        sys.exit(1)
     cfg = opts.parse_args()
 
     if cfg.yaml:

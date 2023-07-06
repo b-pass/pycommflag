@@ -75,7 +75,7 @@ def get_breaks(chanid, starttime)->list[tuple[float,float]]:
             with conn.cursor() as tc:
                 tc.execute("SELECT `offset`,mark AS o FROM recordedseek "\
                            "WHERE chanid = %s and starttime = %s AND type = 33 "\
-                           "ORDER BY ABS(mark - "+str(int(m))+") ASC "\
+                           "ORDER BY ABS(CAST(mark AS SIGNED) - "+str(int(m))+") ASC "\
                            "LIMIT 1",
                            (chanid,starttime))
                 for (o,om) in tc.fetchall():
@@ -121,12 +121,13 @@ def set_breaks(chanid, starttime, marks)->None:
                   (chanid, starttime))
         
         for (st,(b,e)) in marks:
+            print(st,b,e)
             if st not in [st == SceneType.COMMERCIAL,SceneType.COMMERCIAL.value]:
                 # TODO: other tag types (intro, outro, etc)?? are they chapters? commercials?
                 continue
             c.execute("SELECT `offset`,mark FROM recordedseek "\
                       "WHERE chanid = %s AND starttime = %s AND type = 33 "\
-                      "ORDER BY ABS(offset - "+str(int(e*1000))+") ASC "\
+                      "ORDER BY ABS(CAST(`offset` AS SIGNED) - "+str(int(e*1000))+") ASC "\
                       "LIMIT 1",
                       (chanid, starttime))
             o = 0
@@ -137,7 +138,7 @@ def set_breaks(chanid, starttime, marks)->None:
 
             c.execute("SELECT `offset`,mark FROM recordedseek "\
                       "WHERE chanid = %s AND starttime = %s AND type = 33 "\
-                      "ORDER BY ABS(offset - "+str(int(e*1000))+") ASC "\
+                      "ORDER BY ABS(CAST(`offset` AS SIGNED) - "+str(int(e*1000))+") ASC "\
                       "LIMIT 1",
                       (chanid, starttime))
             o = 0
@@ -145,8 +146,10 @@ def set_breaks(chanid, starttime, marks)->None:
             for (o,m) in c.fetchall():
                 break
             fe = m + round((e - o/1000) * rate)
+
+            print("\t....",st,fb,fe)
             
             c.execute("INSERT INTO recordedmarkup (chanid,starttime,mark,type) "\
-                      "VALUES(%s,%s,%s,4), VALUES(%s,%s,%s,5);",
+                      "VALUES(%s,%s,%s,4),(%s,%s,%s,5);",
                       (chanid, starttime, fb, chanid, starttime, fe))
         

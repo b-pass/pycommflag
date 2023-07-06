@@ -185,7 +185,7 @@ def subtract(data:np.ndarray, logo:tuple)->np.ndarray:
     if logo is None:
         return data
     
-    data = np.copy(data)
+    data = np.ndarray.copy(data)
     ((top,left),(bottom,right),lmask,thresh) = logo
     data[top:bottom,left:right] = 0
     return data

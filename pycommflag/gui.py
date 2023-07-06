@@ -227,8 +227,11 @@ class Window(tk.Tk):
         for (t,(b,e)) in reversed(span):
             if type(t) is bool and not t:
                 continue
-            p = b+(e-b)/2 if key == 'blank' else b
-            if (p - self.position) < -3/self.player.frame_rate:
+            if key == 'blank' and (e-b) >= 3*self.player.frame_rate:
+                p = b+(e-b)/2
+            else:
+                p = b
+            if (p - self.position) < -2/self.player.frame_rate:
                 self.move(abs=p)
                 return
 
@@ -242,8 +245,11 @@ class Window(tk.Tk):
         for (t,(b,e)) in span:
             if type(t) is bool and not t:
                 continue
-            p = b+(e-b)/2 if key == 'blank' else b
-            if (p - self.position) > 3/self.player.frame_rate:
+            if key == 'blank' and (e-b) >= 3*self.player.frame_rate:
+                p = b+(e-b)/2
+            else:
+                p = b
+            if (p - self.position) > 2/self.player.frame_rate:
                 self.move(abs=p)
                 return
 

@@ -21,7 +21,7 @@ def run(opts:Any) -> None|int:
         d = neural.load_data(opts)
         if not d:
             return 1
-        neural.train(d, opts)
+        neural.train(d, opts=opts)
         return 0
     
     if not opts.chanid and not opts.starttime:

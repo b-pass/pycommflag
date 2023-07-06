@@ -77,22 +77,6 @@ class AndSegmenter(SceneSegmenter):
     def __str__(self) -> str:
         return '(' + ' & '.join([str(x) for x in self._subs]) + ')'
 
-class TimeSegmenter(SceneSegmenter):
-    def __init__(self, duration=1.0):
-        self._dur = duration
-        self._last = 0
-    
-    def check(self, ftime, **kwargs):
-        diff = ftime - self._last
-        if diff >= self._dur:
-            self._last = ftime
-            return True
-        else:
-            return False
-    
-    def __str__(self) -> str:
-        return str(int(self._dur)) + 's'
-
 class SilenceSegmenter(SceneSegmenter):
     def check(self, faudio=None, **kwargs):
         if faudio is None:
@@ -153,7 +137,6 @@ def _make_segmenter(name:str):
     name = name.lower().strip()
     types = {
         'none':NoneSegmenter,
-        '1s':TimeSegmenter,
         'silence':SilenceSegmenter,
         'audio':AudioSegmenter,
         'logo':LogoSegmenter,

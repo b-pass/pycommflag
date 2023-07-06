@@ -177,7 +177,7 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
 class VideoProc(Thread):
     def __init__(self, feature_log, vt_start, logo, opts):
         super().__init__()
-        self.queue = Queue(100)
+        self.queue = Queue(150)
         self.go = True
         self.feature_log = feature_log
         self.vt_start = vt_start
@@ -215,7 +215,7 @@ class VideoProc(Thread):
         self.difff.end(self.lasttime)
 
     def add_frame(self, frame):
-        fcolor = frame.to_ndarray(format="rgb24", height=720, width=frame.width*(720/frame.height))
+        fcolor = frame.to_ndarray(format="rgb24")#, height=720, width=frame.width*(720/frame.height))
         self.queue.put((frame,fcolor))
     
     def _proc(self, frame, fcolor):
@@ -233,11 +233,14 @@ class VideoProc(Thread):
         self.prev_col = column
 
         # trying to be fast, just look at the middle 1/4 for blank-ish-ness and then verify with the full frame
-        x = np.max(fcolor[int(fcolor.shape[0]*3/8):int(fcolor.shape[0]*5/8)])
+        x = np.max(fcolor[int(fcolor.shape[0]*3/8):int(fcolor.shape[0]*5/8),int(fcolor.shape[1]*3/8):int(fcolor.shape[1]*5/8)])
+        #print("at",frame.time-self.vt_start)
+        #print("max=",x)
         if x < 64:
-            fcolor = logo_finder.subtract(fcolor, self.logo)
-            m = np.median(fcolor, (0,1))
-            frame_blank = max(m) < 24 and np.std(m) < 3 and np.std(fcolor) < 6
+            bchk = logo_finder.subtract(fcolor, self.logo)
+            m = np.median(bchk, (0,1))
+            #print("median=",m,"maxmediam=",max(m),"stdmedian=",np.std(m),"allstd=",np.std(bchk))
+            frame_blank = max(m) < 24 and np.std(m) < 3 and np.std(bchk) < 6
         else:
             frame_blank = False
 
@@ -254,13 +257,13 @@ class VideoProc(Thread):
 
 def mean_axis1_float_uint8(fcolor:np.ndarray)->np.ndarray:
     # the below code is equivalent to:
-    #   return fcolor.mean(axis=(1),dtype='float32').astype('uint8')
+    #    return fcolor.mean(axis=(1),dtype='float32').astype('uint8')
     # but is almost TEN TIMES faster!
     
     # pick out the individual color channels by skipping by 3, and then average them
-    cr = fcolor[...,0::3].mean(axis=(1), dtype='float32')
-    cg = fcolor[...,1::3].mean(axis=(1), dtype='float32')
-    cb = fcolor[...,2::3].mean(axis=(1), dtype='float32')
+    cr = fcolor[...,0::3].mean(axis=(1), dtype='uint32')
+    cg = fcolor[...,1::3].mean(axis=(1), dtype='uint32')
+    cb = fcolor[...,2::3].mean(axis=(1), dtype='uint32')
     
     # and now convert those stacks back into a 720x3
     return np.stack((cb,cg,cr), axis=1).astype('uint8')
