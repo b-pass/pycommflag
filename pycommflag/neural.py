@@ -126,15 +126,18 @@ def flog_to_vecs(flog:dict, seg:segmenter.SceneSegmenter=None)->tuple[list[list[
     answers = []
     dstart = 0
     prev_tag = SceneType.COMMERCIAL.value
+    prev_end = 0
     delete_me = []
     for (dend,d) in zip(timestamps,data):
         ddur = dend - dstart
+        time_since = dstart - prev_end
         for i in range(len(d)):
             d[i] = d[i] / ddur if d[i] > 0 else 0.0
         d.append(min(ddur/300,1.0)) # length indicator
         d.append((dstart%1800)/1800.0) # position indicator
         d.append((dend%1800)/1800.0) # end position indicator
         if d[-1] < d[-2]: d[-1] = 1.0 # position wrap
+        d.append(min(time_since/300,1.0))
 
         oh = [0]*SceneType.count()
         oh[prev_tag if type(prev_tag) is int else prev_tag.value] = 1.0
@@ -145,7 +148,7 @@ def flog_to_vecs(flog:dict, seg:segmenter.SceneSegmenter=None)->tuple[list[list[
             if dstart >= te or dend <= tb:
                 continue # tag doesn't overlap segment
             
-            if ddur > 1 and (dstart + ddur/2 < tb or dstart+ddur/2 > te):
+            if ddur > 1 and (dstart + ddur/10 < tb or dend-ddur/10 > te):
                 #print(dstart,dend,"mostly outside of tag",tt,"which is at",tb,te," -- ignoring the tag")
                 continue
             if next_tag is not None:
@@ -159,6 +162,9 @@ def flog_to_vecs(flog:dict, seg:segmenter.SceneSegmenter=None)->tuple[list[list[
             next_tag = SceneType.UNKNOWN
             #print("missing next tag at",tstart,tend)
         
+        if prev_tag != next_tag and dstart:
+            prev_end = dend
+
         if next_tag == SceneType.DO_NOT_USE or next_tag == SceneType.DO_NOT_USE.value:
             delete_me.append(dend)
             answers.append(None)
@@ -178,10 +184,10 @@ def flog_to_vecs(flog:dict, seg:segmenter.SceneSegmenter=None)->tuple[list[list[
                 break
 
     # also, a paradoxical future NN, also include the next sample's information
-    for i in range(len(data)-1):
-        data[i][-SceneType.count():-SceneType.count()] = data[i+1][:-SceneType.count()]
+    #for i in range(len(data)-1):
+    #    data[i][-SceneType.count():-SceneType.count()] = data[i+1][:-SceneType.count()]
     # just repeat the last sample in this case to keep the tensor square
-    data[-1][-SceneType.count():-SceneType.count()] = data[-1][:-SceneType.count()]
+    #data[-1][-SceneType.count():-SceneType.count()] = data[-1][:-SceneType.count()]
     
     #pt = 0
     #for (t,x,a) in zip(timestamps,data,answers):
@@ -275,12 +281,13 @@ def train(training:tuple, test_answers:list=None, opts:Any=None):
     inputs = keras.Input(shape=(nfeat,))
     n = inputs
     if DROPOUT > 0: n = layers.Dropout(DROPOUT)(n)
+    n = layers.Dense(nfeat, activation='linear')(n)
     # don't know which activation to use? no problem, just use them all
+    n = layers.Dense(nfeat, activation='sigmoid')(n)
+    #if DROPOUT > 0: n = layers.Dropout(DROPOUT)(n)
+    #n = layers.Dense(nfeat, activation='tanh')(n)
+    if DROPOUT > 0: n = layers.Dropout(DROPOUT)(n)
     n = layers.Dense(nfeat, activation='relu')(n)
-    if DROPOUT > 0: n = layers.Dropout(DROPOUT)(n)
-    n = layers.Dense(nfeat*3, activation='tanh')(n)
-    if DROPOUT > 0: n = layers.Dropout(DROPOUT)(n)
-    n = layers.Dense(nfeat, activation='elu')(n)
     outputs = layers.Dense(SceneType.count(), activation='softmax')(n)
     model = keras.Model(inputs, outputs)
     model.summary()
@@ -356,9 +363,12 @@ def predict(feature_log:str|TextIO|dict, opts:Any)->list:
     prev = [0] * SceneType.count()
     prev[SceneType.COMMERCIAL.value] = 1.0
     prevtime = 0
+    change = 0
+    prevans = SceneType.COMMERCIAL.value
     for (when,entry) in zip(times,data):
+        entry[-(SceneType.count()+1)] = min((prevtime - change)/300,1.0)
         entry[-len(prev):] = prev
-        #print(len(entry), entry)
+
         result = model.predict([entry], verbose=False)[0].tolist()
         ans = 0
         #print(result)
@@ -367,8 +377,12 @@ def predict(feature_log:str|TextIO|dict, opts:Any)->list:
                 ans = i
         if ans != SceneType.UNKNOWN.value:
             results.append((ans, (prevtime,when)))
+        if ans != prevans and prevtime:
+            change = when
+        
         prevtime = when
         prev = result
+        prevans = ans
     
     # show must be at least 30 seconds long (opts.show_min_len), or we just combine it into the commercial break its in the middle of
     # commercials must be at least 60 (opts.comm_min_len) seconds long, if it's less, it is deleted
@@ -383,13 +397,22 @@ def predict(feature_log:str|TextIO|dict, opts:Any)->list:
             del results[i]
         else:
             i += 1
+    print(results)
     
     i = 0
     while i < len(results):
         clen = results[i][1][1] - results[i][1][0]
         if clen < opts.break_min_len and results[i][0] == SceneType.COMMERCIAL.value:
-            # tiny commercial, delete it
-            del results[i]
+            if i+1 >= len(results) and clen >= 5 and results[i][1][1]+clen+5 > flog.get('duration', 0):
+                # dont require full length if it goes over the end of the recording
+                break
+            elif i == 0 and clen >= 5 and results[i][1][0] <= 0.1:
+                # don't require full length at the beginning of the recording
+                i += 1
+                pass
+            else:
+                # tiny commercial, delete it
+                del results[i]
             continue
 
         if clen > opts.break_max_len and results[i][0] == SceneType.COMMERCIAL.value:
@@ -399,7 +422,6 @@ def predict(feature_log:str|TextIO|dict, opts:Any)->list:
         # its ok now, move on
         i += 1
     
-    print(results)
     # now where there is a diff within 2 frame of the start/end of a tag, move the tag
     # TODO also do this for audio diffs? or silence ranges?
     for (_,(b,e)) in flog.get('diff_span', []):
@@ -422,6 +444,8 @@ def predict(feature_log:str|TextIO|dict, opts:Any)->list:
                 results[i] = (results[i][0], (b+(e-b)/2, results[i][1][1]))
             elif b-2/frame_rate <= results[i][1][1] and results[i][1][1] <= e+2/frame_rate:
                 results[i] = (results[i][0], (results[i][1][0], b+(e-b)/2))
+
+    print(results)
 
     flog['tags'] = results
     processor.write_feature_log(flog, feature_log)

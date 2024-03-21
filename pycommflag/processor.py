@@ -277,7 +277,7 @@ class AudioProc(Thread):
         import tensorflow as tf
         tf.config.threading.set_intra_op_parallelism_threads(1)
         tf.config.threading.set_inter_op_parallelism_threads(1)
-        self.seg = ina_foss.Segmenter(energy_ratio=0.05)
+        self.seg = ina_foss.Segmenter()
         self.queue = Queue(10)
         self.go = True
         self.audio = []

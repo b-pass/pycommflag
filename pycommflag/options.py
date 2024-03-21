@@ -50,7 +50,7 @@ def get_options():
                   help="Path to use for models (output for training, input for infrencing)")
     ml.add_argument('--model', dest='model_file', default='',
                   help="Path to model to use for inference/prediction")
-    ml.add_argument('--segmenter', dest='segmeth', default='blank|(diff&(audio|logo))',
+    ml.add_argument('--segmenter', dest='segmeth', default='blank|(diff&audio)',
                     help="Scene segmentation instruction; split video into scenes using the demuxers.\n"+
                          "Plus/Amp to AND them, comma/pipe to OR them.\n"+
                          "Segmenters: logo,silence,audio,blank,diff")
@@ -77,7 +77,7 @@ def get_options():
     tune = parser.add_argument_group('Fine Tuning')
     tune.add_argument('--break-max-len', dest="break_max_len", type=int, default=360,
                       help="Longest allowed commercial break (in seconds)")
-    tune.add_argument('--break-min-len', dest="break_min_len", type=int, default=59,
+    tune.add_argument('--break-min-len', dest="break_min_len", type=float, default=59,
                       help="Shortest allowed commercial break (in seconds)")
     tune.add_argument('--show-min-len', dest="show_min_len", type=int, default=59,
                       help="Shortest allowed show segment (in seconds)")
