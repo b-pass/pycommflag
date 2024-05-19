@@ -10,10 +10,7 @@ from .feature_span import *
 from . import processor, segmenter
 
 def flog_to_vecs(flog:dict, seg:segmenter.SceneSegmenter=None)->tuple[list[list[float]], list[list[float]]]:
-    MAX_BLOCK_LEN = 300.0 # seconds
-    x = []
-    y = []
-
+    version = flog.get('file_version', 10)
     frame_rate = flog.get('frame_rate', 29.97)
     endtime = flog.get('duration', 0)
 
@@ -65,6 +62,21 @@ def flog_to_vecs(flog:dict, seg:segmenter.SceneSegmenter=None)->tuple[list[list[
                 del flat[i+1]
                 continue
         i += 1
+    
+    # mark up each frame with the calculated audio type
+    if 'audio' not in flog['frame_header']:
+        flog['frame_header'].append('audio')
+        ftime = flog['frame_header'].find('ftime')
+        ait = iter(flog['audio'])
+        audio = next(ait, (0,(0,endtime+1)))
+        for frame in flog['frames']:
+            while frame[ftime] >= audio[1][1]:
+                audio = next(audio, (0,(0,endtime+1)))
+            if frame[ftime] < audio[1][0]:
+                frame.append(AudioSegmentLabel.SILENCE.value)
+            else:
+                frame.append(audio[0])
+
     
     # now segment based on features and record the timestamps of each segment
     value = {'ftime':'0','faudio':AudioSegmentLabel.SILENCE,'logo_present':False,'is_blank':True,'is_diff':False}

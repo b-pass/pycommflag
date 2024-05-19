@@ -55,6 +55,8 @@ def write_feature_log(flog:dict, log_file:str|TextIO):
     log_file.write("\n}\n")
 
 def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> None:
+    if np.empty(0, 'int'): raise Exception('antigravity') # get the stupid warning out early from numpy 1.13
+
     logo = None
     if type(feature_log) is str:
         if os.path.exists(feature_log) and not opts.no_logo:
@@ -108,7 +110,7 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
     
     audio_interval = int(player.frame_rate * 60)
 
-    audioProc = AudioProc()
+    audioProc = AudioProc(player.frame_rate)
     audioProc.start()
 
     videoProc = VideoProc(feature_log, player.vt_start, logo, opts)
@@ -122,6 +124,7 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
     # not doing format/aspect because everything is widescreen all the time now
     # that was very early '00s... except ultra wide screen movies, and sometimes ultra-wide commercials?
 
+    die = False
     try:
       for frame in player.frames():
         p += 1
@@ -135,13 +138,9 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
         if fcount%audio_interval == 0:
             audioProc.add_audio(player.move_audio())
         videoProc.add_frame(frame)
-    except KeyboardInterrupt:    
-        videoProc.stop()
-        audioProc.stop()
-        videoProc.join()
-        audioProc.join()
-        feature_log.write("\n],\"EARLY_STOP_TRUNCATION\":true}")
-        raise
+    except KeyboardInterrupt:
+        print('\nInterrupt!!\n\n')
+        die = True
 
     videoProc.stop()
 
@@ -166,10 +165,22 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
 
     feature_log.write(',\n"audio":')
     feature_log.write(audioProc.fspan.to_json())
+    
+    feature_log.write(',\n"main_volume":')
+    feature_log.write(json.dumps(audioProc.mrms))
+
+    feature_log.write(',\n"surr_volume":')
+    feature_log.write(json.dumps(audioProc.srms))
+    
+    if die:
+        feature_log.write("\n\n,\"EARLY_STOP_TRUNCATION\":true")
 
     feature_log.write('\n}\n')
     feature_log.flush()
     feature_log.close()
+
+    if die:
+        raise KeyboardInterrupt()
     
     if not opts.quiet:
         print('Extraction complete           ')
@@ -272,18 +283,23 @@ def columnize_frame(frame)->np.ndarray:
     return mean_axis1_float_uint8(frame.to_ndarray(format="rgb24", height=720, width=frame.width*(720/frame.height)))
 
 class AudioProc(Thread):
-    def __init__(self):
+    def __init__(self, fr):
         super().__init__()
         import tensorflow as tf
         tf.config.threading.set_intra_op_parallelism_threads(1)
         tf.config.threading.set_inter_op_parallelism_threads(1)
+        self.frame_rate = fr
         self.seg = ina_foss.Segmenter()
         self.queue = Queue(10)
         self.go = True
         self.audio = []
-        self.prev = None
+        self.main = None
+        self.surr = None
+        self.time = 0
         self.fspan = AudioFeatureSpan()
         self.fspan.start()
+        self.mrms = []
+        self.srms = []
 
     def add_audio(self,segments):
         self.queue.put(segments)
@@ -304,22 +320,46 @@ class AudioProc(Thread):
                 continue
 
             isstart = False
-            if self.prev is None:
-                self.prev = segments.pop(0)
+            if self.main is None:
+                (self.time,self.main,self.surr) = segments.pop(0)
+                if self.main is None:
+                    self.main = np.empty(0, 'float32')
+                if self.surr is None:
+                    self.surr = np.empty(0, 'float32')
                 isstart = True
             
-            all = self.prev[0]
-            start = self.prev[1]
-            time = self.prev[1] + len(self.prev[0])/16000
-            for s in segments:
-                missing = int(round((s[1] - time)*16000))
+            all = self.main
+            sall = self.surr
+            start = self.time
+            time = self.time + len(all)/16000
+            for (st,sm,ss) in segments:
+                missing = int(round((st - time)*16000))
                 if missing > 0:
                     all = np.append(all, np.zeros(missing, 'float32'))
-                all = np.append(all, s[0])
-                time = s[1] + len(s[0])/16000
-            
-            self.prev = (all[-8000:], start+(len(all)-8000)/16000)
+                if ss is not None:
+                    expect = int(round(st - time)*16000)
+                    if len(sall) < expect:
+                        sall = np.append(sall, np.zeros(expect - len(sall), 'float32'))
+                    sall = np.append(sall, ss)
+                
+                time = st + len(sm)/16000
+                all = np.append(all, sm)
 
+            self.time = start + (len(all)-8000)/16000
+            self.main = all[-8000:]
+            self.surr = sall[-8000:]
+
+            # calculate the volume via RMS for both the main and surround
+            # for every frame we do a trailing 1/4 second of audio to calculate the volume
+            rt = round(start,5)
+            x = 8000
+            while rt < self.time and x < len(all):
+                self.mrms.append((rt, round(math.sqrt(np.mean(np.square(all[x-4000:x]))), 5)))
+                self.srms.append((rt, round(math.sqrt(np.mean(np.square(sall[x-4000:x]))), 5)))
+                x += round(16000/self.frame_rate)
+                rt = round(rt + 1/self.frame_rate, 5)
+
+            # run the model on the main audio
             startbound = 0 if isstart else 0.5
             for (lab, sb, se) in self.seg(all):
                 if se > startbound:

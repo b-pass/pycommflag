@@ -141,16 +141,19 @@ class Player:
             for c in range(nc):
                 x.append(d[c::nc])
             d = np.vstack(x)
-        
-        if d.shape[0] >= 4 or (d.shape[0] == 3 and af.layout.channels[2].name.endswith('C')):
-            d = (d[0,...] + d[1,...] + d[2,...]) / 3 #d = ((d[0,...] + d[1,...]) / 2.0 + d[2,...]) / 1.4142
-        elif d.shape[0] >= 2:
-            d = (d[0,...] + d[1,...]) / 2.0
-        else:
+        if d.shape[0] < 1:
             return
         
+        # root mean square - average power of signal, per channel
+        
+        n = 3 if d.shape[0] >= 3 and af.layout.channels[2].name.endswith('C') else 2 if d.shape[0] >= 2 else 1
+        main = np.sum(d[:n], 0) / n 
+        #d = ((d[0,...] + d[1,...]) / 2.0 + d[2,...]) / 1.4142
+
+        surr = np.sum(d[3:,...], 0) / (d.shape[0]-3) if d.shape[0] >= 4 else None
+        
         #print("AQ:",d.shape,af.time-self.at_start,af.sample_rate)
-        self.aq.append((d,af.time-self.at_start,af.sample_rate))
+        self.aq.append((main,surr,af.time-self.at_start,af.sample_rate))
     
     def _resample_audio(self):
         # resample to 16 kHz
@@ -159,26 +162,38 @@ class Player:
             return
         
         # out of order PTS, should never happen...?
-        self.aq = sorted(self.aq, key=lambda x:x[1])
+        self.aq = sorted(self.aq, key=lambda x:x[2])
         
-        start = self.aq[0][1]
-        samples = None
+        start = self.aq[0][2]
+        main_samp = None
+        surr_samp = None
         psr = None
         while self.aq:
-            (d,t,sr) = self.aq.pop(0)
-            #print(t,sr,len(d),t+len(d)/sr)
-            if psr != sr and samples is not None:
-                self._audio_res.append((spsig.resample(samples, int(len(samples)*16000/psr))), start)
-                start = self.aq[0][1] if self.aq else -1
-                samples = None
+            (main,surr,t,sr) = self.aq.pop(0)
+            #print(t,sr,len(main),t+len(main)/sr)
+            if psr != sr and main_samp is not None:
+                self._audio_res.append((
+                    start, 
+                    spsig.resample(main_samp, int(len(main_samp)*16000/psr)), 
+                    spsig.resample(surr_samp, int(len(surr_samp)*16000/psr)) if surr_samp is not None else None
+                ))
+                start = self.aq[0][2] if self.aq else -1 # peek next timestamp
+                main_samp = None
+                surr_samp = None
             psr = sr
-            if samples is not None:
-                samples = np.append(samples, d)
-            else:
-                samples = d
+            if surr is not None:
+                if main_samp is not None and surr_samp is None:
+                    # there was not audio before this on the back channels, pad left with zeros
+                    surr_samp = np.zeros(int(len(main_samp)))
+                surr_samp = np.append(surr_samp, surr) if surr_samp is not None else surr
+            main_samp = np.append(main_samp, main) if main_samp is not None else main
         
-        if samples is not None:
-            self._audio_res.append((spsig.resample(samples, int(len(samples)*16000/psr)), start))
+        if main_samp is not None:
+            self._audio_res.append((
+                start, 
+                spsig.resample(main_samp, int(len(main_samp)*16000/psr)), 
+                spsig.resample(surr_samp, int(len(surr_samp)*16000/psr)) if surr_samp is not None else None
+            ))
 
     def _flush(self):
         if self.graph:
@@ -207,7 +222,7 @@ class Player:
             self.container.seek(pts, stream=self.container.streams.video[0], any_frame=True, backward=False)
         self._flush()
 
-    def move_audio(self)->list[tuple[np.ndarray,float]]:
+    def move_audio(self)->list[tuple[np.ndarray,float,list[float]]]:
         self._resample_audio()
         x = self._audio_res
         self._audio_res = []

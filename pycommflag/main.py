@@ -88,6 +88,7 @@ def run(opts:Any) -> None|int:
     
     processor.process_video(opts.filename, feature_log, opts)
     result = neural.predict(feature_log, opts=opts)
-    if result and opts.chanid and opts.starttime:
-        mythtv.set_breaks(opts.chanid, opts.starttime, result)
+    print("Not saving result because this thing is probably broken")
+    #if result and opts.chanid and opts.starttime:
+    #    mythtv.set_breaks(opts.chanid, opts.starttime, result)
     return 0
