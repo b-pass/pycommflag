@@ -3,7 +3,6 @@ import av
 import errno
 import logging as log
 import numpy as np
-import scipy.signal as spsig
 
 class Player:
     def __init__(self, filename:str, no_deinterlace:bool=False):
@@ -154,46 +153,6 @@ class Player:
         
         #print("AQ:",d.shape,af.time-self.at_start,af.sample_rate)
         self.aq.append((main,surr,af.time-self.at_start,af.sample_rate))
-    
-    def _resample_audio(self):
-        # resample to 16 kHz
-
-        if not self.aq:
-            return
-        
-        # out of order PTS, should never happen...?
-        self.aq = sorted(self.aq, key=lambda x:x[2])
-        
-        start = self.aq[0][2]
-        main_samp = None
-        surr_samp = None
-        psr = None
-        while self.aq:
-            (main,surr,t,sr) = self.aq.pop(0)
-            #print(t,sr,len(main),t+len(main)/sr)
-            if psr != sr and main_samp is not None:
-                self._audio_res.append((
-                    start, 
-                    spsig.resample(main_samp, int(len(main_samp)*16000/psr)), 
-                    spsig.resample(surr_samp, int(len(surr_samp)*16000/psr)) if surr_samp is not None else None
-                ))
-                start = self.aq[0][2] if self.aq else -1 # peek next timestamp
-                main_samp = None
-                surr_samp = None
-            psr = sr
-            if surr is not None:
-                if main_samp is not None and surr_samp is None:
-                    # there was not audio before this on the back channels, pad left with zeros
-                    surr_samp = np.zeros(int(len(main_samp)))
-                surr_samp = np.append(surr_samp, surr) if surr_samp is not None else surr
-            main_samp = np.append(main_samp, main) if main_samp is not None else main
-        
-        if main_samp is not None:
-            self._audio_res.append((
-                start, 
-                spsig.resample(main_samp, int(len(main_samp)*16000/psr)), 
-                spsig.resample(surr_samp, int(len(surr_samp)*16000/psr)) if surr_samp is not None else None
-            ))
 
     def _flush(self):
         if self.graph:
@@ -223,9 +182,9 @@ class Player:
         self._flush()
 
     def move_audio(self)->list[tuple[np.ndarray,float,list[float]]]:
-        self._resample_audio()
-        x = self._audio_res
-        self._audio_res = []
+        x = self.aq
+        if x is not None:
+            self.aq = []
         return x
 
     def frames(self) -> iter:
@@ -274,5 +233,4 @@ class Player:
                 self.vpts = frame.pts
                 yield frame
         
-        self._resample_audio()
         return #raise StopIteration()
