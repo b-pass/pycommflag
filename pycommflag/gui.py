@@ -176,7 +176,7 @@ class Window(tk.Tk):
         self.misc.append(save)
         c += 1
         
-        self.map_height = 80
+        self.map_height = 180
         self.map_width = 1280
         self.mapCanvas = tk.Canvas(self, width=self.map_width, height=self.map_height)
         self.mapCanvas.grid(row=7, column=0, columnspan=5)
@@ -353,31 +353,51 @@ class Window(tk.Tk):
                 self.mapCanvas.create_rectangle(startx, top, stopx, bottom, width=0, fill=color)
             #print(t,startx,stopx,color)
     
+    def drawVolume(self, span, top, bottom, height, color):
+        scale = np.max(np.array(span)[...,1:3])
+        sec_per_pix = self.player.duration / self.map_width
+        fprev = None
+        rprev = None
+        for (t,f,r) in span:
+            x = math.floor(t / sec_per_pix)
+            fy = (bottom-height) - (f/scale) * height
+            ry = bottom - (r/scale) * height
+            if fprev is not None:
+                self.mapCanvas.create_line(fprev[0], fprev[1], x, fy, fill=color,width=0.1)
+                self.mapCanvas.create_line(rprev[0], rprev[1], x, ry, fill=color,width=0.1)
+            fprev = (x,fy)
+            rprev = (x,ry)
+    
     def drawMap(self):
         for x in self.mapCanvas.find_all():
             self.mapCanvas.delete(x)
         self.vMaybe = None
 
-        row = self.map_height/4
+        row = self.map_height/6
         pos = 0
         self.drawSpan(self.tags, top=pos, bottom=pos+row, colorMap=SceneType.color_map())
         pos += row
         self.drawSpan(self.spans.get('logo',[]), top=pos, bottom=pos+row, colorMap={True:'blue'})
         pos += row
+        
+        self.drawSpan(self.spans.get('blank',[]), top=int(row*.3), bottom=pos-int(row*.3), colorMap={True:'black'})
+
         self.drawSpan(self.spans.get('diff',[]), top=pos, bottom=pos+row, colorMap={True:'purple'}, force_width=1)
         pos += row
         self.drawSpan(self.spans.get('audio',[]), top=pos, bottom=pos+row, colorMap=AudioSegmentLabel.color_map())
         pos += row
 
-        self.drawSpan(self.spans.get('blank',[]), top=int(row*.3), bottom=pos-int(row*.3), colorMap={True:'black'})
-
+        if 'volume' in self.spans:
+            self.drawVolume(self.spans.get('volume'), top=pos, bottom=pos+row*2, height=row, color='darkblue')
+            pos += row*2
+        
         if self.settype is not None:
             color = SceneType.color_map()[self.settype]
             if color is not None:
                 self.vMaybe = self.mapCanvas.create_rectangle(0, 0, 0, self.map_height, width=0, fill=color, stipple='gray50')
 
         # lastly, add the positional indicator
-        self.vMapPos = self.mapCanvas.create_line(0,0,0,self.map_height,arrow=tk.BOTH,fill='orange')
+        self.vMapPos = self.mapCanvas.create_line(0,0,0,self.map_height,arrow=tk.BOTH,fill='orange',width=1.5)
         self.updatePosIndicators()
 
     def do_tag(self, btnIdx):
