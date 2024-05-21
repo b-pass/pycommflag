@@ -7,9 +7,9 @@ import sys
 from typing import Any,TextIO,BinaryIO
 
 from .feature_span import *
-from . import processor, segmenter
+from . import processor
 
-def flog_to_vecs(flog:dict, seg:segmenter.SceneSegmenter=None)->tuple[list[list[float]], list[list[float]]]:
+def flog_to_vecs(flog:dict)->tuple[list[list[float]], list[list[float]]]:
     version = flog.get('file_version', 10)
     frame_rate = flog.get('frame_rate', 29.97)
     endtime = flog.get('duration', 0)
@@ -121,19 +121,12 @@ def flog_to_vecs(flog:dict, seg:segmenter.SceneSegmenter=None)->tuple[list[list[
         
         data.append(d)
     
-    return (timestamps,data,answers)
+    return (data,answers)
 
-def load_data(opts)->tuple[list,list,list,list,list,list]:
-    n = []
-    x = []
-    y = []
-
-    seg = segmenter.parse(opts.segmeth)
-    print(seg)
-
+def load_data(opts)->tuple[list,list,list,list]:
     data = opts.ml_data
     if not data:
-        return []
+        return None
     
     test = []
 
@@ -151,19 +144,18 @@ def load_data(opts)->tuple[list,list,list,list,list,list]:
                 del data[i]
             else:
                 i += 1
-    
+    x = []
+    y = []
     for f in data:
         if os.path.isdir(f):
             continue
         #print(f)
         flog = processor.read_feature_log(f)
         if flog:
-            (t,a,b) = flog_to_vecs(flog, seg=seg)
-            n += [os.path.basename(f)] * len(a)
+            (a,b) = flog_to_vecs(flog)
             x += a
             y += b
     
-    nt = []
     xt = []
     yt = []
     for f in test:
@@ -172,8 +164,7 @@ def load_data(opts)->tuple[list,list,list,list,list,list]:
         #print(f)
         flog = processor.read_feature_log(f)
         if flog:
-            (t,a,b) = flog_to_vecs(flog, seg=seg)
-            nt += [os.path.basename(f)] * len(a)
+            (a,b) = flog_to_vecs(flog)
             xt += a
             yt += b
     
@@ -182,19 +173,18 @@ def load_data(opts)->tuple[list,list,list,list,list,list]:
     need = int(len(x)/5) - len(xt)
     if need > (len(x)/100):
         print('Need to move',need,'datum to the test/eval set')
-        z = list(zip(n,x,y))
+        z = list(zip(x,y))
         n=x=y=None
         random.shuffle(z)
-        (n,x,y) = zip(*z[need:])
+        (x,y) = zip(*z[need:])
         if len(xt) == 0:
-            (nt,xt,yt) = zip(*z[:need])
+            (xt,yt) = zip(*z[:need])
         else:
-            (a,b,c) = zip(*z[:need])
-            nt += a
-            xt += b
-            yt += c
+            (a,b) = zip(*z[:need])
+            xt += a
+            yt += b
 
-    return (n,x,y,nt,xt,yt)
+    return (np.copy(x),np.copy(y),np.copy(xt),np.copy(yt))
 
 def train(training:tuple, test_answers:list=None, opts:Any=None):
     # imort these here because their imports are slow 
@@ -202,7 +192,7 @@ def train(training:tuple, test_answers:list=None, opts:Any=None):
     import keras
     from keras import layers
 
-    (names,data,answers,test_names,test_data,test_answers) = training
+    (data,answers,test_data,test_answers) = training
 
     DROPOUT = 0.15
 
@@ -211,9 +201,9 @@ def train(training:tuple, test_answers:list=None, opts:Any=None):
     print("Data (x):",len(data)," Test (y):", len(test_data), "; Samples=",nsteps,"; Features=",nfeat)
     inputs = keras.Input(shape=(nsteps,nfeat))
     n = inputs
-    n = layers.LSTM(64, dropout=DROPOUT)(n)
-    #n = layers.LSTM(64, dropout=DROPOUT, return_sequences=True)(n)
-    #n = layers.LSTM(32)(n)
+    #n = layers.LSTM(64, dropout=DROPOUT)(n)
+    n = layers.LSTM(32, dropout=DROPOUT, return_sequences=True)(n)
+    n = layers.LSTM(32)(n)
     outputs = layers.Dense(SceneType.count(), activation='softmax')(n)
     model = keras.Model(inputs, outputs)
     model.summary()
@@ -245,10 +235,10 @@ def train(training:tuple, test_answers:list=None, opts:Any=None):
         #keras.callbacks.EarlyStopping(monitor='loss', patience=500),
         keras.callbacks.EarlyStopping(monitor='categorical_accuracy', patience=500),
     ]
-    if test_answers:
+    if test_answers is not None and len(test_answers) > 0:
         callbacks.append(keras.callbacks.EarlyStopping(monitor='val_categorical_accuracy', patience=500))
     
-    history = model.fit(train_dataset, epochs=5, shuffle=True, callbacks=callbacks, validation_data=test_dataset)
+    history = model.fit(train_dataset, epochs=5, shuffle=False, callbacks=callbacks, validation_data=test_dataset)
 
     print()
     print("Done")
@@ -275,7 +265,7 @@ def predict(feature_log:str|TextIO|dict, opts:Any)->list:
     import keras
 
     flog = processor.read_feature_log(feature_log)
-    (times,data,answers) = flog_to_vecs(flog, segmenter.parse(opts.segmeth))
+    (times,data,answers) = flog_to_vecs(flog)
 
     mf = opts.model_file
     if not mf and opts:

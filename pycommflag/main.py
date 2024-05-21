@@ -7,15 +7,12 @@ from . import gui
 from . import mythtv
 from . import neural
 from . import processor
-from . import segmenter
 
 def run(opts:Any) -> None|int:
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' # shut up, tf
 
     if opts.rebuild or opts.queue:
         os.execvp("mythcommflag", ["mythcommflag"] + sys.argv[1:])
-    
-    segmenter.parse(opts.segmeth) # parse early to detect raised parse exceptions
 
     if opts.train:
         d = neural.load_data(opts)

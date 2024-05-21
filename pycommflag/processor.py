@@ -114,12 +114,9 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
     audioProc = AudioProc(player.frame_rate)
     audioProc.start()
 
-    videoProc = VideoProc(feature_log, player.vt_start, logo, opts)
+    videoProc = VideoProc(player.vt_start, logo, opts)
     videoProc.start()
 
-    feature_log.write(',\n"frames_header":' + videoProc.frame_header())
-    feature_log.write(',\n"frames":[null\n')
-    
     if not opts.quiet: print('\nExtracting features...', end='\r') 
 
     # not doing format/aspect because everything is widescreen all the time now
@@ -149,26 +146,59 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
     audioProc.stop()
 
     videoProc.join()
-    
-    feature_log.write("]")
-    
-    feature_log.write(',\n"logo_span":')
-    feature_log.write(videoProc.logof.to_json())
-    
-    feature_log.write(',\n"blank_span":')
-    feature_log.write(videoProc.blankf.to_json())
-    
-    feature_log.write(',\n"diff_span":')
-    feature_log.write(videoProc.difff.to_json())
-
     audioProc.join()
-    audioProc.fspan.end(player.duration)
 
-    feature_log.write(',\n"audio":')
-    feature_log.write(audioProc.fspan.to_json())
+    frames = videoProc.frames
+    if len(frames) == 0: frames = [[0,0,0,0]]
     
-    feature_log.write(',\n"volume":')
-    feature_log.write(json.dumps(audioProc.rms))
+    audioProc.fspan.end(frames[-1][0])
+
+    # often the video doesn't start a PTS 0 because of avsync issues, back-fill the first video frame
+    # note, assumes time is at frame[0]
+    if frames[0][0] > 0:
+        while True:
+            frames[0:0] = [list(frames[0])] # insert
+            frames[0][0] = round(frames[0][0] - 1/player.frame_rate, 5)
+            if frames[0][0] <= 0.0:
+                frames[0][0] = 0.0
+                break
+    
+    header = videoProc.frame_header()
+    
+    header += ['fvol', 'rvol']
+
+    assert(AudioSegmentLabel.count() == 4)
+    header += ['silence', 'speech', 'music', 'noise']
+
+    sentinel = frames[-1][0]+1
+    
+    # normalize with the max volume of the whole recording
+    vscale = np.max(np.array(audioProc.rms)[..., 1:3])
+    vit = iter(audioProc.rms)
+    volume = next(vit, (sentinel,0,0))
+
+    ait = iter(audioProc.fspan.to_list())
+    audio = next(ait, (AudioSegmentLabel.SILENCE,(0,sentinel)))
+    
+    for frame in frames:
+        ft = frame[0]
+        
+        # mark up each frame with the calculated audio type and volume level
+        while ft > volume[0]:
+            volume = next(vit, (sentinel,0,0))
+        frame += [volume[1]/vscale, volume[2]/vscale]
+    
+        # convert audio to one-hot and then add it
+        while ft >= audio[1][1]:
+            audio = next(ait, (AudioSegmentLabel.SILENCE,(0,sentinel)))
+        x = [0] * AudioSegmentLabel.count()
+        x[audio[0].value if ft >= audio[1][0] else AudioSegmentLabel.SILENCE.value] = 1
+        frame += x
+
+    feature_log.write(',\n"frames_header":')
+    json.dump(header, feature_log)
+    feature_log.write(',\n"frames":')
+    json.dump(frames, feature_log)
     
     if die:
         feature_log.write("\n\n,\"EARLY_STOP_TRUNCATION\":true")
@@ -184,24 +214,17 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
         print('Extraction complete           ')
 
 class VideoProc(Thread):
-    def __init__(self, feature_log, vt_start, logo, opts):
+    def __init__(self, vt_start, logo, opts):
         super().__init__(name="videoProc")
         self.queue = Queue(150)
         self.go = True
-        self.feature_log = feature_log
         self.vt_start = vt_start
         self.fcount = 0
         self.logo = logo
         self.opts = opts
         self.prev_col = None
-        
         self.lasttime = 0
-        self.logof = FeatureSpan()
-        self.logof.start(0,False)
-        self.blankf = FeatureSpan()
-        self.blankf.start(0,True)
-        self.difff = SeparatorFeatureSpan()
-        self.difff.start(0,True)
+        self.frames = []
 
     def stop(self):
         self.go = False
@@ -217,10 +240,6 @@ class VideoProc(Thread):
                 if self.queue.empty():
                     if not self.go:
                         break
-        
-        self.logof.end(self.lasttime)
-        self.blankf.end(self.lasttime)
-        self.difff.end(self.lasttime)
 
     def add_frame(self, frame):
         fcolor = frame.to_ndarray(format="rgb24")#, height=720, width=frame.width*(720/frame.height))
@@ -253,15 +272,11 @@ class VideoProc(Thread):
             frame_blank = False
 
         self.lasttime = round(frame.time-self.vt_start,5)
-        self.logof.add(self.lasttime, logo_present)
-        self.blankf.add(self.lasttime, frame_blank)
-        self.difff.add(self.lasttime, is_diff)
-        self.feature_log.write(
-            f",[{self.lasttime},{int(logo_present)},{int(frame_blank)},{int(is_diff)}]\n"
-        )
+        self.frames.append([self.lasttime, int(logo_present), int(frame_blank), int(is_diff)])
+        #f",[{self.lasttime},{int(logo_present)},{int(frame_blank)},{int(is_diff)}]\n"
     
     def frame_header(self):
-        return '["time","logo_present","is_blank","is_diff"]'
+        return ["time","logo_present","is_blank","is_diff"]
 
 def mean_axis1_float_uint8(fcolor:np.ndarray)->np.ndarray:
     # the below code is equivalent to:
@@ -416,52 +431,11 @@ class AudioProc(Thread):
 def reprocess(feature_log_filename:str, opts:Any=None) -> dict:
     if feature_log_filename is None:
         raise Exception('missing feature_log_filename')
-    flog = read_feature_log(feature_log_filename)
-
-    lasttime = 0
-    logof = FeatureSpan()
-    logof.start(0,False)
-    blankf = FeatureSpan()
-    blankf.start(0,True)
-    difff = SeparatorFeatureSpan()
-    difff.start(0,True)
-
-    for f in flog['frames']:
-        if f is None:
-            continue
-
-        lasttime = f[0]
-        logof.add(lasttime,f[1])
-        blankf.add(lasttime, f[2])
-        difff.add(lasttime, f[3])
-    
-    logof.end(lasttime)
-    blankf.end(lasttime)
-    difff.end(lasttime)
-
-    audiof = AudioFeatureSpan()
-    audiof.start()
-    for (t,b,e) in read_audio(flog):
-        audiof.add(b,e,t)
-    audiof.end(lasttime)
-    
-    flog['logo_span'] = logof.to_list()
-    flog['blank_span'] = blankf.to_list()
-    flog['diff_span'] = difff.to_list()
-    flog['audio'] = audiof.to_list(serializable=True)
-
-    write_feature_log(flog, feature_log_filename)
-
-    return flog
+    # deprecated?
+    return read_feature_log(feature_log_filename)
 
 def read_logo(log_in:str|TextIO|dict) -> None|tuple:
     return logo_finder.from_json(read_feature_log(log_in).get('logo', None))
-
-def read_audio(log_f:str|TextIO|dict) -> list[tuple]:
-    audiof = AudioFeatureSpan()
-    audiof.from_json(read_feature_log(log_f)['audio'], AudioSegmentLabel)
-
-    return [(x,y,z) for (x,(y,z)) in audiof.to_list()]
 
 def read_tags(log_f:str|TextIO|dict):
     return read_feature_log(log_f).get('tags', [])
@@ -469,27 +443,42 @@ def read_tags(log_f:str|TextIO|dict):
 def read_feature_spans(log:str|TextIO|dict) -> dict[str, FeatureSpan]:
     log = read_feature_log(log)
 
-    if 'audio' not in log:
-        return {}
-
     audiof = AudioFeatureSpan()
-    audiof.from_json(log['audio'], AudioSegmentLabel)
-
+    audiof.start()
     logof = FeatureSpan()
-    logof.from_json(log['logo_span'], bool)
-    
+    logof.start(0,False)
     blankf = FeatureSpan()
-    blankf.from_json(log['blank_span'], bool)
-    
+    blankf.start(0,True)
     difff = SeparatorFeatureSpan()
-    difff.from_json(log['diff_span'], bool)
+    difff.start(0,True)
+    volume = []
+    
+    lasttime = 0
+    lab = AudioSegmentLabel.SILENCE
+
+    for f in log['frames']:
+        audiof.add(lasttime, f[0], lab)
+        
+        lasttime = f[0]
+        logof.add(lasttime,f[1])
+        blankf.add(lasttime, f[2])
+        difff.add(lasttime, f[3])
+        volume.append((lasttime, f[4], f[5]))
+        for i in range(AudioSegmentLabel.count()):
+            if f[6+i]:
+                lab = AudioSegmentLabel(i)
+    
+    logof.end(lasttime)
+    blankf.end(lasttime)
+    difff.end(lasttime)
+    audiof.end(lasttime)
 
     return {
         'logo':logof.to_list(),
         'blank':blankf.to_list(),
         'diff':difff.to_list(),
         'audio':audiof.to_list(),
-        'volume':log.get('volume',None),
+        'volume':volume,
     }
 
 def guess_external_breaks(opts:Any)->list:

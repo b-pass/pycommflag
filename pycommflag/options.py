@@ -50,10 +50,6 @@ def get_options():
                   help="Path to use for models (output for training, input for infrencing)")
     ml.add_argument('--model', dest='model_file', default='',
                   help="Path to model to use for inference/prediction")
-    ml.add_argument('--segmenter', dest='segmeth', default='blank|(diff&audio)',
-                    help="Scene segmentation instruction; split video into scenes using the demuxers.\n"+
-                         "Plus/Amp to AND them, comma/pipe to OR them.\n"+
-                         "Segmenters: logo,silence,audio,blank,diff")
     parser.add_argument_group(ml)
     
     mcf = parser.add_argument_group('MythTV Options', description="Commandline compatibility with mythcommflag")

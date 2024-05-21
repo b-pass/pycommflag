@@ -122,7 +122,7 @@ def set_breaks(chanid, starttime, marks)->None:
         
         for (st,(b,e)) in marks:
             print(st,b,e)
-            if st not in [st == SceneType.COMMERCIAL,SceneType.COMMERCIAL.value]:
+            if st not in [SceneType.COMMERCIAL, SceneType.COMMERCIAL.value]:
                 # TODO: other tag types (intro, outro, etc)?? are they chapters? commercials?
                 continue
             c.execute("SELECT `offset`,mark FROM recordedseek "\
@@ -135,6 +135,7 @@ def set_breaks(chanid, starttime, marks)->None:
             for (o,m) in c.fetchall():
                 break
             fb = int(m) + round((b - float(o)/1000) * rate)
+            if fb < 0: fb = 0
 
             c.execute("SELECT `offset`,mark FROM recordedseek "\
                       "WHERE chanid = %s AND starttime = %s AND type = 33 "\
