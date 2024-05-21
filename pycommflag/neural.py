@@ -37,174 +37,89 @@ def flog_to_vecs(flog:dict, seg:segmenter.SceneSegmenter=None)->tuple[list[list[
                     tags[ti] = (tt, (half, te))
                 elif fixe and not fixb:
                     tags[ti] = (tt, (tags[ti][1][0], half))
-
-    feat_info = [('audio','faudio'),('logo_span','logo_present'),('blank_span','is_blank'),('diff_span','is_diff')]
-
-    # put all the features in a flat array
-    flat = []
-    for (fn,pn) in feat_info:
-        for (v,(b,e)) in flog.get(fn, []):
-            flat.append({'ftime':b, pn:v})
-    # sort if by time
-    flat.sort(key=lambda x: x['ftime'])
-    # combine features if they have the same timestamp
-    i = 0
-    while i+1 < len(flat):
-        if (flat[i+1]['ftime'] - flat[i]['ftime']) <= (0.5/frame_rate):
-            nope = False
-            for k in flat[i].keys():
-                if k != 'ftime' and k in flat[i+1]:
-                    nope = True
-                    break
-            if not nope:
-                del flat[i+1]['ftime']
-                flat[i].update(flat[i+1])
-                del flat[i+1]
-                continue
-        i += 1
     
-    # mark up each frame with the calculated audio type
-    if 'audio' not in flog['frame_header']:
-        flog['frame_header'].append('audio')
-        ftime = flog['frame_header'].find('ftime')
-        ait = iter(flog['audio'])
-        audio = next(ait, (0,(0,endtime+1)))
-        for frame in flog['frames']:
-            while frame[ftime] >= audio[1][1]:
-                audio = next(audio, (0,(0,endtime+1)))
-            if frame[ftime] < audio[1][0]:
-                frame.append(AudioSegmentLabel.SILENCE.value)
-            else:
-                frame.append(audio[0])
+    frames = flog['frames']
+    if frames[0] is None: frames.pop(0)
 
+    frames_header = flog['frames_header']
+    assert(frames_header[0] == 'time')
+
+    # often the video doesn't start a PTS 0 because of sync issues, back-fill the first video frame
+    # note, assumes time is at frame[0]
+    if frames[0][0] > 0:
+        while True:
+            frames[0:0] = [list(frames[0])] # insert
+            frames[0][0] = round(frames[0][0] - 1/frame_rate, 5)
+            if frames[0][0] <= 0.0:
+                frames[0][0] = 0.0
+                break
     
-    # now segment based on features and record the timestamps of each segment
-    value = {'ftime':'0','faudio':AudioSegmentLabel.SILENCE,'logo_present':False,'is_blank':True,'is_diff':False}
+    # mark up each frame with the calculated audio type and volume level
+    ######## if 'audio' not in frames_header:
+    # normalize with the max volume of the whole recording
+    if 'volume' in flog and 'volume' not in frames_header:
+        vscale = np.max(np.array(flog['volume'])[...,1:3])
+        vit = iter(flog['volume'])
+        volume = next(vit, (0,0,0))
+        
+        for frame in frames:
+            ft = frame[0]
+            while ft >= volume[0]+0.00001:
+                volume = next(vit, (endtime+1,0,0))
+            frame += [volume[1]/vscale, volume[2]/vscale]
+    
+    # convert audio to one-hot and then add it
+    ait = iter(flog['audio'])
+    audio = next(ait, (0,(0,endtime+1)))
+    for frame in frames:
+        ft = frame[0]
+        while ft >= audio[1][1]:
+            audio = next(ait, (0,(0,endtime+1)))
+        av = audio[0] if ft >= audio[1][0] else AudioSegmentLabel.SILENCE.value
+        x = [0] * AudioSegmentLabel.count()
+        x[int(av)] = 1
+        frame += x
+
+    # normalize time values on a 30-minute scale
+    # save the real timestamps though
     timestamps = []
-    for x in flat:
-        value.update(x)
-        if seg.check(**value):
-            timestamps.append(value['ftime'])
-    
-    # get rid of any empty 0 timestamps at the start
-    while timestamps[0] == 0.0:
-        timestamps.pop(0)
-    # the upper bound
-    timestamps.append(endtime)
-    
-    data = []
-    for _ in range(len(timestamps)):
-        data.append([0] * (AudioSegmentLabel.count() + 2))
-
-    # Save duration of each audio type
-    didx = 0
-    for (v,(b,e)) in flog.get('audio',[]):
-        while didx < len(timestamps) and b - 0.5/frame_rate > timestamps[didx]:
-            didx += 1
-        if didx >= len(timestamps): didx = len(timestamps)-1
-        #print(v,b,e,didx,timestamps[didx])
-        fi = v if type(v) is int else v.value
-        data[didx][fi] += min(e,timestamps[didx]) - b
-        for j in range(didx+1,len(timestamps)):
-            if e <= timestamps[j-1]:
-                break
-            data[j][fi] += min(e,timestamps[j]) - timestamps[j-1]
-            #print('X',timestamps[j-1],min(e,timestamps[j]),j,timestamps[j])
-
-    # count the diffs
-    didx = 0
-    for (v,(b,e)) in flog.get('diff_span',[]):
-        while didx < len(timestamps) and b - 0.5/frame_rate > timestamps[didx]:
-            didx += 1
-        if didx >= len(timestamps): didx = len(timestamps)-1
-        data[didx][AudioSegmentLabel.count()+0] += 1
-    
-    # sum the logo time
-    didx = 0
-    for (v,(b,e)) in flog.get('logo_span',[]):
-        if not v:
-            continue
-        while didx < len(timestamps) and b - 0.5/frame_rate > timestamps[didx]:
-            didx += 1
-        if didx >= len(timestamps): didx = len(timestamps)-1
+    for f in frames:
+        timestamps.append(f[0])
+        f[0] = (f[0] % 1800) / 1800.0
         
-        data[didx][AudioSegmentLabel.count()+1] += min(e,timestamps[didx]) - b
-        for j in range(didx+1,len(timestamps)):
-            if e <= timestamps[j-1]:
-                break
-            data[j][AudioSegmentLabel.count()+1] += min(e,timestamps[j]) - timestamps[j-1]
-
-    # now associate labels/tags with the segments we have identified (based on timestamps)
+    # convert tag to a one-hot and then add it
     answers = []
-    dstart = 0
-    prev_tag = SceneType.COMMERCIAL.value
-    prev_end = 0
-    delete_me = []
-    for (dend,d) in zip(timestamps,data):
-        ddur = dend - dstart
-        time_since = dstart - prev_end
-        for i in range(len(d)):
-            d[i] = d[i] / ddur if d[i] > 0 else 0.0
-        d.append(min(ddur/300,1.0)) # length indicator
-        d.append((dstart%1800)/1800.0) # position indicator
-        d.append((dend%1800)/1800.0) # end position indicator
-        if d[-1] < d[-2]: d[-1] = 1.0 # position wrap
-        d.append(min(time_since/300,1.0))
+    tit = iter(tags)
+    tag = next(tit, (SceneType.UNKNOWN, (0, endtime+1)))
+    for f in frames:
+        while f[0] >= tag[1][1]:
+            tag = next(tit, (SceneType.UNKNOWN, (0, endtime+1)))
+        tt = tag[0] if f[0] >= tag[1][0] else SceneType.UNKNOWN
+        x = [0] * SceneType.count()
+        x[tt if type(tt) is int else tt.value] = 1
+        answers.append(x)
 
-        oh = [0]*SceneType.count()
-        oh[prev_tag if type(prev_tag) is int else prev_tag.value] = 1.0
-        d += oh # basic recurrent NN, this is the answer from the previous sample
+    window = 1.0
 
-        next_tag = None
-        for (tt,(tb,te)) in tags:
-            if dstart >= te or dend <= tb:
-                continue # tag doesn't overlap segment
-            
-            if ddur > 1 and (dstart + ddur/10 < tb or dend-ddur/10 > te):
-                #print(dstart,dend,"mostly outside of tag",tt,"which is at",tb,te," -- ignoring the tag")
-                continue
-            if next_tag is not None:
-                if dstart + ddur/2 >= te:
-                    #print(dstart,dend,"straddles tag",tt,"which is at",tb,te," -- but not using it")
-                    break
-                #else: print(dstart,dend,"straddles tag",tt,"which is at",tb,te," -- overwriting", next_tag)
-            next_tag = tt
-            #print(dstart,dend,"matches tag",tt,"which is at",tb,te)
-        if next_tag is None:
-            next_tag = SceneType.UNKNOWN
-            #print("missing next tag at",tstart,tend)
+    need = int((window * 29) / 2)
+    skip = max(1,int(frame_rate / 30))
+    data = []
+    for i in range(len(frames)):
+        d = []
+        # near the beginning, fill with repeats from first frame in order to get to the correct size
+        extra = need - i//skip 
+        if extra > 0:
+            d += [frames[0]] * extra
+        d += frames[i - need : i+need+1 : skip]
         
-        if prev_tag != next_tag and dstart:
-            prev_end = dend
+        # TODO: should we include the answers from the previous frames? 
+        # if we did, we'd need to carefully set the future one-hots to be all zero, i guess.
 
-        if next_tag == SceneType.DO_NOT_USE or next_tag == SceneType.DO_NOT_USE.value:
-            delete_me.append(dend)
-            answers.append(None)
-        else:
-            oh = [0]*SceneType.count()
-            oh[next_tag if type(next_tag) is int else next_tag.value] = 1.0
-            answers.append(oh)
-            prev_tag = next_tag
-        dstart = dend
-    
-    for d in reversed(delete_me):
-        for i in range(len(timestamps)):
-            if timestamps[i] == d:
-                del timestamps[i]
-                del data[i]
-                del answers[i]
-                break
-
-    # also, a paradoxical future NN, also include the next sample's information
-    #for i in range(len(data)-1):
-    #    data[i][-SceneType.count():-SceneType.count()] = data[i+1][:-SceneType.count()]
-    # just repeat the last sample in this case to keep the tensor square
-    #data[-1][-SceneType.count():-SceneType.count()] = data[-1][:-SceneType.count()]
-    
-    #pt = 0
-    #for (t,x,a) in zip(timestamps,data,answers):
-    #    print(a,pt,t,len(x),x)
-    #    pt = t
+        extra = need*2+1 - len(d)
+        if extra > 0:
+            d += [frames[-1]] * extra
+        
+        data.append(d)
     
     return (timestamps,data,answers)
 
@@ -265,15 +180,19 @@ def load_data(opts)->tuple[list,list,list,list,list,list]:
     import random
     random.seed(time.time())
     need = int(len(x)/5) - len(xt)
-    while need > 0:
-        need -= 1
-        i = random.randint(0,len(x)-1)
-        nt.append(n[i])
-        xt.append(x[i])
-        yt.append(y[i])
-        del n[i]
-        del x[i]
-        del y[i]
+    if need > (len(x)/100):
+        print('Need to move',need,'datum to the test/eval set')
+        z = list(zip(n,x,y))
+        n=x=y=None
+        random.shuffle(z)
+        (n,x,y) = zip(*z[need:])
+        if len(xt) == 0:
+            (nt,xt,yt) = zip(*z[:need])
+        else:
+            (a,b,c) = zip(*z[:need])
+            nt += a
+            xt += b
+            yt += c
 
     return (n,x,y,nt,xt,yt)
 
@@ -285,28 +204,23 @@ def train(training:tuple, test_answers:list=None, opts:Any=None):
 
     (names,data,answers,test_names,test_data,test_answers) = training
 
-    print("Data (x):",len(data)," Test (y):", len(test_data))
-
     DROPOUT = 0.15
 
-    nfeat = len(data[0])
-    inputs = keras.Input(shape=(nfeat,))
+    nsteps = len(data[0])
+    nfeat = len(data[0][0])
+    print("Data (x):",len(data)," Test (y):", len(test_data), "; Samples=",nsteps,"; Features=",nfeat)
+    inputs = keras.Input(shape=(nsteps,nfeat))
     n = inputs
-    if DROPOUT > 0: n = layers.Dropout(DROPOUT)(n)
-    n = layers.Dense(nfeat, activation='linear')(n)
-    # don't know which activation to use? no problem, just use them all
-    n = layers.Dense(nfeat, activation='sigmoid')(n)
-    #if DROPOUT > 0: n = layers.Dropout(DROPOUT)(n)
-    #n = layers.Dense(nfeat, activation='tanh')(n)
-    if DROPOUT > 0: n = layers.Dropout(DROPOUT)(n)
-    n = layers.Dense(nfeat, activation='relu')(n)
+    n = layers.LSTM(64, dropout=DROPOUT)(n)
+    #n = layers.LSTM(64, dropout=DROPOUT, return_sequences=True)(n)
+    #n = layers.LSTM(32)(n)
     outputs = layers.Dense(SceneType.count(), activation='softmax')(n)
     model = keras.Model(inputs, outputs)
     model.summary()
 
     model.compile(optimizer="adam", loss="categorical_crossentropy", metrics=['categorical_accuracy', 'mean_squared_error'])
 
-    batch_size = opts.tf_batch_size if opts else 1000
+    batch_size = opts.tf_batch_size if opts else 500
     train_dataset = tf.data.Dataset.from_tensor_slices((data, answers)).batch(batch_size)
     test_dataset = tf.data.Dataset.from_tensor_slices((test_data, test_answers)).batch(batch_size)
     
@@ -334,7 +248,7 @@ def train(training:tuple, test_answers:list=None, opts:Any=None):
     if test_answers:
         callbacks.append(keras.callbacks.EarlyStopping(monitor='val_categorical_accuracy', patience=500))
     
-    history = model.fit(train_dataset, epochs=5000, shuffle=True, callbacks=callbacks, validation_data=test_dataset)
+    history = model.fit(train_dataset, epochs=5, shuffle=True, callbacks=callbacks, validation_data=test_dataset)
 
     print()
     print("Done")

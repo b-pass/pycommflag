@@ -370,6 +370,8 @@ class AudioProc(Thread):
             for (st,sm,ss) in segments:
                 # check for a hole, fill with zeros if needed
                 missing = int(round((st - nexttime)*16000))
+                nexttime = st + len(sm)/16000
+                
                 if missing > 0:
                     sm = np.append(sm, np.zeros(missing, 'float32'))
 
@@ -381,11 +383,9 @@ class AudioProc(Thread):
                 
                 main = np.append(main, sm)
                 surr = np.append(surr, ss)
-
-                nexttime = st + len(sm)/16000
             
             # now chunk into "work_rate" sized pieces and work on them individually
-            while len(main) >= work_unit or (done and len(main) > 0):
+            while len(main) >= work_unit or (done and len(main) > 8000):
                 assert(len(main) == len(surr))
 
                 # slice the time
