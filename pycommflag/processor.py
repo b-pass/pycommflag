@@ -101,6 +101,7 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
     feature_log.write(',\n"logo":')
     feature_log.write(logo_finder.to_json(logo))
 
+    start = time.time()
     fcount = 0
     ftotal = int(player.duration * player.frame_rate)
 
@@ -130,7 +131,9 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
         if p >= report:
             ro = rt
             rt = time.perf_counter()
-            print("Extracting, %5.1f%% (%5.1f fps)           " % (min(fcount/percent,100.0), p/(rt - ro)), end='\r')
+            perc = min(fcount/percent,100.0)
+            timeleft = round( (100.0 - perc) * ((time.time() - start) / perc) )+1
+            print("Extracting, %5.1f%% @%5.1f fps, %4d seconds left               " % (perc, p/(rt - ro), timeleft), end='\r')
             #gc.collect()
             p = 0
         if fcount%audio_interval == 0:
@@ -150,7 +153,7 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
 
     frames = videoProc.frames
     if len(frames) == 0: frames = [[0,0,0,0]]
-    
+
     audioProc.fspan.end(frames[-1][0])
 
     # often the video doesn't start a PTS 0 because of avsync issues, back-fill the first video frame
@@ -186,7 +189,7 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
         # mark up each frame with the calculated audio type and volume level
         while ft > volume[0]:
             volume = next(vit, (sentinel,0,0))
-        frame += [volume[1]/vscale, volume[2]/vscale]
+        frame += [round(float(volume[1]/vscale),6), round(float(volume[2]/vscale),6)]
     
         # convert audio to one-hot and then add it
         while ft >= audio[1][1]:
@@ -253,10 +256,10 @@ class VideoProc(Thread):
         column = mean_axis1_float_uint8(fcolor).astype('int16')
         if self.prev_col is not None:
             diff = column - self.prev_col
-            scm = np.mean(np.std(np.abs(diff), (0)))
-            is_diff = scm >= self.opts.diff_threshold 
+            diff = np.mean(np.std(np.abs(diff), (0)))
+            #is_diff = diff >= self.opts.diff_threshold 
         else:
-            is_diff = False
+            diff = 0
         self.prev_col = column
 
         # trying to be fast, just look at the middle 1/4 for blank-ish-ness and then verify with the full frame
@@ -272,11 +275,11 @@ class VideoProc(Thread):
             frame_blank = False
 
         self.lasttime = round(frame.time-self.vt_start,5)
-        self.frames.append([self.lasttime, int(logo_present), int(frame_blank), int(is_diff)])
+        self.frames.append([self.lasttime, int(logo_present), int(frame_blank), round(diff, 6)])
         #f",[{self.lasttime},{int(logo_present)},{int(frame_blank)},{int(is_diff)}]\n"
     
     def frame_header(self):
-        return ["time","logo_present","is_blank","is_diff"]
+        return ["time","logo_present","is_blank","diff"]
 
 def mean_axis1_float_uint8(fcolor:np.ndarray)->np.ndarray:
     # the below code is equivalent to:
@@ -414,7 +417,7 @@ class AudioProc(Thread):
                     if rt > self.rms[-1][0]:
                         mrms = math.sqrt(np.mean(np.square(mwork[x-vwnd:x])))
                         srms = math.sqrt(np.mean(np.square(swork[x-vwnd:x])))
-                        self.rms.append((round(rt,5), round(mrms,5), round(srms,5)))
+                        self.rms.append((round(rt,5), mrms, srms))
                     x += vwnd//2
                     rt += self.volume_window/2
                 
@@ -458,11 +461,11 @@ def read_feature_spans(log:str|TextIO|dict) -> dict[str, FeatureSpan]:
 
     for f in log['frames']:
         audiof.add(lasttime, f[0], lab)
-        
+
         lasttime = f[0]
         logof.add(lasttime,f[1])
         blankf.add(lasttime, f[2])
-        difff.add(lasttime, f[3])
+        difff.add(lasttime, f[3] >= 15.0)
         volume.append((lasttime, f[4], f[5]))
         for i in range(AudioSegmentLabel.count()):
             if f[6+i]:

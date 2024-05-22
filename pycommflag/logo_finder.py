@@ -40,12 +40,12 @@ def search(player:Player, search_beginning:bool=False, opts:Any=None) -> tuple|N
             continue
         elif p >= report:
             p = 0
-            print("Searching, %3.1f%%    " % (min(fcount/percent,100.0)), end='\r')
+            print("Logo Searching, %3.1f%%    " % (min(fcount/percent,100.0)), end='\r')
         data = _gray(frame)
         logo_sum += scipy.ndimage.sobel(data) > _LOGO_EDGE_THRESHOLD
         fcount += 1
     
-    if not opts.quiet: print("Searching is complete.\n")
+    if not opts.quiet: print("Logo Searching is complete.\n")
 
     # overscan, ignore 3% on each side
     logo_sum[:math.ceil(player.shape[0]*.03)] = 0

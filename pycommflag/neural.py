@@ -9,7 +9,7 @@ from typing import Any,TextIO,BinaryIO
 from .feature_span import *
 from . import processor
 
-def flog_to_vecs(flog:dict)->tuple[list[list[float]], list[list[float]]]:
+def flog_to_vecs(flog:dict)->tuple[list[float], list[list[float]], list[list[float]]]:
     version = flog.get('file_version', 10)
     frame_rate = flog.get('frame_rate', 29.97)
     endtime = flog.get('duration', 0)
@@ -69,25 +69,20 @@ def flog_to_vecs(flog:dict)->tuple[list[list[float]], list[list[float]]]:
             frame += [volume[1]/vscale, volume[2]/vscale]
     
     # convert audio to one-hot and then add it
-    ait = iter(flog['audio'])
-    audio = next(ait, (0,(0,endtime+1)))
-    for frame in frames:
-        ft = frame[0]
-        while ft >= audio[1][1]:
-            audio = next(ait, (0,(0,endtime+1)))
-        av = audio[0] if ft >= audio[1][0] else AudioSegmentLabel.SILENCE.value
-        x = [0] * AudioSegmentLabel.count()
-        x[int(av)] = 1
-        frame += x
+    if 'audio' in flog and 'silent' not in frames_header:
+        ait = iter(flog['audio'])
+        audio = next(ait, (0,(0,endtime+1)))
+        for frame in frames:
+            ft = frame[0]
+            while ft >= audio[1][1]:
+                audio = next(ait, (0,(0,endtime+1)))
+            av = audio[0] if ft >= audio[1][0] else AudioSegmentLabel.SILENCE.value
+            x = [0] * AudioSegmentLabel.count()
+            x[int(av)] = 1
+            frame += x
 
-    # normalize time values on a 30-minute scale
-    # save the real timestamps though
-    timestamps = []
-    for f in frames:
-        timestamps.append(f[0])
-        f[0] = (f[0] % 1800) / 1800.0
-        
     # convert tag to a one-hot and then add it
+    diff_max = 0.0
     answers = []
     tit = iter(tags)
     tag = next(tit, (SceneType.UNKNOWN, (0, endtime+1)))
@@ -95,14 +90,34 @@ def flog_to_vecs(flog:dict)->tuple[list[list[float]], list[list[float]]]:
         while f[0] >= tag[1][1]:
             tag = next(tit, (SceneType.UNKNOWN, (0, endtime+1)))
         tt = tag[0] if f[0] >= tag[1][0] else SceneType.UNKNOWN
+        if type(tt) is not int: tt = tt.value
+        if tt == SceneType.DO_NOT_USE.value:
+            # truncate right here
+            if len(answers) < len(frames):
+                frames = frames[:len(answers)]
+            break
         x = [0] * SceneType.count()
         x[tt if type(tt) is int else tt.value] = 1
         answers.append(x)
+        diff_max = max(diff_max, f[3])
+    
+    if diff_max == 0:
+        diff_max = 1e-7
+    timestamps = []
+    for f in frames:
+        # save the real timestamps
+        timestamps.append(f[0])
+        
+        # normalize time values on a 30-minute scale
+        f[0] = (f[0] % 1800) / 1800.0
 
-    window = 1.0
+        # normalize the diffs to a range
+        f[3] = f[3] / diff_max
+    
+    window = 2.0
 
     need = int((window * 29) / 2)
-    skip = max(1,int(frame_rate / 30))
+    skip = max(1,int(frame_rate / 29))
     data = []
     for i in range(len(frames)):
         d = []
@@ -110,7 +125,8 @@ def flog_to_vecs(flog:dict)->tuple[list[list[float]], list[list[float]]]:
         extra = need - i//skip 
         if extra > 0:
             d += [frames[0]] * extra
-        d += frames[i - need : i+need+1 : skip]
+        
+        d += frames[i - need*skip : i+need*skip+1 : skip]
         
         # TODO: should we include the answers from the previous frames? 
         # if we did, we'd need to carefully set the future one-hots to be all zero, i guess.
@@ -121,7 +137,7 @@ def flog_to_vecs(flog:dict)->tuple[list[list[float]], list[list[float]]]:
         
         data.append(d)
     
-    return (data,answers)
+    return (timestamps,data,answers)
 
 def load_data(opts)->tuple[list,list,list,list]:
     data = opts.ml_data
@@ -152,7 +168,7 @@ def load_data(opts)->tuple[list,list,list,list]:
         #print(f)
         flog = processor.read_feature_log(f)
         if flog:
-            (a,b) = flog_to_vecs(flog)
+            (_,a,b) = flog_to_vecs(flog)
             x += a
             y += b
     
@@ -164,13 +180,13 @@ def load_data(opts)->tuple[list,list,list,list]:
         #print(f)
         flog = processor.read_feature_log(f)
         if flog:
-            (a,b) = flog_to_vecs(flog)
+            (_,a,b) = flog_to_vecs(flog)
             xt += a
             yt += b
     
     import random
     random.seed(time.time())
-    need = int(len(x)/5) - len(xt)
+    need = int(len(x)/4) - len(xt)
     if need > (len(x)/100):
         print('Need to move',need,'datum to the test/eval set')
         z = list(zip(x,y))
@@ -194,21 +210,27 @@ def train(training:tuple, test_answers:list=None, opts:Any=None):
 
     (data,answers,test_data,test_answers) = training
 
-    DROPOUT = 0.15
+    sums = np.sum((np.sum(answers, axis=0), np.sum(test_answers, axis=0)), axis=0)
+    weights = [1] * len(sums)
+    weights[SceneType.SHOW.value] = sums[SceneType.COMMERCIAL.value] / sums[SceneType.SHOW.value]
+    weights[SceneType.COMMERCIAL.value] = sums[SceneType.SHOW.value] / sums[SceneType.COMMERCIAL.value]
+    print("Loss Weights",weights)
+
+    DROPOUT = 0#.1
 
     nsteps = len(data[0])
     nfeat = len(data[0][0])
     print("Data (x):",len(data)," Test (y):", len(test_data), "; Samples=",nsteps,"; Features=",nfeat)
     inputs = keras.Input(shape=(nsteps,nfeat))
     n = inputs
-    #n = layers.LSTM(64, dropout=DROPOUT)(n)
-    n = layers.LSTM(32, dropout=DROPOUT, return_sequences=True)(n)
-    n = layers.LSTM(32)(n)
+    n = layers.LSTM(128, dropout=DROPOUT)(n)
+    #n = layers.LSTM(32, dropout=DROPOUT, return_sequences=True)(n)
+    #n = layers.LSTM(16)(n)
     outputs = layers.Dense(SceneType.count(), activation='softmax')(n)
     model = keras.Model(inputs, outputs)
     model.summary()
 
-    model.compile(optimizer="adam", loss="categorical_crossentropy", metrics=['categorical_accuracy', 'mean_squared_error'])
+    model.compile(optimizer="adam", loss="categorical_crossentropy", loss_weights=weights, metrics=['categorical_accuracy', 'mean_squared_error'])
 
     batch_size = opts.tf_batch_size if opts else 500
     train_dataset = tf.data.Dataset.from_tensor_slices((data, answers)).batch(batch_size)
@@ -238,7 +260,7 @@ def train(training:tuple, test_answers:list=None, opts:Any=None):
     if test_answers is not None and len(test_answers) > 0:
         callbacks.append(keras.callbacks.EarlyStopping(monitor='val_categorical_accuracy', patience=500))
     
-    history = model.fit(train_dataset, epochs=5, shuffle=False, callbacks=callbacks, validation_data=test_dataset)
+    model.fit(train_dataset, epochs=15, shuffle=False, callbacks=callbacks, validation_data=test_dataset)
 
     print()
     print("Done")
@@ -265,7 +287,15 @@ def predict(feature_log:str|TextIO|dict, opts:Any)->list:
     import keras
 
     flog = processor.read_feature_log(feature_log)
+    duration = flog.get('duration', 0)
+    frame_rate = flog.get('frame_rate', 29.97)
+    spans = processor.read_feature_spans(flog)
+    
+    assert(flog['frames'][-1][0] > frame_rate)
+
     (times,data,answers) = flog_to_vecs(flog)
+    flog = None # flog has been MODIFIED do not save it over the original!
+    assert(len(times) == len(data))
 
     mf = opts.model_file
     if not mf and opts:
@@ -274,32 +304,38 @@ def predict(feature_log:str|TextIO|dict, opts:Any)->list:
         raise Exception(f"Model file '{mf}' does not exist")
     model:tf.keras.Model = keras.models.load_model(mf)
 
-    frame_rate = flog.get('frame_rate', 29.97)
-    results = []
-    prev = [0] * SceneType.count()
-    prev[SceneType.COMMERCIAL.value] = 1.0
-    prevtime = 0
-    change = 0
-    prevans = SceneType.COMMERCIAL.value
-    for (when,entry) in zip(times,data):
-        entry[-(SceneType.count()+1)] = min((prevtime - change)/300,1.0)
-        entry[-len(prev):] = prev
+    results = [(0,(0,0))]
+    result = model.predict(np.copy(data), verbose=True)
+    result = np.argmax(result, axis=1)
+    for i in range(len(result)):
+        when = times[i]
+        ans = int(result[i])
+        results[-1] = (results[-1][0], (results[-1][1][0], when))
+        if ans != results[-1][0]:
+            results.append((ans, (when, when)))
+    results[-1] = (results[-1][0], (results[-1][1][0], duration))
 
-        result = model.predict([entry], verbose=False)[0].tolist()
-        ans = 0
-        #print(result)
-        for i in range(len(result)):
-            if result[i] >= result[ans]:
-                ans = i
-        if ans != SceneType.UNKNOWN.value:
-            results.append((ans, (prevtime,when)))
-        if ans != prevans and prevtime:
-            change = when
-        
-        prevtime = when
-        prev = result
-        prevans = ans
+    i = 0
+    while i < len(results):
+        if results[i][0] != SceneType.COMMERCIAL.value:
+            del results[i]
+        else:
+            i += 1
     
+    print(f'\n\nInitial n={len(results)}:')
+    print(results)
+
+    i = 0
+    while i < len(results):
+        #print(i, results[i])
+        # this also coalesces consecutive results into one larger range
+        if results[i][0] == results[i-1][0] and (results[i][1][0] - results[i-1][1][1]) < opts.show_min_len:
+            # tiny show gap, delete it by merging the commercials
+            results[i-1] = (results[i][0], (results[i-1][1][0], results[i][1][1]))
+            del results[i]
+        else:
+            i += 1
+
     # show must be at least 30 seconds long (opts.show_min_len), or we just combine it into the commercial break its in the middle of
     # commercials must be at least 60 (opts.comm_min_len) seconds long, if it's less, it is deleted
     # commercials must be less than 360 seconds long (opts.comm_max_len), if it's more then it is just show after that
@@ -313,16 +349,15 @@ def predict(feature_log:str|TextIO|dict, opts:Any)->list:
             del results[i]
         else:
             i += 1
-    print(results)
     
     i = 0
     while i < len(results):
         clen = results[i][1][1] - results[i][1][0]
         if clen < opts.break_min_len and results[i][0] == SceneType.COMMERCIAL.value:
-            if i+1 >= len(results) and clen >= 5 and results[i][1][1]+clen+5 > flog.get('duration', 0):
+            if i+1 >= len(results) and clen >= 5 and results[i][1][1]+clen+5 > duration:
                 # dont require full length if it goes over the end of the recording
                 break
-            elif i == 0 and clen >= 5 and results[i][1][0] <= 0.1:
+            elif i == 0 and clen >= 5 and results[i][1][0] < 5:
                 # don't require full length at the beginning of the recording
                 i += 1
                 pass
@@ -338,9 +373,9 @@ def predict(feature_log:str|TextIO|dict, opts:Any)->list:
         # its ok now, move on
         i += 1
     
-    # now where there is a diff within 2 frame of the start/end of a tag, move the tag
+    # now where there is a diff within 2 frames of the start/end of a tag, move the tag
     # TODO also do this for audio diffs? or silence ranges?
-    for (_,(b,e)) in flog.get('diff_span', []):
+    for (_,(b,e)) in spans.get('diff_span', []):
         for i in range(len(results)):
             if abs(results[i][1][0] - b) <= 2.5/frame_rate:
                results[i] = (results[i][0], (b, results[i][1][1]))
@@ -352,7 +387,7 @@ def predict(feature_log:str|TextIO|dict, opts:Any)->list:
                results[i] = (results[i][0], (results[i][1][0], e))
     
     # now where there is a blank within 2 frame of the start/end of a tag, move the tag toward the middle of the blank
-    for (v,(b,e)) in flog.get('blank_span', []):
+    for (v,(b,e)) in spans.get('blank_span', []):
         if not v:
             continue
         for i in range(len(results)):
@@ -361,8 +396,10 @@ def predict(feature_log:str|TextIO|dict, opts:Any)->list:
             elif b-2/frame_rate <= results[i][1][1] and results[i][1][1] <= e+2/frame_rate:
                 results[i] = (results[i][0], (results[i][1][0], b+(e-b)/2))
 
+    print(f'\n\nFinal n={len(results)}:')
     print(results)
 
+    flog = processor.read_feature_log(feature_log)
     flog['tags'] = results
     processor.write_feature_log(flog, feature_log)
 
