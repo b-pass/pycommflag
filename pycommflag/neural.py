@@ -9,6 +9,10 @@ from typing import Any,TextIO,BinaryIO
 from .feature_span import *
 from . import processor
 
+TIME_WINDOW = 2.0
+UNITS = 128
+DROPOUT = .1
+
 def flog_to_vecs(flog:dict)->tuple[list[float], list[list[float]], list[list[float]]]:
     version = flog.get('file_version', 10)
     frame_rate = flog.get('frame_rate', 29.97)
@@ -21,8 +25,10 @@ def flog_to_vecs(flog:dict)->tuple[list[float], list[list[float]], list[list[flo
     # TODO, do we need to handle all-blank scenes at the start/end of a block differently?
     # the reason would be because of inconsistent training data (sometimes the blank is part of the commercial, sometimes the show)
     # but there are blanks in the middle of both also so maybe that doesnt matter....?
-    if tags and 'blank_span' in flog :
+    if tags:
         blanks = flog.get('blank_span', [])
+        if not blanks:
+            blanks = processor.read_blank_span(flog)
         for (bv,(bs,be)) in blanks:
             if not bv or bs == 0.0 or be >= endtime:
                 continue
@@ -38,14 +44,20 @@ def flog_to_vecs(flog:dict)->tuple[list[float], list[list[float]], list[list[flo
                 elif fixe and not fixb:
                     tags[ti] = (tt, (tags[ti][1][0], half))
     
-    frames = flog['frames']
-    if frames[0] is None: frames.pop(0)
+    # copy the frames so we don't mess up "flog"
+    frames = list(flog['frames'])
 
     frames_header = flog['frames_header']
-    assert(frames_header[0] == 'time')
+    assert('time' in frames_header[0])
+    assert('diff' in frames_header[3])
+
+    if frames[0] is None: frames.pop(0)
+
+    # everything we do is for 29.97 or 30 (close enough); support 59.94 and 60 too... 
+    if frame_rate >= 58:
+        frames = frames[::int(frame_rate/29)]
 
     # often the video doesn't start a PTS 0 because of sync issues, back-fill the first video frame
-    # note, assumes time is at frame[0]
     if frames[0][0] > 0:
         while True:
             frames[0:0] = [list(frames[0])] # insert
@@ -53,36 +65,8 @@ def flog_to_vecs(flog:dict)->tuple[list[float], list[list[float]], list[list[flo
             if frames[0][0] <= 0.0:
                 frames[0][0] = 0.0
                 break
-    
-    # mark up each frame with the calculated audio type and volume level
-    ######## if 'audio' not in frames_header:
-    # normalize with the max volume of the whole recording
-    if 'volume' in flog and 'volume' not in frames_header:
-        vscale = np.max(np.array(flog['volume'])[...,1:3])
-        vit = iter(flog['volume'])
-        volume = next(vit, (0,0,0))
-        
-        for frame in frames:
-            ft = frame[0]
-            while ft >= volume[0]+0.00001:
-                volume = next(vit, (endtime+1,0,0))
-            frame += [volume[1]/vscale, volume[2]/vscale]
-    
-    # convert audio to one-hot and then add it
-    if 'audio' in flog and 'silent' not in frames_header:
-        ait = iter(flog['audio'])
-        audio = next(ait, (0,(0,endtime+1)))
-        for frame in frames:
-            ft = frame[0]
-            while ft >= audio[1][1]:
-                audio = next(ait, (0,(0,endtime+1)))
-            av = audio[0] if ft >= audio[1][0] else AudioSegmentLabel.SILENCE.value
-            x = [0] * AudioSegmentLabel.count()
-            x[int(av)] = 1
-            frame += x
 
-    # convert tag to a one-hot and then add it
-    diff_max = 0.0
+    # convert tags to a one-hot per-frame
     answers = []
     tit = iter(tags)
     tag = next(tit, (SceneType.UNKNOWN, (0, endtime+1)))
@@ -99,44 +83,29 @@ def flog_to_vecs(flog:dict)->tuple[list[float], list[list[float]], list[list[flo
         x = [0] * SceneType.count()
         x[tt if type(tt) is int else tt.value] = 1
         answers.append(x)
-        diff_max = max(diff_max, f[3])
     
-    if diff_max == 0:
-        diff_max = 1e-7
-    timestamps = []
-    for f in frames:
-        # save the real timestamps
-        timestamps.append(f[0])
-        
-        # normalize time values on a 30-minute scale
-        f[0] = (f[0] % 1800) / 1800.0
+    # ok now we can numpy....
+    frames = np.copy(frames)
 
-        # normalize the diffs to a range
-        f[3] = f[3] / diff_max
-    
-    window = 2.0
+    # copy the real timestamps
+    timestamps = np.copy(frames[...,0])
 
-    need = int((window * 29) / 2)
-    skip = max(1,int(frame_rate / 29))
+    # normalize the timestamps upto 30 minutes
+    frames[...,0] = (frames[...,0] % 1800.0) / 1800.0
+
+    # normalize frame diffs
+    frames[...,3] = np.clip(frames[...,3] / 30, 0, 1.0)
+
+    need = int((TIME_WINDOW * 29) / 2)
     data = []
-    for i in range(len(frames)):
-        d = []
-        # near the beginning, fill with repeats from first frame in order to get to the correct size
-        extra = need - i//skip 
-        if extra > 0:
-            d += [frames[0]] * extra
-        
-        d += frames[i - need*skip : i+need*skip+1 : skip]
-        
-        # TODO: should we include the answers from the previous frames? 
-        # if we did, we'd need to carefully set the future one-hots to be all zero, i guess.
-
-        extra = need*2+1 - len(d)
-        if extra > 0:
-            d += [frames[-1]] * extra
-        
+    d = np.concatenate((np.tile(frames[0], (need,1)),frames[0:need+1]))
+    for i in range(len(frames)-(need+1)):
+        d = np.append(d[1:], [frames[i+need+1]], axis=0)
         data.append(d)
-    
+    for i in range(len(frames)-(need+1), len(frames)):
+        d = np.append(d[1:], [frames[-1]], axis=0)
+        data.append(d)
+
     return (timestamps,data,answers)
 
 def load_data(opts)->tuple[list,list,list,list]:
@@ -216,14 +185,12 @@ def train(training:tuple, test_answers:list=None, opts:Any=None):
     weights[SceneType.COMMERCIAL.value] = sums[SceneType.SHOW.value] / sums[SceneType.COMMERCIAL.value]
     print("Loss Weights",weights)
 
-    DROPOUT = 0#.1
-
     nsteps = len(data[0])
     nfeat = len(data[0][0])
     print("Data (x):",len(data)," Test (y):", len(test_data), "; Samples=",nsteps,"; Features=",nfeat)
     inputs = keras.Input(shape=(nsteps,nfeat))
     n = inputs
-    n = layers.LSTM(128, dropout=DROPOUT)(n)
+    n = layers.LSTM(UNITS, dropout=DROPOUT)(n)
     #n = layers.LSTM(32, dropout=DROPOUT, return_sequences=True)(n)
     #n = layers.LSTM(16)(n)
     outputs = layers.Dense(SceneType.count(), activation='softmax')(n)
@@ -271,8 +238,8 @@ def train(training:tuple, test_answers:list=None, opts:Any=None):
     print(tmetrics)
 
     dir = opts.models_dir if opts and opts.models_dir else '.'
-    name = f'{dir}{os.sep}pycf-{dmetrics[1]:.04f}-{tmetrics[1]:.04f}-mse{tmetrics[2]:.04f}-{int(time.time())}.h5'
-    #if dmetrics[1] >= 0.95 and tmetrics[1] >= 0.95:
+    name = f'{dir}{os.sep}pycf-{tmetrics[1]:.04f}-lstm{UNITS}-d{DROPOUT}-w{TIME_WINDOW}-{int(time.time())}.h5'
+    #if dmetrics[1] >= 0.85 and tmetrics[1] >= 0.85:
     print('Saving as ' + name)
     model.save(name)
 
@@ -294,7 +261,6 @@ def predict(feature_log:str|TextIO|dict, opts:Any)->list:
     assert(flog['frames'][-1][0] > frame_rate)
 
     (times,data,answers) = flog_to_vecs(flog)
-    flog = None # flog has been MODIFIED do not save it over the original!
     assert(len(times) == len(data))
 
     mf = opts.model_file

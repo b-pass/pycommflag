@@ -443,6 +443,24 @@ def read_logo(log_in:str|TextIO|dict) -> None|tuple:
 def read_tags(log_f:str|TextIO|dict):
     return read_feature_log(log_f).get('tags', [])
 
+def read_blank_span(log:str|TextIO|dict) -> list:
+    log = read_feature_log(log)
+
+    blankf = FeatureSpan()
+    blankf.start(0,True)
+
+    lasttime = 0
+    if log['frames'] and log['frames'][0] is None:
+        log['frames'].pop(0)
+
+    for f in log['frames']:
+        lasttime = f[0]
+        blankf.add(lasttime, f[2])
+    
+    blankf.end(lasttime)
+    
+    return blankf.to_list()
+
 def read_feature_spans(log:str|TextIO|dict) -> dict[str, FeatureSpan]:
     log = read_feature_log(log)
 
@@ -458,6 +476,9 @@ def read_feature_spans(log:str|TextIO|dict) -> dict[str, FeatureSpan]:
     
     lasttime = 0
     lab = AudioSegmentLabel.SILENCE
+
+    if log['frames'] and log['frames'][0] is None:
+        log['frames'].pop(0)
 
     for f in log['frames']:
         audiof.add(lasttime, f[0], lab)
