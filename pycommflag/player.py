@@ -143,10 +143,8 @@ class Player:
         if d.shape[0] < 1:
             return
         
-        # root mean square - average power of signal, per channel
-        
-        n = 3 if d.shape[0] >= 3 and af.layout.channels[2].name.endswith('C') else 2 if d.shape[0] >= 2 else 1
-        main = np.sum(d[:n], 0) / n 
+        n = 3 if d.shape[0] >= 3 and af.layout.channels[2].name.endswith('C') else 2
+        main = np.sum(d[:n], 0) / float(n)
         #d = ((d[0,...] + d[1,...]) / 2.0 + d[2,...]) / 1.4142
 
         surr = np.sum(d[3:,...], 0) / (d.shape[0]-3) if d.shape[0] >= 4 else None

@@ -176,7 +176,7 @@ class AudioSegmentLabel(Enum):
 
     def color_map():
         return {
-            AudioSegmentLabel.SILENCE : None,# 'dark grey',
+            AudioSegmentLabel.SILENCE : 'red',# 'dark grey',
             AudioSegmentLabel.SPEECH : 'dark blue',
             AudioSegmentLabel.MUSIC : 'light blue',
             AudioSegmentLabel.NOISE : 'pink',

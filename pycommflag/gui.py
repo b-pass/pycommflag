@@ -21,6 +21,7 @@ class Window(tk.Tk):
         self.next_frame_time = 1/self.player.frame_rate
         self.settype = None
         self.setpos = 0
+        self.logo = logo
         
         p = 0
         self.tags = []
@@ -225,8 +226,7 @@ class Window(tk.Tk):
             span = self.spans.get(key)
             
         for (t,(b,e)) in reversed(span):
-            if type(t) is bool and not t:
-                continue
+            if not t: continue
             if key == 'blank' and (e-b) >= 3*self.player.frame_rate:
                 p = b+(e-b)/2
             else:
@@ -243,8 +243,7 @@ class Window(tk.Tk):
             span = self.spans.get(key)
             
         for (t,(b,e)) in span:
-            if type(t) is bool and not t:
-                continue
+            if not t: continue
             if key == 'blank' and (e-b) >= 3*self.player.frame_rate:
                 p = b+(e-b)/2
             else:
@@ -301,17 +300,31 @@ class Window(tk.Tk):
         if len(frames) >= 1:
             self.images[3] = ImageTk.PhotoImage(frames[-1].to_image(height=180,width=320))
         
-        info = 'Diffs:'
+        info = ''
         prev = None
+        n = 0
         for frame in frames[-3:]:
-            c = processor.columnize_frame(frame).astype('int16')
+            # stolen from processor
+            n += 1
+            fcolor = frame.to_ndarray(format="rgb24")
+            c = processor.mean_axis1_float_uint8(fcolor).astype('int16')
             if prev is None:
                 prev = c
                 continue
             diff = prev - c
             prev = c
             scm = np.mean(np.std(np.abs(diff), (0)))
-            info += '\nDiff: %9.05f' % (scm,)
+            info += 'Diff: %9.05f\n\n' % (scm,)
+            if n == 2:
+                # stolen from processor
+                cmax = np.max(fcolor[int(fcolor.shape[0]*3/8):int(fcolor.shape[0]*5/8),int(fcolor.shape[1]*3/8):int(fcolor.shape[1]*5/8)])
+                bchk = logo_finder.subtract(fcolor, self.logo)
+                med = np.median(bchk, (0,1))
+                frame_blank = max(med) < 24 and np.std(med) < 3 and np.std(bchk) < 6
+                info += f'c-Max: {cmax} | Max: {max(med)}\nStdMed: {round(np.std(med),2)} | StdAll: {round(np.std(bchk),2)}\n'
+                info += ('Blank' if frame_blank else 'Not Blank')
+                info += '\n\n'
+
         self.vinfo.configure(text=info)
 
         f = self.player.seek_exact(seconds + 5)

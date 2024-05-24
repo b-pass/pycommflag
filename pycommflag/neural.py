@@ -26,10 +26,7 @@ def flog_to_vecs(flog:dict)->tuple[list[float], list[list[float]], list[list[flo
     # the reason would be because of inconsistent training data (sometimes the blank is part of the commercial, sometimes the show)
     # but there are blanks in the middle of both also so maybe that doesnt matter....?
     if tags:
-        blanks = flog.get('blank_span', [])
-        if not blanks:
-            blanks = processor.read_blank_span(flog)
-        for (bv,(bs,be)) in blanks:
+        for (bv,(bs,be)) in processor.read_feature_spans(flog, 'blank'):
             if not bv or bs == 0.0 or be >= endtime:
                 continue
             half = bs + (be - bs)
@@ -97,6 +94,10 @@ def flog_to_vecs(flog:dict)->tuple[list[float], list[list[float]], list[list[flo
     frames[...,3] = np.clip(frames[...,3] / 30, 0, 1.0)
 
     need = int((TIME_WINDOW * 29) / 2)
+        
+    if len(frames) < need*5:
+        return ([],[],[])
+
     data = []
     d = np.concatenate((np.tile(frames[0], (need,1)),frames[0:need+1]))
     for i in range(len(frames)-(need+1)):
@@ -256,7 +257,7 @@ def predict(feature_log:str|TextIO|dict, opts:Any)->list:
     flog = processor.read_feature_log(feature_log)
     duration = flog.get('duration', 0)
     frame_rate = flog.get('frame_rate', 29.97)
-    spans = processor.read_feature_spans(flog)
+    spans = processor.read_feature_spans(flog, 'diff', 'blank')
     
     assert(flog['frames'][-1][0] > frame_rate)
 
@@ -339,33 +340,33 @@ def predict(feature_log:str|TextIO|dict, opts:Any)->list:
         # its ok now, move on
         i += 1
     
-    # now where there is a diff within 2 frames of the start/end of a tag, move the tag
+    time_thresh = .5*frame_rate
+    # now where there is a diff within a few frames of the start/end of a tag, move the tag
     # TODO also do this for audio diffs? or silence ranges?
-    for (_,(b,e)) in spans.get('diff_span', []):
+    for (_,(b,e)) in spans.get('diff', []):
         for i in range(len(results)):
-            if abs(results[i][1][0] - b) <= 2.5/frame_rate:
+            if abs(results[i][1][0] - b) <= time_thresh:
                results[i] = (results[i][0], (b, results[i][1][1]))
-            elif abs(results[i][1][0] - e) <= 2.5/frame_rate:
+            elif abs(results[i][1][0] - e) <= time_thresh:
                results[i] = (results[i][0], (e, results[i][1][1]))
-            if abs(results[i][1][1] - b) <= 2.5/frame_rate:
+            if abs(results[i][1][1] - b) <= time_thresh:
                results[i] = (results[i][0], (results[i][1][0], b))
-            elif abs(results[i][1][1] - e) <= 2.5/frame_rate:
+            elif abs(results[i][1][1] - e) <= time_thresh:
                results[i] = (results[i][0], (results[i][1][0], e))
     
-    # now where there is a blank within 2 frame of the start/end of a tag, move the tag toward the middle of the blank
-    for (v,(b,e)) in spans.get('blank_span', []):
+    # now where there is a blank within a few frames of the start/end of a tag, move the tag toward the middle of the blank
+    for (v,(b,e)) in spans.get('blank', []):
         if not v:
             continue
         for i in range(len(results)):
-            if b-2/frame_rate <= results[i][1][0] and results[i][1][0] <= e+2/frame_rate:
+            if b-time_thresh <= results[i][1][0] and results[i][1][0] <= e+time_thresh:
                 results[i] = (results[i][0], (b+(e-b)/2, results[i][1][1]))
-            elif b-2/frame_rate <= results[i][1][1] and results[i][1][1] <= e+2/frame_rate:
+            elif b-time_thresh <= results[i][1][1] and results[i][1][1] <= e+time_thresh:
                 results[i] = (results[i][0], (results[i][1][0], b+(e-b)/2))
 
     print(f'\n\nFinal n={len(results)}:')
     print(results)
 
-    flog = processor.read_feature_log(feature_log)
     flog['tags'] = results
     processor.write_feature_log(flog, feature_log)
 

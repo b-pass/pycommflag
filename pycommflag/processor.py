@@ -294,11 +294,8 @@ def mean_axis1_float_uint8(fcolor:np.ndarray)->np.ndarray:
     # and now convert those stacks back into a 720x3
     return np.stack((cb,cg,cr), axis=1).astype('uint8')
 
-def columnize_frame(frame)->np.ndarray:
-    return mean_axis1_float_uint8(frame.to_ndarray(format="rgb24", height=720, width=frame.width*(720/frame.height)))
-
 class AudioProc(Thread):
-    def __init__(self, frame_rate, volume_window=.1, work_rate=30.0):
+    def __init__(self, frame_rate, volume_window=.1, work_rate=60.0):
         super().__init__(name="audioProc")
         import tensorflow as tf
         tf.config.threading.set_intra_op_parallelism_threads(1)
@@ -307,64 +304,26 @@ class AudioProc(Thread):
         self.volume_window = max(1/frame_rate, volume_window)
         self.work_rate = max(1.0, work_rate)
         self.seg = ina_foss.Segmenter()
-        self.aq = []
-        self.go = True
+        self.queue = Queue(10)
         self.fspan = AudioFeatureSpan()
         self.fspan.start()
         self.rms = [(0,0,0)]
 
     def add_audio(self, audio):
-        self.aq += audio
+        for a in audio:
+            if a:
+                self.queue.put(a)
     
     def stop(self):
-        self.go = False
+        self.queue.put(None)
     
-    def _resample_queue(self) -> list[tuple[float,np.ndarray,np.ndarray|None]]:
+    def _resample(self,main,surr,t,sr) -> tuple[float,np.ndarray,np.ndarray]:
         # resample to 16 kHz
-
-        if not self.aq:
-            return []
-
-        # out of order PTS, should never happen...?
-        self.aq = sorted(self.aq, key=lambda x:x[2])
-        result = []
-        
-        start = self.aq[0][2]
-        main_samp = None
-        surr_samp = None
-        psr = None
-        while self.aq:
-            (main,surr,t,sr) = self.aq.pop(0)
-            #print(t,sr,len(main),t+len(main)/sr)
-            if psr != sr and main_samp is not None:
-                result.append((
-                    start, 
-                    spsig.resample(main_samp, int(len(main_samp)*16000/psr)), 
-                    spsig.resample(surr_samp, int(len(surr_samp)*16000/psr)) if surr_samp is not None else None,
-                ))
-                start = self.aq[0][2] if self.aq else -1 # peek next timestamp
-                main_samp = None
-                surr_samp = None
-            psr = sr
-            
-            if surr is not None:
-                if main_samp is not None:
-                    # pad left with zeros as needed
-                    if surr_samp is None:
-                        surr_samp = np.zeros(int(len(main_samp)), 'float32')
-                    elif len(main_samp) > len(surr_samp):
-                        surr_samp = np.append(surr_samp, np.zeros(len(main_samp) - len(surr_samp), 'float32'))
-                surr_samp = np.append(surr_samp, surr) if surr_samp is not None else surr
-            main_samp = np.append(main_samp, main) if main_samp is not None else main
-        
-        if main_samp is not None:
-            result.append((
-                start, 
-                spsig.resample(main_samp, int(len(main_samp)*16000/psr)), 
-                spsig.resample(surr_samp, int(len(surr_samp)*16000/psr)) if surr_samp is not None else None,
-            ))
-        
-        return result
+        return (
+            t, 
+            spsig.resample(main, int(len(main)*16000/sr)), 
+            spsig.resample(surr, int(len(surr)*16000/sr)) if surr is not None else None,
+        )
 
     def run(self):
         main = np.empty(0, 'float32')
@@ -372,28 +331,24 @@ class AudioProc(Thread):
         cur = 0.0
         nexttime = 0.0
         work_unit = round(16000 * self.work_rate) + 8000
+        min_work = work_unit
         vwnd = round(16000*self.volume_window)
         done = False
         while not done:
-            # first, resample the summarized audio packets into 16khz
-            segments = self._resample_queue()
-            if not segments:
-                time.sleep(0.001)
-                if self.go or self.aq:
-                    continue
-                else:
-                    done = True
-            
             # merge samples into a contiguous array
-            for (st,sm,ss) in segments:
+            if segment := self.queue.get(True):
                 # check for a hole, fill with zeros if needed
+                (st,sm,ss) = self._resample(*segment)
+
                 missing = int(round((st - nexttime)*16000))
                 nexttime = st + len(sm)/16000
                 
-                if missing > 0:
-                    sm = np.append(sm, np.zeros(missing, 'float32'))
+                if missing != 0:
+                    #print('Missing',missing,'audio samples? fill zero...')
+                    # these are LEADING missing values
+                    sm = np.append(np.zeros(missing, 'float32'), sm)
 
-                # resample code might leave trailing holes in ss; so pad it if needed
+                # resample code might leave TRAILING holes in ss; so pad it if needed
                 if ss is None:
                     ss = np.zeros(len(sm), 'float32')
                 elif len(sm) > len(ss):
@@ -401,9 +356,12 @@ class AudioProc(Thread):
                 
                 main = np.append(main, sm)
                 surr = np.append(surr, ss)
+            else:
+                done = True
+                min_work = 8000
             
             # now chunk into "work_rate" sized pieces and work on them individually
-            while len(main) >= work_unit or (done and len(main) > 8000):
+            while len(main) >= min_work:
                 assert(len(main) == len(surr))
 
                 # slice the time
@@ -443,36 +401,40 @@ def read_logo(log_in:str|TextIO|dict) -> None|tuple:
 def read_tags(log_f:str|TextIO|dict):
     return read_feature_log(log_f).get('tags', [])
 
-def read_blank_span(log:str|TextIO|dict) -> list:
+def read_feature_spans(log:str|TextIO|dict, *spans) -> dict[str, list]:
     log = read_feature_log(log)
 
-    blankf = FeatureSpan()
-    blankf.start(0,True)
+    if len(spans) == 0:
+        spans = ['logo','blank','diff','audio','volume']
 
-    lasttime = 0
-    if log['frames'] and log['frames'][0] is None:
-        log['frames'].pop(0)
-
-    for f in log['frames']:
-        lasttime = f[0]
-        blankf.add(lasttime, f[2])
+    if 'audio' in spans:
+        audiof = AudioFeatureSpan()
+        audiof.start()
+    else:
+        audiof = None
     
-    blankf.end(lasttime)
+    if 'volume' in spans:
+        volume = []
+    else:
+        volume = None
     
-    return blankf.to_list()
-
-def read_feature_spans(log:str|TextIO|dict) -> dict[str, FeatureSpan]:
-    log = read_feature_log(log)
-
-    audiof = AudioFeatureSpan()
-    audiof.start()
-    logof = FeatureSpan()
-    logof.start(0,False)
-    blankf = FeatureSpan()
-    blankf.start(0,True)
-    difff = SeparatorFeatureSpan()
-    difff.start(0,True)
-    volume = []
+    if 'logo' in spans:
+        logof = FeatureSpan()
+        logof.start(0,False)
+    else:
+        logof = None
+    
+    if 'blank' in spans:
+        blankf = FeatureSpan()
+        blankf.start(0,True)
+    else:
+        blankf = None
+    
+    if 'diff' in spans:
+        difff = FeatureSpan()
+        difff.start(0,True)
+    else:
+        difff = None
     
     lasttime = 0
     lab = AudioSegmentLabel.SILENCE
@@ -481,29 +443,41 @@ def read_feature_spans(log:str|TextIO|dict) -> dict[str, FeatureSpan]:
         log['frames'].pop(0)
 
     for f in log['frames']:
-        audiof.add(lasttime, f[0], lab)
+        if audiof is not None:
+            audiof.add(lasttime, f[0], lab)
 
         lasttime = f[0]
-        logof.add(lasttime,f[1])
-        blankf.add(lasttime, f[2])
-        difff.add(lasttime, f[3] >= 15.0)
-        volume.append((lasttime, f[4], f[5]))
-        for i in range(AudioSegmentLabel.count()):
-            if f[6+i]:
-                lab = AudioSegmentLabel(i)
+        if logof is not None:
+            logof.add(lasttime,f[1])
+        if blankf is not None:
+            blankf.add(lasttime, f[2])
+        if difff is not None:
+            difff.add(lasttime, f[3] >= 15.0)
+        if volume is not None:
+            volume.append((lasttime, f[4], f[5]))
+        
+        if audiof is not None:
+            for i in range(AudioSegmentLabel.count()):
+                if f[6+i]:
+                    lab = AudioSegmentLabel(i)
     
-    logof.end(lasttime)
-    blankf.end(lasttime)
-    difff.end(lasttime)
-    audiof.end(lasttime)
-
-    return {
-        'logo':logof.to_list(),
-        'blank':blankf.to_list(),
-        'diff':difff.to_list(),
-        'audio':audiof.to_list(),
-        'volume':volume,
-    }
+    result = {}
+    if logof is not None:
+        logof.end(lasttime)
+        result['logo'] = logof.to_list()
+    if blankf is not None:
+        blankf.end(lasttime)
+        result['blank'] = blankf.to_list()
+    if difff is not None:
+        difff.end(lasttime)
+        result['diff'] = difff.to_list()
+    if audiof is not None:
+        audiof.end(lasttime)
+        result['audio'] = audiof.to_list()
+    if volume is not None:
+        result['volume'] = volume
+    
+    return result
 
 def guess_external_breaks(opts:Any)->list:
     if not opts:
