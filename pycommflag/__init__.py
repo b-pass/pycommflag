@@ -12,3 +12,8 @@ applications as a python module.
 
 from . import logo_finder, options, processor, gui
 from .player import Player
+
+
+import logging
+logging.getLogger('h5py').setLevel(logging.WARNING)
+logging.getLogger('tensorflow').setLevel(logging.WARNING)
