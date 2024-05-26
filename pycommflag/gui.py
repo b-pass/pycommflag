@@ -214,6 +214,9 @@ class Window(tk.Tk):
         for v in range(len(self.video_labels)):
             self.video_labels[v].configure(image=self.images[0 if v != 2 else 1])
         
+        self.vMapPos = None
+        self.vMaybe = None
+        self.tag_canvas_items = []
         self.drawMap()
 
         self.move(abs=0)
@@ -353,18 +356,22 @@ class Window(tk.Tk):
             self.mapCanvas.coords(self.vMaybe, startx, 0, stopx, self.map_height)
             #print(self.settype, self.vMaybe, self.setpos, self.position, startx, stopx)
 
-    def drawSpan(self, span, colorMap, top, bottom, force_width=None):
+    def drawSpan(self, span, colorMap, top, bottom, force_width=None, name="span"):
+        items = []
         sec_per_pix = self.player.duration / self.map_width
         for (t,(b,e)) in span:
+            color = colorMap.get(t, None)
+            if color is None:
+                continue
             startx = math.floor(b / sec_per_pix)
             if force_width is not None:
                 stopx = startx + force_width
             else:
                 stopx = max(startx+1,math.ceil(e / sec_per_pix))
-            color = colorMap.get(t, None)
-            if color is not None:
-                self.mapCanvas.create_rectangle(startx, top, stopx, bottom, width=0, fill=color)
+            x = self.mapCanvas.create_rectangle(startx, top, stopx, bottom, width=0, fill=color, tags=(name,))
+            items.append(x)
             #print(t,startx,stopx,color)
+        return items
     
     def drawVolume(self, span, top, bottom, height, color):
         scale = np.max(np.array(span)[...,1:3])
@@ -381,19 +388,37 @@ class Window(tk.Tk):
             fprev = (x,fy)
             rprev = (x,ry)
     
+    def redrawTags(self):
+        for x in self.tag_canvas_items:
+            self.mapCanvas.delete(x)
+        if self.vMaybe is not None:
+            self.mapCanvas.delete(self.vMaybe)
+            self.vMaybe = None
+            
+        row = self.map_height/6
+        pos = 0
+        self.tag_canvas_items = self.drawSpan(self.tags, top=pos, bottom=pos+row, colorMap=SceneType.color_map())
+        self.mapCanvas.tag_lower("span", "blank")
+        
+        if self.settype is not None:
+            color = SceneType.color_map()[self.settype]
+            if color is not None:
+                self.vMaybe = self.mapCanvas.create_rectangle(0, 0, 0, self.map_height, width=0, fill=color, stipple='gray50')
+
     def drawMap(self):
         for x in self.mapCanvas.find_all():
             self.mapCanvas.delete(x)
         self.vMaybe = None
+        self.vMapPos = None
+        self.tag_canvas_items = []
 
         row = self.map_height/6
         pos = 0
-        self.drawSpan(self.tags, top=pos, bottom=pos+row, colorMap=SceneType.color_map())
         pos += row
         self.drawSpan(self.spans.get('logo',[]), top=pos, bottom=pos+row, colorMap={True:'blue'})
         pos += row
         
-        self.drawSpan(self.spans.get('blank',[]), top=int(row*.3), bottom=pos-int(row*.3), colorMap={True:'black'})
+        self.drawSpan(self.spans.get('blank',[]), top=int(row*.3), bottom=pos-int(row*.3), colorMap={True:'black'}, name="blank")
 
         self.drawSpan(self.spans.get('diff',[]), top=pos, bottom=pos+row, colorMap={True:'purple'}, force_width=1)
         pos += row
@@ -403,11 +428,8 @@ class Window(tk.Tk):
         if 'volume' in self.spans:
             self.drawVolume(self.spans.get('volume'), top=pos, bottom=pos+row*2, height=row, color='darkblue')
             pos += row*2
-        
-        if self.settype is not None:
-            color = SceneType.color_map()[self.settype]
-            if color is not None:
-                self.vMaybe = self.mapCanvas.create_rectangle(0, 0, 0, self.map_height, width=0, fill=color, stipple='gray50')
+            
+        self.redrawTags()
 
         # lastly, add the positional indicator
         self.vMapPos = self.mapCanvas.create_line(0,0,0,self.map_height,arrow=tk.BOTH,fill='orange',width=1.5)
@@ -425,8 +447,10 @@ class Window(tk.Tk):
         b.grid(row=0, column=1, padx=5)
 
         self.setpos = self.position
-        self.drawMap()
-        self.next()
+        
+        #self.drawMap()
+        self.redrawTags()
+        self.updatePosIndicators()
     
     def cancel_tag(self, btnIdx):
         self.settype = None
@@ -488,7 +512,8 @@ class Window(tk.Tk):
             (b,t,label) = self.taggers[btnIdx]
             b.configure(text=f'Flag {label}', command=lambda x=btnIdx:self.do_tag(x))
 
-        self.drawMap()
+        self.redrawTags()
+        self.updatePosIndicators()
     
     def truncate_now(self):
         if self.settype is not None:
