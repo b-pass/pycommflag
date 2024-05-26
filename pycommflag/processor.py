@@ -152,12 +152,10 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
     audioProc.join()
 
     frames = videoProc.frames
-    if len(frames) == 0: frames = [[0,0,0,0]]
 
     audioProc.fspan.end(frames[-1][0])
 
     # often the video doesn't start a PTS 0 because of avsync issues, back-fill the first video frame
-    # note, assumes time is at frame[0]
     if frames[0][0] > 0:
         while True:
             frames[0:0] = [list(frames[0])] # insert
@@ -295,16 +293,16 @@ def mean_axis1_float_uint8(fcolor:np.ndarray)->np.ndarray:
     return np.stack((cb,cg,cr), axis=1).astype('uint8')
 
 class AudioProc(Thread):
-    def __init__(self, frame_rate, volume_window=.1, work_rate=60.0):
+    def __init__(self, frame_rate, volume_window=.05, work_rate=60.0):
         super().__init__(name="audioProc")
         import tensorflow as tf
         tf.config.threading.set_intra_op_parallelism_threads(1)
         tf.config.threading.set_inter_op_parallelism_threads(1)
         self.frame_rate = frame_rate
-        self.volume_window = max(1/frame_rate, volume_window)
+        self.volume_window = max(2/29.97, volume_window)
         self.work_rate = max(1.0, work_rate)
         self.seg = ina_foss.Segmenter()
-        self.queue = Queue(10)
+        self.queue = Queue(150)
         self.fspan = AudioFeatureSpan()
         self.fspan.start()
         self.rms = [(0,0,0)]
@@ -330,8 +328,9 @@ class AudioProc(Thread):
         surr = np.empty(0, 'float32')
         cur = 0.0
         nexttime = 0.0
-        work_unit = round(16000 * self.work_rate) + 8000
-        min_work = work_unit
+        self.rms = [(0,0,0)]
+        work_unit = round(16000 * self.work_rate)
+        min_work = work_unit + 8000
         vwnd = round(16000*self.volume_window)
         done = False
         while not done:
@@ -344,6 +343,7 @@ class AudioProc(Thread):
                 nexttime = st + len(sm)/16000
                 
                 if missing != 0:
+                    #print('Missing',missing,"before",st)
                     #print('Missing',missing,'audio samples? fill zero...')
                     # these are LEADING missing values
                     sm = np.append(np.zeros(missing, 'float32'), sm)
@@ -359,6 +359,7 @@ class AudioProc(Thread):
             else:
                 done = True
                 min_work = 8000
+                #print('FINISHED at',cur,'have',len(main),'audio samples left')
             
             # now chunk into "work_rate" sized pieces and work on them individually
             while len(main) >= min_work:
@@ -368,10 +369,12 @@ class AudioProc(Thread):
                 mwork = main[0:work_unit]
                 swork = surr[0:work_unit]
                 
-                # calculate the volume via RMS for both the main and surround in small rolling slices
+                # calculate the volume via RMS for both the main and surround 
+                # in small rolling and overlapping slices
                 rt = round(cur + self.volume_window, 5)
                 x = vwnd
                 while x <= len(mwork):
+                    # avoid dupes by checking the previous timestamp
                     if rt > self.rms[-1][0]:
                         mrms = math.sqrt(np.mean(np.square(mwork[x-vwnd:x])))
                         srms = math.sqrt(np.mean(np.square(swork[x-vwnd:x])))
@@ -380,14 +383,22 @@ class AudioProc(Thread):
                     rt += self.volume_window/2
                 
                 # classify the main channel
+                #print('Running audio segmenter on',len(mwork),'samples at',cur)
                 for (lab, sb, se) in self.seg(mwork):
+                    # we put an extra half second at the beginning so there is overlap in the data that
+                    # we see on successive runs (so it isn't starting cold on important data). But,
+                    # we don't actually care about that time...
                     if cur == 0 or se > 0.5:
                         self.fspan.add(round(cur+sb,5), round(cur+se,5), AudioSegmentLabel[lab])
                 
-                # done with this time slice
-                cur += self.work_rate-0.5
+                # done with this time slice, leaving the half second in the buffer to repeat it next time.
                 main = main[work_unit-8000:]
                 surr = surr[work_unit-8000:]
+                if cur == 0:
+                    # all the subsequent runs will overlap by half a second with the previous one.
+                    work_unit += 8000
+                cur += (len(mwork) - 8000)/16000.0
+        self.fspan.end(cur)
 
 def reprocess(feature_log_filename:str, opts:Any=None) -> dict:
     if feature_log_filename is None:

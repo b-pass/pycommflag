@@ -15,11 +15,7 @@ def run(opts:Any) -> None|int:
         os.execvp("mythcommflag", ["mythcommflag"] + sys.argv[1:])
 
     if opts.train:
-        d = neural.load_data(opts)
-        if not d:
-            return 1
-        neural.train(d, opts=opts)
-        return 0
+        return neural.train(opts=opts)
     
     if not opts.chanid and not opts.starttime:
         if opts.feature_log:

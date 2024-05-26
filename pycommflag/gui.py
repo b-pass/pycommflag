@@ -118,7 +118,7 @@ class Window(tk.Tk):
         b.grid(row=0, column=1, padx=5)
         self.misc.append(b)
 
-        b = tk.Button(skips, text="|< Silence", command=lambda:self.prev('audio'))
+        b = tk.Button(skips, text="|< Audio", command=lambda:self.prev('audio'))
         b.grid(row=0, column=2, padx=5)
         self.misc.append(b)
 

@@ -4,14 +4,15 @@ import numpy as np
 import re
 import time
 import sys
+import gc
 from typing import Any,TextIO,BinaryIO
 
 from .feature_span import *
 from . import processor
 
 TIME_WINDOW = 2.0
-UNITS = 128
-DROPOUT = .1
+UNITS = 64
+DROPOUT = .2
 
 def flog_to_vecs(flog:dict)->tuple[list[float], list[list[float]], list[list[float]]]:
     version = flog.get('file_version', 10)
@@ -26,20 +27,18 @@ def flog_to_vecs(flog:dict)->tuple[list[float], list[list[float]], list[list[flo
     # the reason would be because of inconsistent training data (sometimes the blank is part of the commercial, sometimes the show)
     # but there are blanks in the middle of both also so maybe that doesnt matter....?
     if tags:
-        for (bv,(bs,be)) in processor.read_feature_spans(flog, 'blank'):
-            if not bv or bs == 0.0 or be >= endtime:
+        for (bv,(bs,be)) in processor.read_feature_spans(flog, 'blank').get('blank', []):
+            if not bv or bs == 0.0 or be >= endtime or (be-bs) >= 4.0:
                 continue
             half = bs + (be - bs)
             for ti in range(len(tags)):
                 (tt, (tb, te)) = tags[ti]
-                fixb = bs <= tb and tb < be and abs(tb-half) >= 1.5/frame_rate
-                fixe = bs <= te and te < be and abs(te-half) >= 1.5/frame_rate
-                if fixe and fixb:
-                    pass
-                elif fixb and not fixe:
+                fixb = bs-.5 <= tb and tb <= be+.5
+                fixe = bs-.5 <= te and te <= be+.5
+                if fixb and not fixe:
                     tags[ti] = (tt, (half, te))
                 elif fixe and not fixb:
-                    tags[ti] = (tt, (tags[ti][1][0], half))
+                    tags[ti] = (tt, (tb, half))
     
     # copy the frames so we don't mess up "flog"
     frames = list(flog['frames'])
@@ -53,39 +52,12 @@ def flog_to_vecs(flog:dict)->tuple[list[float], list[list[float]], list[list[flo
     # everything we do is for 29.97 or 30 (close enough); support 59.94 and 60 too... 
     if frame_rate >= 58:
         frames = frames[::int(frame_rate/29)]
-
-    # often the video doesn't start a PTS 0 because of sync issues, back-fill the first video frame
-    if frames[0][0] > 0:
-        while True:
-            frames[0:0] = [list(frames[0])] # insert
-            frames[0][0] = round(frames[0][0] - 1/frame_rate, 5)
-            if frames[0][0] <= 0.0:
-                frames[0][0] = 0.0
-                break
-
-    # convert tags to a one-hot per-frame
-    answers = []
-    tit = iter(tags)
-    tag = next(tit, (SceneType.UNKNOWN, (0, endtime+1)))
-    for f in frames:
-        while f[0] >= tag[1][1]:
-            tag = next(tit, (SceneType.UNKNOWN, (0, endtime+1)))
-        tt = tag[0] if f[0] >= tag[1][0] else SceneType.UNKNOWN
-        if type(tt) is not int: tt = tt.value
-        if tt == SceneType.DO_NOT_USE.value:
-            # truncate right here
-            if len(answers) < len(frames):
-                frames = frames[:len(answers)]
-            break
-        x = [0] * SceneType.count()
-        x[tt if type(tt) is int else tt.value] = 1
-        answers.append(x)
     
     # ok now we can numpy....
     frames = np.copy(frames)
 
     # copy the real timestamps
-    timestamps = np.copy(frames[...,0])
+    timestamps = frames[...,0].tolist()
 
     # normalize the timestamps upto 30 minutes
     frames[...,0] = (frames[...,0] % 1800.0) / 1800.0
@@ -99,13 +71,42 @@ def flog_to_vecs(flog:dict)->tuple[list[float], list[list[float]], list[list[flo
         return ([],[],[])
 
     data = []
-    d = np.concatenate((np.tile(frames[0], (need,1)),frames[0:need+1]))
+    # we don't use numpy here because it wants to make copies of all of these slices
+    # but using a python list does not, and that is a SIGNIFICANT memory savings
+    # that's because there is a 59x duplication of the same data across sample sets
+    d = ([frames[0]]*need) + frames[0:need+1].tolist()
     for i in range(len(frames)-(need+1)):
-        d = np.append(d[1:], [frames[i+need+1]], axis=0)
+        d = d[1:] + [frames[i+need+1]]
         data.append(d)
     for i in range(len(frames)-(need+1), len(frames)):
-        d = np.append(d[1:], [frames[-1]], axis=0)
+        d = d[1:] + [frames[-1]]
         data.append(d)
+
+    # convert tags to a one-hot per-frame
+    bad = []
+    answers = []
+    tit = iter(tags)
+    tag = next(tit, (SceneType.UNKNOWN, (0, endtime+1)))
+    for ts in timestamps:
+        while ts >= tag[1][1]:
+            tag = next(tit, (SceneType.UNKNOWN, (0, endtime+1)))
+        tt = tag[0] if ts >= tag[1][0] else SceneType.UNKNOWN
+        if type(tt) is not int: tt = tt.value
+        #if tt != SceneType.COMMERCIAL.value and tt != SceneType.SHOW.value:
+        if tt == SceneType.DO_NOT_USE.value:
+            bad.append(len(answers))
+            answers.append(None)
+            continue
+
+        x = [0] * SceneType.count()
+        x[tt if type(tt) is int else tt.value] = 1
+        answers.append(x)
+
+    for i in reversed(bad):
+        assert(answers[i] is None)
+        del timestamps[i]
+        del data[i]
+        del answers[i]
 
     return (timestamps,data,answers)
 
@@ -130,29 +131,36 @@ def load_data(opts)->tuple[list,list,list,list]:
                 del data[i]
             else:
                 i += 1
+
     x = []
     y = []
     for f in data:
         if os.path.isdir(f):
             continue
-        #print(f)
-        flog = processor.read_feature_log(f)
-        if flog:
+        print("Loading",f)
+        if flog := processor.read_feature_log(f):
             (_,a,b) = flog_to_vecs(flog)
             x += a
             y += b
+            flog = None
+            a = None
+            b = None
+        gc.collect()
     
     xt = []
     yt = []
     for f in test:
         if os.path.isdir(f):
             continue
-        #print(f)
-        flog = processor.read_feature_log(f)
-        if flog:
+        print("Loading",f)
+        if flog := processor.read_feature_log(f):
             (_,a,b) = flog_to_vecs(flog)
             xt += a
             yt += b
+            flog = None
+            a = None
+            b = None
+        gc.collect()
     
     import random
     random.seed(time.time())
@@ -169,26 +177,44 @@ def load_data(opts)->tuple[list,list,list,list]:
             (a,b) = zip(*z[:need])
             xt += a
             yt += b
+        print('...done')
 
     return (np.copy(x),np.copy(y),np.copy(xt),np.copy(yt))
 
-def train(training:tuple, test_answers:list=None, opts:Any=None):
+def train(opts:Any=None):
+    (data,answers,test_data,test_answers) = load_data(opts)
+    gc.collect()
+    
     # imort these here because their imports are slow 
     import tensorflow as tf
     import keras
     from keras import layers
 
-    (data,answers,test_data,test_answers) = training
-
+    print('Calculating loss weights')
     sums = np.sum((np.sum(answers, axis=0), np.sum(test_answers, axis=0)), axis=0)
-    weights = [1] * len(sums)
-    weights[SceneType.SHOW.value] = sums[SceneType.COMMERCIAL.value] / sums[SceneType.SHOW.value]
-    weights[SceneType.COMMERCIAL.value] = sums[SceneType.SHOW.value] / sums[SceneType.COMMERCIAL.value]
+    #weights = [1] * len(sums)
+    #weights[SceneType.SHOW.value] = sums[SceneType.COMMERCIAL.value] / sums[SceneType.SHOW.value]
+    #weights[SceneType.COMMERCIAL.value] = sums[SceneType.SHOW.value] / sums[SceneType.COMMERCIAL.value]
+    sums += 1
+    weights = (np.sum(sums)-sums)/np.sum(sums)
     print("Loss Weights",weights)
-
+    
     nsteps = len(data[0])
     nfeat = len(data[0][0])
     print("Data (x):",len(data)," Test (y):", len(test_data), "; Samples=",nsteps,"; Features=",nfeat)
+    
+    batch_size = opts.tf_batch_size if opts else 500
+    train_dataset = tf.data.Dataset.from_tensor_slices((data, answers)).batch(batch_size)
+    data = None
+    answers = None
+    gc.collect()
+
+    test_dataset = tf.data.Dataset.from_tensor_slices((test_data, test_answers)).batch(batch_size)
+    have_test = test_answers is not None and len(test_answers) > 0
+    test_data = None
+    test_answers = None
+    gc.collect()
+
     inputs = keras.Input(shape=(nsteps,nfeat))
     n = inputs
     n = layers.LSTM(UNITS, dropout=DROPOUT)(n)
@@ -200,36 +226,25 @@ def train(training:tuple, test_answers:list=None, opts:Any=None):
 
     model.compile(optimizer="adam", loss="categorical_crossentropy", loss_weights=weights, metrics=['categorical_accuracy', 'mean_squared_error'])
 
-    batch_size = opts.tf_batch_size if opts else 500
-    train_dataset = tf.data.Dataset.from_tensor_slices((data, answers)).batch(batch_size)
-    test_dataset = tf.data.Dataset.from_tensor_slices((test_data, test_answers)).batch(batch_size)
+    import signal
+    def handler(signum, frame):
+        print("\nStopping (gracefully)...\n")
+        model.stop_training = True
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+    signal.signal(signal.SIGINT, handler)
+
+    callbacks = []
+    #callbacks.append(keras.callbacks.EarlyStopping(monitor='categorical_accuracy', patience=50))
+    #if have_test:
+    #    callbacks.append(keras.callbacks.EarlyStopping(monitor='val_categorical_accuracy', patience=50))
     
-    class GracefulStop(keras.callbacks.Callback):
-        def __init__(self):
-            super(keras.callbacks.Callback, self).__init__()
-            self._stop = False
-            def handler(signum, frame):
-                self._stop = True
-                print("\nStopping!\n")
-            import signal
-            signal.signal(signal.SIGINT, handler)
-
-        def on_epoch_end(self, epoch, logs={}):
-            if self._stop:
-                print("\nGraceful stop\n")
-                self.model.stop_training = True
-
-    callbacks = [
-        GracefulStop(),
-        # keras.callbacks.ModelCheckpoint('chk-'+name, monitor='val_binary_accuracy', mode='max', verbose=1, save_best_only=True)
-        #keras.callbacks.EarlyStopping(monitor='loss', patience=500),
-        keras.callbacks.EarlyStopping(monitor='categorical_accuracy', patience=500),
-    ]
-    if test_answers is not None and len(test_answers) > 0:
-        callbacks.append(keras.callbacks.EarlyStopping(monitor='val_categorical_accuracy', patience=500))
+    gc.collect()
     
     model.fit(train_dataset, epochs=15, shuffle=False, callbacks=callbacks, validation_data=test_dataset)
 
+    gc.collect()
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    
     print()
     print("Done")
     dmetrics = model.evaluate(train_dataset, verbose=0)
@@ -271,9 +286,11 @@ def predict(feature_log:str|TextIO|dict, opts:Any)->list:
         raise Exception(f"Model file '{mf}' does not exist")
     model:tf.keras.Model = keras.models.load_model(mf)
 
-    results = [(0,(0,0))]
+    
     result = model.predict(np.copy(data), verbose=True)
+
     result = np.argmax(result, axis=1)
+    results = [(0,(0,0))]
     for i in range(len(result)):
         when = times[i]
         ans = int(result[i])
@@ -284,47 +301,34 @@ def predict(feature_log:str|TextIO|dict, opts:Any)->list:
 
     i = 0
     while i < len(results):
-        if results[i][0] != SceneType.COMMERCIAL.value:
-            del results[i]
-        else:
-            i += 1
-    
-    print(f'\n\nInitial n={len(results)}:')
-    print(results)
-
-    i = 0
-    while i < len(results):
-        #print(i, results[i])
-        # this also coalesces consecutive results into one larger range
-        if results[i][0] == results[i-1][0] and (results[i][1][0] - results[i-1][1][1]) < opts.show_min_len:
-            # tiny show gap, delete it by merging the commercials
-            results[i-1] = (results[i][0], (results[i-1][1][0], results[i][1][1]))
+        if results[i][0] == SceneType.SHOW.value:
             del results[i]
         else:
             i += 1
 
+    # clean up tiny gaps between identified breaks (including true 0-length gaps)
     # show must be at least 30 seconds long (opts.show_min_len), or we just combine it into the commercial break its in the middle of
-    # commercials must be at least 60 (opts.comm_min_len) seconds long, if it's less, it is deleted
-    # commercials must be less than 360 seconds long (opts.comm_max_len), if it's more then it is just show after that
     i = 1
     while i < len(results):
-        #print(i, results[i])
-        # this also coalesces consecutive results into one larger range
         if results[i][0] == results[i-1][0] and (results[i][1][0] - results[i-1][1][1]) < opts.show_min_len:
-            # tiny show gap, delete it by merging the commercials
             results[i-1] = (results[i][0], (results[i-1][1][0], results[i][1][1]))
             del results[i]
         else:
             i += 1
-    
+
+    print(f'\n\nMerged n={len(results)}')
+    print(results)
+
+    # commercials must be at least 60 (opts.comm_min_len) seconds long, if it's less, it is deleted
+    # commercials must be less than 360 seconds long (opts.comm_max_len), if it's more then it is just show after that
     i = 0
     while i < len(results):
         clen = results[i][1][1] - results[i][1][0]
         if clen < opts.break_min_len and results[i][0] == SceneType.COMMERCIAL.value:
-            if i+1 >= len(results) and clen >= 5 and results[i][1][1]+clen+5 > duration:
-                # dont require full length if it goes over the end of the recording
+            if i+1 >= len(results) and clen >= 5 and results[i][1][1]+clen+10 >= duration:
+                # dont require full length if it is near the end of the recording
                 break
-            elif i == 0 and clen >= 5 and results[i][1][0] < 5:
+            elif i == 0 and clen >= 5 and results[i][1][0] <= 5:
                 # don't require full length at the beginning of the recording
                 i += 1
                 pass
@@ -333,65 +337,46 @@ def predict(feature_log:str|TextIO|dict, opts:Any)->list:
                 del results[i]
             continue
 
-        if clen > opts.break_max_len and results[i][0] == SceneType.COMMERCIAL.value:
+        if clen >= opts.break_max_len:
             # huge commercial, truncate it
             results[i] = (results[i][0], (results[i][1][0], results[i][1][0] + opts.break_max_len))
 
         # its ok now, move on
         i += 1
     
-    time_thresh = .5*frame_rate
+    print('Post filter n=', len(results))
+    print(results)
+
     # now where there is a diff within a few frames of the start/end of a tag, move the tag
     # TODO also do this for audio diffs? or silence ranges?
-    for (_,(b,e)) in spans.get('diff', []):
-        for i in range(len(results)):
-            if abs(results[i][1][0] - b) <= time_thresh:
-               results[i] = (results[i][0], (b, results[i][1][1]))
-            elif abs(results[i][1][0] - e) <= time_thresh:
-               results[i] = (results[i][0], (e, results[i][1][1]))
-            if abs(results[i][1][1] - b) <= time_thresh:
-               results[i] = (results[i][0], (results[i][1][0], b))
-            elif abs(results[i][1][1] - e) <= time_thresh:
-               results[i] = (results[i][0], (results[i][1][0], e))
+    for (_,(db,de)) in spans.get('diff', []):
+        for ti in range(len(results)):
+            (tt, (tb, te)) = results[ti]
+            fixb = db-.1 < tb and tb < db+.1
+            fixe = de-.1 < te and te < de+.1
+            if fixb and not fixe:
+                results[ti] = (tt, (db, te))
+            elif fixe and not fixb:
+                results[ti] = (tt, (tb, de))
     
     # now where there is a blank within a few frames of the start/end of a tag, move the tag toward the middle of the blank
-    for (v,(b,e)) in spans.get('blank', []):
-        if not v:
+    for (bv,(bs,be)) in spans.get('blank', []):
+        if not bv or bs == 0.0 or be >= duration or (be-bs) >= 4.0:
             continue
-        for i in range(len(results)):
-            if b-time_thresh <= results[i][1][0] and results[i][1][0] <= e+time_thresh:
-                results[i] = (results[i][0], (b+(e-b)/2, results[i][1][1]))
-            elif b-time_thresh <= results[i][1][1] and results[i][1][1] <= e+time_thresh:
-                results[i] = (results[i][0], (results[i][1][0], b+(e-b)/2))
-
+        half = bs + (be - bs)
+        for ti in range(len(results)):
+            (tt, (tb, te)) = results[ti]
+            fixb = bs-.5 <= tb and tb <= be+.5
+            fixe = bs-.5 <= te and te <= be+.5
+            if fixb and not fixe:
+                results[ti] = (tt, (half, te))
+            elif fixe and not fixb:
+                results[ti] = (tt, (tb, half))
+    
     print(f'\n\nFinal n={len(results)}:')
     print(results)
 
     flog['tags'] = results
     processor.write_feature_log(flog, feature_log)
 
-    '''
-    this is broken because results[i] is a tuple of (t,(b,e)) and answers is a one-hot vector without time in it at all
-    correct = 0
-    incorrect = 0
-    for i in range(min(len(results),len(answers))):
-        actual = 0
-        expected = 0
-        for j in range(len(results[i])):
-            print(i,j,actual,expected,results[i])
-            if results[i][actual] < results[i][j]:
-                actual = j
-            if answers[i] is not None and answers[i][expected] < answers[i][j]:
-                expected = j
-        
-        if actual != expected:
-            print(f"{times[i]} MISMATCHED result type {actual} was not {expected} at strength {results[i][actual]} vs {results[i][expected]}")
-            print(results[i])
-            incorrect += 1
-        else:
-            #print(f"{times[i]} matched result type {actual} at strength {results[i][actual]}")
-            correct += 1
-    if correct+incorrect > 0:
-        print(f"{round(correct*100/(correct+incorrect),2)}% accurate")
-    '''
     return results

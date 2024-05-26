@@ -75,7 +75,7 @@ class Player:
                 pts = int(seconds / vs.time_base) + vs.start_time
                 self.vpts = pts
                 self.container.seek(pts, stream=vs, any_frame=True)
-                vf = next(self.frames())
+                vf = next(self.frames(), None)
                 if vf and ((vf.time + 1/self.frame_rate) - self.vt_start) <= orig_ask:
                     break
                 #print(f"trying to get to {orig_ask} at {seconds} got {vf.time-self.vt_start}")
@@ -84,34 +84,6 @@ class Player:
         
         for f in self.frames():
             if (f.time - self.vt_start) >= orig_ask:
-                return f
-        return None
-    
-    def ______maybe_new_seek_exact(self, seconds:float)->av.VideoFrame:
-        old_pos = self.vpts
-        if seconds > self.duration:
-            seconds = self.duration
-        orig_ask = seconds
-        vs = self.container.streams.video[self.streams.get('video', 0)]
-        while True:
-            pts = int(seconds / vs.time_base) + vs.start_time
-            self.vpts = pts
-            self.container.seek(pts, stream=vs, any_frame=True)
-            self._flush()
-            f = next(self.frames())
-            print(f"trying to get to {seconds} got {f.time-self.vt_start}")
-            if (f.time-self.vt_start) > orig_ask and seconds > 1:
-                seconds -= 0.5
-            elif (f.time-self.vt_start) == orig_ask:
-                return f
-            else:
-                break
-        
-        for f in self.frames():
-            print(f"Check seek to {seconds}, got {f.time - self.vt_start} (old pos {old_pos - self.vt_start})")
-            if f.time == old_pos and (old_pos - self.vt_start) != seconds:
-                continue
-            if (f.time - self.vt_start) >= seconds:
                 return f
         return None
     
@@ -127,7 +99,7 @@ class Player:
         self.aq = None
         self._audio_res = []
 
-    def _queue_audio(self, af):
+    def _queue_audio(self, af:av.AudioFrame):
         if self.aq is None or af is None or af.time is None:
             return
         d = af.to_ndarray()
