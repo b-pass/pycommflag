@@ -17,6 +17,9 @@ def run(opts:Any) -> None|int:
     if opts.train:
         return neural.train(opts=opts)
     
+    if opts.gui and not opts.feature_log:
+        opts.feature_log = opts.gui
+
     if not opts.chanid and not opts.starttime:
         if opts.feature_log:
             if m:=re.match(r'(?:.*[\//])?cf_(\d{4,6})_(\d{12,})(?:\.[a-zA-Z0-9]{2,5}){1,4}', opts.feature_log):
@@ -38,10 +41,13 @@ def run(opts:Any) -> None|int:
         return 0
     
     if opts.gui:
-        flog = processor.reprocess(opts.feature_log, opts=opts)
+        if not opts.feature_log:
+            opts.feature_log = opts.gui
+        
+        flog = processor.reprocess(opts.gui, opts=opts)
         if not opts.filename:
             opts.filename = flog.get('filename','')
-            
+        
         if not opts.filename:
             print('No video file was found in the options')
             return 1

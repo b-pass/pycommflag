@@ -182,6 +182,9 @@ def load_data(opts)->tuple[list,list,list,list]:
     return (np.copy(x),np.copy(y),np.copy(xt),np.copy(yt))
 
 def train(opts:Any=None):
+    # yield CPU time to useful tasks, this is a background thing...
+    os.nice(10)
+
     (data,answers,test_data,test_answers) = load_data(opts)
     gc.collect()
     
@@ -286,7 +289,6 @@ def predict(feature_log:str|TextIO|dict, opts:Any)->list:
         raise Exception(f"Model file '{mf}' does not exist")
     model:tf.keras.Model = keras.models.load_model(mf)
 
-    
     result = model.predict(np.copy(data), verbose=True)
 
     result = np.argmax(result, axis=1)
@@ -324,7 +326,7 @@ def predict(feature_log:str|TextIO|dict, opts:Any)->list:
     i = 0
     while i < len(results):
         clen = results[i][1][1] - results[i][1][0]
-        if clen < opts.break_min_len and results[i][0] == SceneType.COMMERCIAL.value:
+        if clen < 10 or (clen < opts.break_min_len and results[i][0] == SceneType.COMMERCIAL.value):
             if i+1 >= len(results) and clen >= 5 and results[i][1][1]+clen+10 >= duration:
                 # dont require full length if it is near the end of the recording
                 break

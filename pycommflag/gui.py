@@ -151,8 +151,9 @@ class Window(tk.Tk):
         self.tag_cancel = tk.Button(tags, text='Cancel This Flag')
 
         self.taggers.append((tk.Button(tags), SceneType.COMMERCIAL, 'Break'))
-        self.taggers.append((tk.Button(tags), SceneType.INTRO, 'Intro'))
         self.taggers.append((tk.Button(tags), SceneType.SHOW, 'Show'))
+        #self.taggers.append((tk.Button(tags), SceneType.TRANSITION, 'Transition'))
+        self.taggers.append((tk.Button(tags), SceneType.INTRO, 'Intro'))
         self.taggers.append((tk.Button(tags), SceneType.CREDITS, 'Credits'))
         self.taggers.append((tk.Button(tags), SceneType.DO_NOT_USE, 'Bad'))
 
@@ -489,14 +490,15 @@ class Window(tk.Tk):
                 self.tags[e:e] = [(tt, (endpos,x))]
             
             # if the one before is the same type, merge with that
-            if b > 0 and b-1 < len(self.tags) and self.tags[b-1][0] == settype and (startpos-self.tags[b-1][1][1]) < 0.02:
+            if b > 0 and b-1 < len(self.tags) and self.tags[b-1][0] == settype and (startpos-self.tags[b-1][1][1]) < 0.05:
                 b -= 1
                 startpos = self.tags[b][1][0]
             # if the one after is the same type, merge with that
-            if e > 0 and e < len(self.tags) and self.tags[e][0] == settype and (self.tags[e][1][0] - endpos) < 0.02:
+            if e < len(self.tags) and self.tags[e][0] == settype and (self.tags[e][1][0] - endpos) < 0.05:
                 endpos = self.tags[e][1][1]
                 e += 1
             
+            # and now replace all of that stuff with this new tag
             self.tags[b:e] = [(settype, (startpos, endpos))]
             
         self.settype = None
@@ -530,6 +532,7 @@ class Window(tk.Tk):
         for (t,(b,e)) in self.tags:
             if t != SceneType.SHOW:
                 self.result.append((t.value,(b,e)))
+        print('RESULT', self.result)
         self.destroy()
 
     def run(self):

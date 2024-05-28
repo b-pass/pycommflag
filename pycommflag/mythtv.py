@@ -117,23 +117,29 @@ def set_breaks(chanid, starttime, marks)->None:
             rate = container.streams.video[0].average_rate
         
         c.execute("DELETE FROM recordedmarkup "\
-                  "WHERE chanid = %s AND starttime = %s AND (type = 4 OR type = 5) ",
+                  "WHERE chanid = %s AND starttime = %s AND (type = 2 OR type = 4 OR type = 5) ",
                   (chanid, starttime))
         
         for (st,(b,e)) in marks:
-            print(st,b,e)
-            if st not in [SceneType.COMMERCIAL, SceneType.COMMERCIAL.value]:
-                # TODO: other tag types (intro, outro, etc)?? are they chapters? commercials?
+            if type(st) is int:
+                st = SceneType(st)
+            if st == SceneType.DO_NOT_USE:
                 continue
+            print(st,b,e)
+
+            # MythTV stores commbreaks as frame numbers in its DB
+            # Which is from like 1999
+            # But we're using times instead.
+            # MythTV stores the time associated with each keyframe in the DB as type 33.
+            # So we find the frame number of the timestamp closest to the one we want and 
+            # then use the frame rate to ship to the exact frame number we have flagged.
+
             c.execute("SELECT `offset`,mark FROM recordedseek "\
                       "WHERE chanid = %s AND starttime = %s AND type = 33 "\
-                      "ORDER BY ABS(CAST(`offset` AS SIGNED) - "+str(int(e*1000))+") ASC "\
+                      "ORDER BY ABS(CAST(`offset` AS SIGNED) - "+str(int(b*1000))+") ASC "\
                       "LIMIT 1",
                       (chanid, starttime))
-            o = 0
-            m = 0
-            for (o,m) in c.fetchall():
-                break
+            (o,m) = c.fetchone()
             fb = int(m) + round((b - float(o)/1000) * rate)
             if fb < 0: fb = 0
 
@@ -142,15 +148,20 @@ def set_breaks(chanid, starttime, marks)->None:
                       "ORDER BY ABS(CAST(`offset` AS SIGNED) - "+str(int(e*1000))+") ASC "\
                       "LIMIT 1",
                       (chanid, starttime))
-            o = 0
-            m = 0
-            for (o,m) in c.fetchall():
-                break
-            fe = m + round((e - o/1000) * rate)
-
-            print("\t....",st,fb,fe)
+            (o,m) = c.fetchone()
+            fe = int(m) + round((e - o/1000) * rate)
             
-            c.execute("INSERT INTO recordedmarkup (chanid,starttime,mark,type) "\
-                      "VALUES(%s,%s,%s,4),(%s,%s,%s,5);",
-                      (chanid, starttime, fb, chanid, starttime, fe))
+            if st == SceneType.COMMERCIAL:
+                print("\t....",st,fb,fe)
+                c.execute("INSERT INTO recordedmarkup (chanid,starttime,mark,type) "\
+                          "VALUES(%s,%s,%s,4),(%s,%s,%s,5);",
+                          (chanid, starttime, fb, chanid, starttime, fe))
+            elif st == SceneType.INTRO or st == SceneType.CREDITS:
+                print("\t....",st,fe, '(B)')
+                c.execute("INSERT INTO recordedmarkup (chanid,starttime,mark,type) "\
+                          "VALUES(%s,%s,%s,2)",
+                          (chanid, starttime, fe))
+            else:
+                pass
+            
         

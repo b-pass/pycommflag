@@ -56,14 +56,17 @@ def write_feature_log(flog:dict, log_file:str|TextIO):
     log_file.write("\n}\n")
 
 def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> None:
-    if np.empty(0, 'int'): raise Exception('antigravity') # get the stupid warning out early from numpy 1.13
+    # if we ever implement "live" processing then don't do this...
+    
+    # yield CPU time to useful tasks, this is a background thing.
+    os.nice(10)
 
     logo = None
     if type(feature_log) is str:
         if os.path.exists(feature_log) and not opts.no_logo:
             logo = logo_finder.from_json(read_feature_log(feature_log).get('logo', None))
             if logo and not opts.quiet:
-                print(f"{feature_log} exists, re-using logo ", logo[0], logo[1])
+                log.info(f"{feature_log} exists, re-using logo ", logo[0], logo[1])
         
         if feature_log.endswith('.gz'):
             import gzip
@@ -103,15 +106,14 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
 
     start = time.time()
     fcount = 0
-    ftotal = int(player.duration * player.frame_rate)
+    ftotal = int(player.duration * player.frame_rate)+1
 
     percent = ftotal/100.0
     report = math.ceil(ftotal/1000) if not opts.quiet else ftotal*10
     rt = time.perf_counter()
     p = 0
     
-    audio_interval = round(player.frame_rate)
-
+    audio_interval = round(player.frame_rate*5.0)
     audioProc = AudioProc(player.frame_rate)
     audioProc.start()
 
@@ -153,16 +155,14 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
 
     frames = videoProc.frames
 
-    audioProc.fspan.end(frames[-1][0])
-
     # often the video doesn't start a PTS 0 because of avsync issues, back-fill the first video frame
-    if frames[0][0] > 0:
-        while True:
-            frames[0:0] = [list(frames[0])] # insert
-            frames[0][0] = round(frames[0][0] - 1/player.frame_rate, 5)
-            if frames[0][0] <= 0.0:
-                frames[0][0] = 0.0
-                break
+    #if frames[0][0] > 0:
+    #    while True:
+    #        frames[0:0] = [list(frames[0])] # insert
+    #        frames[0][0] = round(frames[0][0] - 1/player.frame_rate, 5)
+    #        if frames[0][0] <= 0.0:
+    #            frames[0][0] = 0.0
+    #            break
     
     header = videoProc.frame_header()
     
@@ -319,8 +319,8 @@ class AudioProc(Thread):
         # resample to 16 kHz
         return (
             t, 
-            spsig.resample(main, int(len(main)*16000/sr)), 
-            spsig.resample(surr, int(len(surr)*16000/sr)) if surr is not None else None,
+            spsig.resample_poly(main, 16000, sr, padtype='mean'), 
+            spsig.resample_poly(surr, 16000, sr, padtype='mean') if surr is not None else None,
         )
 
     def run(self):
@@ -343,8 +343,7 @@ class AudioProc(Thread):
                 nexttime = st + len(sm)/16000
                 
                 if missing != 0:
-                    #print('Missing',missing,"before",st)
-                    #print('Missing',missing,'audio samples? fill zero...')
+                    log.info('Missing',missing,'audio samples before time',st)
                     # these are LEADING missing values
                     sm = np.append(np.zeros(missing, 'float32'), sm)
 

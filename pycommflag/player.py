@@ -149,7 +149,6 @@ class Player:
         self.container.streams.audio[0].thread_count = 2
         if pts is not None:
             self.container.seek(pts, stream=self.container.streams.video[0], any_frame=True, backward=False)
-        self._flush()
 
     def move_audio(self)->list[tuple[np.ndarray,float,list[float]]]:
         x = self.aq
@@ -185,8 +184,9 @@ class Player:
                 continue
             
             if fail:
+                if self.graph:
+                    self._create_graph()
                 log.info(f"Resync'd after {fail} skipped/dropped/corrupt/whatever frames")
-                self._flush()
                 fail = 0
             
             if type(frame) is av.AudioFrame:

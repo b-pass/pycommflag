@@ -15,8 +15,8 @@ def get_options():
                         help="Output location for commercial break results")
     parser.add_argument('-r', '--reprocess', dest="reprocess", type=str, 
                         help="Input location of feature data log to be reprocessed.")
-    parser.add_argument('-g', '--gui', dest='gui', action='store_true', 
-                        help="(Re)Process and then display for GUI editing.  Must also supply --file and --feature-log for the thing being edited in the GUI.")
+    parser.add_argument('-g', '--gui', dest='gui', type=str, 
+                        help="Display this feature log for GUI editing.")
     parser.add_argument('-q', '--quiet', dest='quiet', action='store_true',
                         help="Do not print progress during processing")
     parser.add_argument('--loglevel', dest='loglevel', type=str,
