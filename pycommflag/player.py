@@ -120,9 +120,25 @@ class Player:
         #d = ((d[0,...] + d[1,...]) / 2.0 + d[2,...]) / 1.4142
 
         surr = np.sum(d[3:,...], 0) / (d.shape[0]-3) if d.shape[0] >= 4 else None
-        
-        #print("AQ:",d.shape,af.time-self.at_start,af.sample_rate)
-        self.aq.append((main,surr,af.time-self.at_start,af.sample_rate))
+
+        when = af.time - self.at_start
+
+        if self.aq and \
+            self.aq[-1][3] == af.sample_rate and \
+            (self.aq[-1][2] + len(self.aq[-1][0]) / af.sample_rate) >= when and \
+            ((surr is None and self.aq[-1][1] is None) or \
+                 (surr is not None and self.aq[-1][1] is not None and len(self.aq[-1][0]) == len(self.aq[-1][1]))):
+
+            #print(f'Append {len(main)} to {len(self.aq[-1][0])} at {when} sr {af.sample_rate}')
+            self.aq[-1] = (
+                np.append(self.aq[-1][0], main),
+                np.append(self.aq[-1][1], surr) if surr is not None else None,
+                self.aq[-1][2],
+                af.sample_rate
+            )
+        else:
+            #print("AQ:",d.shape,af.time-self.at_start,af.sample_rate)
+            self.aq.append((main,surr,af.time-self.at_start,af.sample_rate))
 
     def _flush(self):
         if self.graph:

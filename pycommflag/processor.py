@@ -66,7 +66,7 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
         if os.path.exists(feature_log) and not opts.no_logo:
             logo = logo_finder.from_json(read_feature_log(feature_log).get('logo', None))
             if logo and not opts.quiet:
-                log.info(f"{feature_log} exists, re-using logo ", logo[0], logo[1])
+                log.info(f"{feature_log} exists, re-using logo {logo[0]},{logo[1]}")
         
         if feature_log.endswith('.gz'):
             import gzip
@@ -76,15 +76,6 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
     else:
         feature_log.seek(0)
         feature_log.truncate()
-
-    feature_log.write('{ "file_version":10')
-
-    if opts.chanid: feature_log.write(f',\n"chanid":"{opts.chanid}"')
-    if opts.starttime: feature_log.write(f',\n"starttime":"{opts.starttime}"')
-    try:
-        feature_log.write(f',\n"filename":"{os.path.realpath(opts.filename)}"')
-    except:
-        pass
 
     player = Player(video_filename, no_deinterlace=opts.no_deinterlace)
 
@@ -96,7 +87,14 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
         logo = logo_finder.search(player, opts=opts)
         player.seek(0)
     
-    player.enable_audio()
+    feature_log.write('{ "file_version":10')
+
+    if opts.chanid: feature_log.write(f',\n"chanid":"{opts.chanid}"')
+    if opts.starttime: feature_log.write(f',\n"starttime":"{opts.starttime}"')
+    try:
+        feature_log.write(f',\n"filename":"{os.path.realpath(opts.filename)}"')
+    except:
+        pass
 
     feature_log.write(f',\n"duration":{float(player.duration)}')
     feature_log.write(f',\n"frame_rate":{round(float(player.frame_rate),4)}')
@@ -105,6 +103,7 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
     feature_log.write(logo_finder.to_json(logo))
 
     start = time.time()
+    
     fcount = 0
     ftotal = int(player.duration * player.frame_rate)+1
 
@@ -113,7 +112,8 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
     rt = time.perf_counter()
     p = 0
     
-    audio_interval = round(player.frame_rate*5.0)
+    player.enable_audio()
+    audio_interval = round(player.frame_rate)
     audioProc = AudioProc(player.frame_rate)
     audioProc.start()
 
@@ -217,8 +217,7 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
 class VideoProc(Thread):
     def __init__(self, vt_start, logo, opts):
         super().__init__(name="videoProc")
-        self.queue = Queue(150)
-        self.go = True
+        self.queue = Queue(300)
         self.vt_start = vt_start
         self.fcount = 0
         self.logo = logo
@@ -228,9 +227,7 @@ class VideoProc(Thread):
         self.frames = []
 
     def stop(self):
-        self.go = False
         self.queue.put(None)
-        self.go = False
     
     def run(self):
         while True:
@@ -238,18 +235,15 @@ class VideoProc(Thread):
             if x is not None:
                 self._proc(*x)
             else:
-                if self.queue.empty():
-                    if not self.go:
-                        break
+                break
 
     def add_frame(self, frame):
         fcolor = frame.to_ndarray(format="rgb24")#, height=720, width=frame.width*(720/frame.height))
-        self.queue.put((frame,fcolor))
-    
-    def _proc(self, frame, fcolor):
-        self.fcount += 1
-        
         logo_present = logo_finder.check_frame(frame, self.logo)
+        self.queue.put((frame.time,fcolor,logo_present))
+    
+    def _proc(self, ftime, fcolor, logo_present):
+        self.fcount += 1
 
         column = mean_axis1_float_uint8(fcolor).astype('int16')
         if self.prev_col is not None:
@@ -272,7 +266,7 @@ class VideoProc(Thread):
         else:
             frame_blank = False
 
-        self.lasttime = round(frame.time-self.vt_start,5)
+        self.lasttime = round(ftime-self.vt_start,5)
         self.frames.append([self.lasttime, int(logo_present), int(frame_blank), round(diff, 6)])
         #f",[{self.lasttime},{int(logo_present)},{int(frame_blank)},{int(is_diff)}]\n"
     
@@ -302,7 +296,7 @@ class AudioProc(Thread):
         self.volume_window = max(2/29.97, volume_window)
         self.work_rate = max(1.0, work_rate)
         self.seg = ina_foss.Segmenter()
-        self.queue = Queue(150)
+        self.queue = Queue(300)
         self.fspan = AudioFeatureSpan()
         self.fspan.start()
         self.rms = [(0,0,0)]
@@ -342,10 +336,18 @@ class AudioProc(Thread):
                 missing = int(round((st - nexttime)*16000))
                 nexttime = st + len(sm)/16000
                 
-                if missing != 0:
-                    log.info('Missing',missing,'audio samples before time',st)
+                if missing > 0:
+                    log.info(f'Missing {missing} audio samples before time {st} (got {len(sm)})')
                     # these are LEADING missing values
                     sm = np.append(np.zeros(missing, 'float32'), sm)
+                elif missing < 0:
+                    extra = -missing
+                    log.info(f'Extra audio samples at time {st}? Got {len(sm)}, dropping {extra} of them...')
+                    if extra == len(sm):
+                        continue
+                    sm = sm[extra:]
+                    if len(ss) >= extra:
+                        ss = ss[extra:]
 
                 # resample code might leave TRAILING holes in ss; so pad it if needed
                 if ss is None:
@@ -403,7 +405,9 @@ def reprocess(feature_log_filename:str, opts:Any=None) -> dict:
     if feature_log_filename is None:
         raise Exception('missing feature_log_filename')
     # deprecated?
-    return read_feature_log(feature_log_filename)
+    flog = read_feature_log(feature_log_filename)
+    read_logo(flog)
+    return flog
 
 def read_logo(log_in:str|TextIO|dict) -> None|tuple:
     return logo_finder.from_json(read_feature_log(log_in).get('logo', None))

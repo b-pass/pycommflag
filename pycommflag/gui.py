@@ -327,7 +327,9 @@ class Window(tk.Tk):
                 frame_blank = max(med) < 24 and np.std(med) < 3 and np.std(bchk) < 6
                 info += f'c-Max: {cmax} | Max: {max(med)}\nStdMed: {round(np.std(med),2)} | StdAll: {round(np.std(bchk),2)}\n'
                 info += ('Blank' if frame_blank else 'Not Blank')
-                info += '\n\n'
+                info += '\n'
+                lif = logo_finder.logo_in_frame(frame, self.logo)
+                info += 'Logo? %3.01f%% (%d of %d)\n\n' % (lif[0]/lif[1]*100, lif[0], lif[1])
 
         self.vinfo.configure(text=info)
 

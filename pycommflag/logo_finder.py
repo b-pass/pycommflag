@@ -58,12 +58,24 @@ def search(player:Player, search_beginning:bool=False, opts:Any=None) -> tuple|N
 
     # in case we found something stuck on the screen, try to look beyond that
     best = np.max(logo_sum)
-    if best > fcount*.95:
-        logo_sum = np.where(logo_sum <= fcount*.9, logo_sum, 0)
+    while best > fcount*.95:
+        pos = np.argwhere(logo_sum >= best)[-1]
+        if pos[0] >= player.shape[0]/2:
+            if pos[1] >= player.shape[1]/2:
+                logo_sum[player.shape[0]//2:,player.shape[1]//2:] = 0
+            else:
+                logo_sum[player.shape[0]//2:, :player.shape[1]//2] = 0
+        else:
+            if pos[1] >= player.shape[1]/2:
+                logo_sum[:player.shape[0]//2, player.shape[1]//2:] = 0
+            else:
+                logo_sum[:player.shape[0]//2, :player.shape[1]//2] = 0
+        log.info(f'Stuck logo ({best*100/fcount}%) at {pos[0]},{pos[1]} -- nuke quarter of the screen')
         best = np.max(logo_sum)
+        log.debug(f'New best = {best*100/fcount}% of {fcount}')
 
     if best <= fcount / 3:
-        log.info(f"No logo found (insufficient edge strength, best={best*100/fcount})")
+        log.info(f"No logo found (insufficient edge strength, best={best*100/fcount}%)")
         return None
     
     logo_mask = logo_sum >= (best - fcount*.15)
@@ -72,18 +84,17 @@ def search(player:Player, search_beginning:bool=False, opts:Any=None) -> tuple|N
         return None
     
     nz = np.nonzero(logo_mask)
-    top = int(min(nz[0]))
-    left = int(min(nz[1]))
-    bottom = int(max(nz[0]))
-    right = int(max(nz[1]))
+    top = int(np.min(nz[0]))
+    left = int(np.min(nz[1]))
+    bottom = int(np.max(nz[0]))
+    right = int(np.max(nz[1]))
     if right - left < 5 or bottom - top < 5:
-        log.info("No logo found (bounding box too narrow)")
+        log.info(f"No logo found (bounding box {top},{left}->{bottom},{right} is too small)")
         return None
 
     # if the bound is more than half the image then clip it
     if bottom-top >= player.shape[0]/2 or right-left >= player.shape[1]/2:
         pos = np.argwhere(logo_sum >= best)[-1]
-        log.debug(f"Pre-trunc bounding box: {top},{left}->{bottom},{right}. Max ele={pos}")
         
         if pos[0] >= player.shape[0]/2:
             top = int(player.shape[0]/2)
@@ -101,7 +112,7 @@ def search(player:Player, search_beginning:bool=False, opts:Any=None) -> tuple|N
         top = top+int(min(nz[0]))
         left = left+int(min(nz[1]))
         if right - left < 5 or bottom - top < 5:
-            log.info("No logo found (truncated bounding box too narrow)")
+            log.info(f"No logo found (truncated bounding box at {top},{left}->{bottom},{right} too small)")
             return None
     
     top -= 5
@@ -109,29 +120,49 @@ def search(player:Player, search_beginning:bool=False, opts:Any=None) -> tuple|N
     bottom += 5
     right += 5
     
-    logo_mask = logo_mask[top:bottom,left:right]
-    
-    log.debug(f"Logo bounding box: {top},{left} to {bottom},{right}")
+    log.debug(f"Final logo bounding box: {top},{left}->{bottom},{right}")
 
+    logo_mask = logo_mask[top:bottom,left:right]
+    filt = 0
+    for y in range(5,logo_mask.shape[0]-10):
+        for x in range(5,logo_mask.shape[1]-10):
+            if logo_mask[y,x]:
+                ok = False
+                for yo in range(-2,3):
+                    for xo in range(-2,3):
+                        if (xo or yo) and logo_mask[y+yo,x+xo]:
+                            ok = True
+                            break
+                if not ok:
+                    logo_mask[y,x] = False
+                    filt += 1
+    if filt:
+        log.debug(f"Filtered {filt} logo mask elements that were isolated from others")
+    
     lmc = np.count_nonzero(logo_mask)
     if lmc < 20:
         log.info(f"No logo found (not enough edges within bounding box, got {lmc})")
         return None
-    thresh = int(lmc * .75)
+    thresh = round(lmc * 2 / 3)
+
     return ((top,left), (bottom,right), logo_mask, thresh)
 
-def check_frame(frame :VideoFrame, logo :tuple) -> bool:
-    global _LOGO_EDGE_THRESHOLD
-
+def logo_in_frame(frame :VideoFrame, logo :tuple) -> tuple[int, int]:
     if not logo:
-        return False
+        return (0,1)
+    global _LOGO_EDGE_THRESHOLD
     
     ((top,left),(bottom,right),lmask,thresh) = logo
     c = _gray(frame, [top,bottom,left,right])
     c = scipy.ndimage.sobel(c) > _LOGO_EDGE_THRESHOLD
     c = np.where(lmask, c, False)
     #print('\n!',np.count_nonzero(c),'of',np.count_nonzero(lmask),'!')
-    return np.count_nonzero(c) >= thresh
+    n = np.count_nonzero(c)
+    return n, thresh
+
+def check_frame(frame :VideoFrame, logo :tuple) -> bool:
+    (n,t) = logo_in_frame(frame, logo)
+    return n >= t
 
 def _gray(frame:VideoFrame,box:tuple=None) -> np.ndarray:
     if frame.format.is_planar:
@@ -156,11 +187,35 @@ def from_json(js:list|str)->tuple|None:
     if type(js) != list:
         raise Exception("Expected dict")
     assert(len(js) == 4)
+    logo_mask = np.array(js[2], 'bool')
+
+    filt = 0
+    thresh = js[3]
+    for y in range(5,logo_mask.shape[0]-10):
+        for x in range(5,logo_mask.shape[1]-10):
+            if logo_mask[y,x]:
+                ok = False
+                for yo in range(-2,3):
+                    for xo in range(-2,3):
+                        if (xo or yo) and logo_mask[y+yo,x+xo]:
+                            ok = True
+                            break
+                if not ok:
+                    logo_mask[y,x] = False
+                    filt += 1
+    
+    if filt > thresh/4:
+        # ok, never mind...
+        logo_mask = np.array(js[2], 'bool')
+    else:
+        # also decrease the threshold...
+        thresh -= filt
+
     return (
         (js[0][0], js[0][1]),
         (js[1][0], js[1][1]),
-        np.array(js[2], 'bool'),
-        js[3]
+        logo_mask,
+        thresh,
     )
 
 def to_json(logo:tuple)->str:

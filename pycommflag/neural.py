@@ -11,7 +11,7 @@ from .feature_span import *
 from . import processor
 
 TIME_WINDOW = 2.0
-UNITS = 64
+UNITS = 128
 DROPOUT = .2
 
 def flog_to_vecs(flog:dict)->tuple[list[float], list[list[float]], list[list[float]]]:
@@ -164,8 +164,8 @@ def load_data(opts)->tuple[list,list,list,list]:
     
     import random
     random.seed(time.time())
-    need = int(len(x)/4) - len(xt)
-    if need > (len(x)/100):
+    need = len(x)//4 - len(xt)
+    if need > len(x)/100:
         print('Need to move',need,'datum to the test/eval set')
         z = list(zip(x,y))
         n=x=y=None
@@ -178,8 +178,13 @@ def load_data(opts)->tuple[list,list,list,list]:
             xt += a
             yt += b
         print('...done')
+    
+    #x = np.copy(x)
+    #y = np.copy(y)
+    #xt = np.copy(xt)
+    #yt = np.copy(yt)
 
-    return (np.copy(x),np.copy(y),np.copy(xt),np.copy(yt))
+    return (x,y,xt,yt)
 
 def train(opts:Any=None):
     # yield CPU time to useful tasks, this is a background thing...
@@ -221,8 +226,8 @@ def train(opts:Any=None):
     inputs = keras.Input(shape=(nsteps,nfeat))
     n = inputs
     n = layers.LSTM(UNITS, dropout=DROPOUT)(n)
-    #n = layers.LSTM(32, dropout=DROPOUT, return_sequences=True)(n)
-    #n = layers.LSTM(16)(n)
+    #n = layers.LSTM(UNITS, dropout=DROPOUT, return_sequences=True)(n)
+    #n = layers.LSTM(UNITS//2)(n)
     outputs = layers.Dense(SceneType.count(), activation='softmax')(n)
     model = keras.Model(inputs, outputs)
     model.summary()
@@ -243,7 +248,7 @@ def train(opts:Any=None):
     
     gc.collect()
     
-    model.fit(train_dataset, epochs=15, shuffle=False, callbacks=callbacks, validation_data=test_dataset)
+    model.fit(train_dataset, epochs=15, shuffle=True, callbacks=callbacks, validation_data=test_dataset)
 
     gc.collect()
     signal.signal(signal.SIGINT, signal.SIG_DFL)
@@ -342,6 +347,14 @@ def predict(feature_log:str|TextIO|dict, opts:Any)->list:
         if clen >= opts.break_max_len:
             # huge commercial, truncate it
             results[i] = (results[i][0], (results[i][1][0], results[i][1][0] + opts.break_max_len))
+            nextstart = results[i][1][1] + opts.min_show_len
+            # check to make sure we didn't somehow create a small gap, if we did then WIDEN it to be min_show_len
+            while i+1 < len(results) and results[i+1][1][0] < nextstart:
+                if results[i+1][1][1] <= nextstart:
+                    del results[i+1]
+                else:
+                    results[i+1][1] = (nextstart, results[i+1][1][1])
+                    break
 
         # its ok now, move on
         i += 1
