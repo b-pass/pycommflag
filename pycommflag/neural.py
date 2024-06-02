@@ -11,7 +11,7 @@ from .feature_span import *
 from . import processor
 
 TIME_WINDOW = 2.0
-UNITS = 128
+UNITS = 64
 DROPOUT = .2
 
 def flog_to_vecs(flog:dict)->tuple[list[float], list[list[float]], list[list[float]]]:
@@ -109,6 +109,24 @@ def flog_to_vecs(flog:dict)->tuple[list[float], list[list[float]], list[list[flo
         del answers[i]
 
     return (timestamps,data,answers)
+
+def create_data_generator(data,answers,batch_size):
+    from keras.utils import Sequence
+
+    class pycfDataGenerator(Sequence):
+        def __init__(self, data, answers, batch_size):
+            self.batch_size = batch_size
+            self.data = data
+            self.answers = answers
+        
+        def __len__(self):
+            return len(self.answers) // self.batch_size
+        
+        def __getitem__(self, index):
+            index *= self.batch_size
+            return np.copy(self.data[index:index+self.batch_size]), np.copy(self.answers[index:index+self.batch_size])
+
+    return pycfDataGenerator(data,answers,batch_size)
 
 def load_data(opts)->tuple[list,list,list,list]:
     data = opts.ml_data
@@ -212,12 +230,13 @@ def train(opts:Any=None):
     print("Data (x):",len(data)," Test (y):", len(test_data), "; Samples=",nsteps,"; Features=",nfeat)
     
     batch_size = opts.tf_batch_size if opts else 500
-    train_dataset = tf.data.Dataset.from_tensor_slices((data, answers)).batch(batch_size)
+    train_dataset = create_data_generator(data, answers, batch_size)#train_dataset = tf.data.Dataset.from_tensor_slices((data, answers)).batch(batch_size)
     data = None
     answers = None
     gc.collect()
 
-    test_dataset = tf.data.Dataset.from_tensor_slices((test_data, test_answers)).batch(batch_size)
+    #test_dataset = tf.data.Dataset.from_tensor_slices((test_data, test_answers)).batch(batch_size)
+    test_dataset = create_data_generator(test_data, test_answers, batch_size)
     have_test = test_answers is not None and len(test_answers) > 0
     test_data = None
     test_answers = None
@@ -239,7 +258,7 @@ def train(opts:Any=None):
         print("\nStopping (gracefully)...\n")
         model.stop_training = True
         signal.signal(signal.SIGINT, signal.SIG_DFL)
-    signal.signal(signal.SIGINT, handler)
+    oldhandler = signal.signal(signal.SIGINT, handler)
 
     callbacks = []
     #callbacks.append(keras.callbacks.EarlyStopping(monitor='categorical_accuracy', patience=50))
@@ -248,10 +267,10 @@ def train(opts:Any=None):
     
     gc.collect()
     
-    model.fit(train_dataset, epochs=15, shuffle=True, callbacks=callbacks, validation_data=test_dataset)
+    model.fit(train_dataset, batch_size=batch_size, epochs=15, shuffle=True, callbacks=callbacks, validation_data=test_dataset)
 
     gc.collect()
-    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    signal.signal(signal.SIGINT, oldhandler)
     
     print()
     print("Done")
@@ -347,8 +366,8 @@ def predict(feature_log:str|TextIO|dict, opts:Any)->list:
         if clen >= opts.break_max_len:
             # huge commercial, truncate it
             results[i] = (results[i][0], (results[i][1][0], results[i][1][0] + opts.break_max_len))
-            nextstart = results[i][1][1] + opts.min_show_len
-            # check to make sure we didn't somehow create a small gap, if we did then WIDEN it to be min_show_len
+            nextstart = results[i][1][1] + opts.show_min_len
+            # check to make sure we didn't somehow create a small gap, if we did then WIDEN it to be show_min_len
             while i+1 < len(results) and results[i+1][1][0] < nextstart:
                 if results[i+1][1][1] <= nextstart:
                     del results[i+1]

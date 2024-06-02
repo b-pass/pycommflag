@@ -258,11 +258,12 @@ class VideoProc(Thread):
         x = np.max(fcolor[int(fcolor.shape[0]*3/8):int(fcolor.shape[0]*5/8),int(fcolor.shape[1]*3/8):int(fcolor.shape[1]*5/8)])
         #print("at",frame.time-self.vt_start)
         #print("max=",x)
-        if x < 64:
-            bchk = logo_finder.subtract(fcolor, self.logo)
-            m = np.median(bchk, (0,1))
-            #print("median=",m,"maxmediam=",max(m),"stdmedian=",np.std(m),"allstd=",np.std(bchk))
-            frame_blank = max(m) < 24 and np.std(m) < 3 and np.std(bchk) < 6
+        if x < 32:
+            fcolor = logo_finder.subtract(fcolor, self.logo)
+            m = np.median(fcolor, (0,1))
+            #print("median=",m,"maxmediam=",max(m),"stdmedian=",np.std(m),"allstd=",np.std(fcolor))
+            frame_blank = max(m) < 24 and np.std(m) < 3 and np.std(fcolor) < 6
+            fcolor = None
         else:
             frame_blank = False
 
