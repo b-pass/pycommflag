@@ -1,18 +1,26 @@
 import logging as log
-import os
-import numpy as np
-import re
-import time
-import sys
 import gc
+import math
+from multiprocessing import Process, Queue
+import os
+import pickle
+import re
+import resource
+import sys
+import tempfile
+import time
 from typing import Any,TextIO,BinaryIO
+
+import numpy as np
+from keras.utils import Sequence
 
 from .feature_span import *
 from . import processor
 
 TIME_WINDOW = 2.0
 UNITS = 64
-DROPOUT = .2
+DROPOUT = .1
+EPOCHS = 15
 
 def flog_to_vecs(flog:dict)->tuple[list[float], list[list[float]], list[list[float]]]:
     version = flog.get('file_version', 10)
@@ -54,7 +62,7 @@ def flog_to_vecs(flog:dict)->tuple[list[float], list[list[float]], list[list[flo
         frames = frames[::int(frame_rate/29)]
     
     # ok now we can numpy....
-    frames = np.copy(frames)
+    frames = np.array(frames)
 
     # copy the real timestamps
     timestamps = frames[...,0].tolist()
@@ -65,22 +73,35 @@ def flog_to_vecs(flog:dict)->tuple[list[float], list[list[float]], list[list[flo
     # normalize frame diffs
     frames[...,3] = np.clip(frames[...,3] / 30, 0, 1.0)
 
-    need = int((TIME_WINDOW * 29) / 2)
-        
+    need = int((TIME_WINDOW * 29.97) / 2) + 1
+    
     if len(frames) < need*5:
         return ([],[],[])
-
+    
+    # there is a 59x duplication of the same data across sample sets here so BE CAREFUL with slices
     data = []
-    # we don't use numpy here because it wants to make copies of all of these slices
-    # but using a python list does not, and that is a SIGNIFICANT memory savings
-    # that's because there is a 59x duplication of the same data across sample sets
-    d = ([frames[0]]*need) + frames[0:need+1].tolist()
-    for i in range(len(frames)-(need+1)):
-        d = d[1:] + [frames[i+need+1]]
-        data.append(d)
-    for i in range(len(frames)-(need+1), len(frames)):
-        d = d[1:] + [frames[-1]]
-        data.append(d)
+    i = 0
+
+    # the leading frames can't use slices because the first frame repeats (for padding)
+    while i <= need:
+        d = ([frames[0]] * (need - i)) + frames[max(0,i - need): i + need + 1].tolist()
+        data.append(np.array(d))
+        #print(data[-1][0],data[-1][-1])
+        i += 1
+
+    # the majority of frames use a simple numpy slice        
+    while i < (len(frames)-(need+1)):
+        data.append(frames[i - need : i + need + 1])
+        #print("!",data[-1][0],data[-1][-1])
+        i += 1
+    
+    # the trailing frames can't use slices because the last frame repeats (for padding)
+    while i < len(frames):
+        d = frames[i - need : i + need + 1].tolist()
+        d += [frames[-1]] * (need*2+1 - len(d))
+        data.append(np.array(d))
+        #print("!",data[-1][0],data[-1][-1], "@", i, len(data[-1]))
+        i += 1
 
     # convert tags to a one-hot per-frame
     bad = []
@@ -100,33 +121,18 @@ def flog_to_vecs(flog:dict)->tuple[list[float], list[list[float]], list[list[flo
 
         x = [0] * SceneType.count()
         x[tt if type(tt) is int else tt.value] = 1
-        answers.append(x)
+        answers.append(np.array(x))
 
     for i in reversed(bad):
         assert(answers[i] is None)
         del timestamps[i]
         del data[i]
         del answers[i]
+    
+    assert(len(timestamps) == len(data))
+    assert(len(data) == len(answers))
 
     return (timestamps,data,answers)
-
-def create_data_generator(data,answers,batch_size):
-    from keras.utils import Sequence
-
-    class pycfDataGenerator(Sequence):
-        def __init__(self, data, answers, batch_size):
-            self.batch_size = batch_size
-            self.data = data
-            self.answers = answers
-        
-        def __len__(self):
-            return len(self.answers) // self.batch_size
-        
-        def __getitem__(self, index):
-            index *= self.batch_size
-            return np.copy(self.data[index:index+self.batch_size]), np.copy(self.answers[index:index+self.batch_size])
-
-    return pycfDataGenerator(data,answers,batch_size)
 
 def load_data(opts)->tuple[list,list,list,list]:
     data = opts.ml_data
@@ -195,102 +201,177 @@ def load_data(opts)->tuple[list,list,list,list]:
             (a,b) = zip(*z[:need])
             xt += a
             yt += b
-        print('...done')
     
-    #x = np.copy(x)
-    #y = np.copy(y)
-    #xt = np.copy(xt)
-    #yt = np.copy(yt)
+    #x = np.array(x)
+    #y = np.array(y)
+    #xt = np.array(xt)
+    #yt = np.array(yt)
 
     return (x,y,xt,yt)
 
+class DataGenerator(Sequence):
+    def __init__(self, data, answers, batch_size):
+        self.batch_size = batch_size
+        self.data = data
+        self.answers = answers
+        self.len = math.ceil(len(self.answers) / self.batch_size)
+        self.shape = (len(data[0]), len(data[0][0]))
+    
+    def __len__(self):
+        return self.len
+    
+    def __getitem__(self, index):
+        index *= self.batch_size
+        return np.array(self.data[index:index+self.batch_size]), np.array(self.answers[index:index+self.batch_size])
+
 def train(opts:Any=None):
     # yield CPU time to useful tasks, this is a background thing...
-    os.nice(10)
-
+    
     (data,answers,test_data,test_answers) = load_data(opts)
     gc.collect()
     
-    # imort these here because their imports are slow 
-    import tensorflow as tf
-    import keras
-    from keras import layers
-
-    print('Calculating loss weights')
-    sums = np.sum((np.sum(answers, axis=0), np.sum(test_answers, axis=0)), axis=0)
-    #weights = [1] * len(sums)
-    #weights[SceneType.SHOW.value] = sums[SceneType.COMMERCIAL.value] / sums[SceneType.SHOW.value]
-    #weights[SceneType.COMMERCIAL.value] = sums[SceneType.SHOW.value] / sums[SceneType.COMMERCIAL.value]
-    sums += 1
-    weights = (np.sum(sums)-sums)/np.sum(sums)
-    print("Loss Weights",weights)
+    #print('Calculating loss weights')
+    #sums = np.sum((np.sum(answers, axis=0), np.sum(test_answers, axis=0)), axis=0)
+    ##weights = [1] * len(sums)
+    ##weights[SceneType.SHOW.value] = sums[SceneType.COMMERCIAL.value] / sums[SceneType.SHOW.value]
+    ##weights[SceneType.COMMERCIAL.value] = sums[SceneType.SHOW.value] / sums[SceneType.COMMERCIAL.value]
+    #sums += 1
+    #weights = (np.sum(sums)-sums)/np.sum(sums)
+    #print("Loss Weights",weights)
     
     nsteps = len(data[0])
     nfeat = len(data[0][0])
     print("Data (x):",len(data)," Test (y):", len(test_data), "; Samples=",nsteps,"; Features=",nfeat)
-    
-    batch_size = opts.tf_batch_size if opts else 500
-    train_dataset = create_data_generator(data, answers, batch_size)#train_dataset = tf.data.Dataset.from_tensor_slices((data, answers)).batch(batch_size)
+
+    #train_dataset = tf.data.Dataset.from_tensor_slices((data, answers)).batch(batch_size)
+    train_dataset = DataGenerator(data, answers, opts.tf_batch_size)
     data = None
     answers = None
     gc.collect()
 
     #test_dataset = tf.data.Dataset.from_tensor_slices((test_data, test_answers)).batch(batch_size)
-    test_dataset = create_data_generator(test_data, test_answers, batch_size)
+    test_dataset = DataGenerator(test_data, test_answers, opts.tf_batch_size)
     have_test = test_answers is not None and len(test_answers) > 0
     test_data = None
     test_answers = None
     gc.collect()
 
-    inputs = keras.Input(shape=(nsteps,nfeat))
-    n = inputs
-    n = layers.LSTM(UNITS, dropout=DROPOUT)(n)
-    #n = layers.LSTM(UNITS, dropout=DROPOUT, return_sequences=True)(n)
-    #n = layers.LSTM(UNITS//2)(n)
-    outputs = layers.Dense(SceneType.count(), activation='softmax')(n)
-    model = keras.Model(inputs, outputs)
-    model.summary()
-
-    model.compile(optimizer="adam", loss="categorical_crossentropy", loss_weights=weights, metrics=['categorical_accuracy', 'mean_squared_error'])
-
-    import signal
-    def handler(signum, frame):
-        print("\nStopping (gracefully)...\n")
-        model.stop_training = True
-        signal.signal(signal.SIGINT, signal.SIG_DFL)
-    oldhandler = signal.signal(signal.SIGINT, handler)
-
-    callbacks = []
-    #callbacks.append(keras.callbacks.EarlyStopping(monitor='categorical_accuracy', patience=50))
-    #if have_test:
-    #    callbacks.append(keras.callbacks.EarlyStopping(monitor='val_categorical_accuracy', patience=50))
+    tfile = tempfile.NamedTemporaryFile(prefix='train-', suffix='.pycf.model.h5')
+    model_path = tfile.name
     
-    gc.collect()
-    
-    model.fit(train_dataset, batch_size=batch_size, epochs=15, shuffle=True, callbacks=callbacks, validation_data=test_dataset)
+    stop = False
+    epoch = 0
+    while not stop:
+        queue = Queue(1)
+        sub = Process(target=_train_some, args=(model_path, train_dataset, test_dataset, epoch, queue))
+        sub.start()
 
-    gc.collect()
-    signal.signal(signal.SIGINT, oldhandler)
+        while sub.is_alive():
+            try:
+                epoch, flag = queue.get()
+            except KeyboardInterrupt:
+                stop = True
+                os.kill(sub.pid, 2) 
+                break
+            
+            # TODO save it either way?
+            if flag == 'done':
+                stop = True
+                break
+            elif flag == 'restart':
+                break
+        
+        sub.join()
     
     print()
     print("Done")
-    dmetrics = model.evaluate(train_dataset, verbose=0)
-    tmetrics = model.evaluate(test_dataset, verbose=0)
+    print()
+    print('Final Evaluation...')
 
-    print(dmetrics)
+    #dmetrics = model.evaluate(train_dataset, verbose=0)
+    #print(dmetrics)
+    import keras
+    tmetrics = keras.models.load_model(model_path).evaluate(test_dataset, verbose=1)
+    print()
     print(tmetrics)
 
-    dir = opts.models_dir if opts and opts.models_dir else '.'
-    name = f'{dir}{os.sep}pycf-{tmetrics[1]:.04f}-lstm{UNITS}-d{DROPOUT}-w{TIME_WINDOW}-{int(time.time())}.h5'
-    #if dmetrics[1] >= 0.85 and tmetrics[1] >= 0.85:
-    print('Saving as ' + name)
-    model.save(name)
+    if tmetrics[1] >= 0.80:
+        name = f'{opts.models_dir if opts and opts.models_dir else "."}{os.sep}pycf-{tmetrics[1]:.04f}-lstm{UNITS}-d{DROPOUT}-w{TIME_WINDOW}-{int(time.time())}.h5'
+        print()
+        print('Saving as ' + name)
 
-    #for (f,d) in test_data.items():
-    #    metrics = model.evaluate(d[0],d[1], verbose=0)
-    #    print('%-30s = %8.04f' % (os.path.basename(f), metrics[1]))
-
+        import shutil
+        shutil.move(model_path, name)
+    
     print()
+    return 0
+
+def _train_some(model_path, train_dataset, test_dataset, epoch, queue):
+    import signal
+    import keras
+    from keras import layers, callbacks
+    
+    os.nice(10) # lower priority in case of other tasks on this server
+
+    model:keras.models.Model = None
+    if epoch > 0:
+        model = keras.models.load_model(model_path)
+    else:
+        inputs = keras.Input(shape=train_dataset.shape)
+        n = inputs
+        n = layers.LSTM(UNITS, dropout=DROPOUT)(n)
+        #n = layers.LSTM(UNITS, dropout=DROPOUT, return_sequences=True)(n)
+        #n = layers.LSTM(UNITS//2)(n)
+        outputs = layers.Dense(SceneType.count(), activation='softmax')(n)
+        model = keras.Model(inputs, outputs)
+        model.summary()
+        model.compile(optimizer="adam", loss="categorical_crossentropy", metrics=['categorical_accuracy', 'mean_squared_error'])
+        model.save(model_path)
+
+    cb = []
+
+    #cb.append(keras.callbacks.EarlyStopping(monitor='categorical_accuracy', patience=50))
+    #if have_test:
+    #    cb.append(keras.callbacks.EarlyStopping(monitor='val_categorical_accuracy', patience=50))
+    
+    class EpochCheckpoint(callbacks.ModelCheckpoint):
+        def on_epoch_end(self, epoch, logs=None):
+            self.last_epoch = epoch
+            return super().on_epoch_end(epoch, logs)
+
+    ecp = EpochCheckpoint(model_path, verbose=1, monitor='val_categorical_accuracy', mode='auto', save_best_only=False)
+    cb.append(ecp)
+
+    class MemoryChecker(callbacks.Callback):
+        def __init__(self, *args):
+            super().__init__(*args)
+            self.start_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            self.exceeded = False
+
+        def on_epoch_end(self, epoch, logs=None):
+            rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            change = rss - self.start_rss
+            if change > 4000000:
+                print(f'Now using too much memory ({rss//1024}MB)! {change//1024}MB more than at start which was {self.start_rss//1024}MB')
+                self.model.stop_training = True
+                self.exceeded = True
+
+    cb.append(MemoryChecker())
+    
+    def handler(signum, frame):
+        print("\nStopping (gracefully)...\n")
+        model.stop_training = True
+        signal.signal(signal.SIGINT, oldsint)
+        signal.signal(signal.SIGTERM, oldterm)
+        return
+    oldsint = signal.signal(signal.SIGINT, handler)
+    oldterm = signal.signal(signal.SIGTERM, handler)
+
+    model.fit(train_dataset, epochs=EPOCHS, initial_epoch=epoch, shuffle=True, callbacks=cb, validation_data=test_dataset)
+
+    model.save(model_path)
+    queue.put( (ecp.last_epoch+1, 'done' if ecp.last_epoch+1 >= EPOCHS else 'restart') )
+    return
 
 def predict(feature_log:str|TextIO|dict, opts:Any)->list:
     import tensorflow as tf
@@ -311,9 +392,9 @@ def predict(feature_log:str|TextIO|dict, opts:Any)->list:
         mf = f'{opts.models_dir or "."}{os.sep}model.h5'
     if not os.path.exists(mf):
         raise Exception(f"Model file '{mf}' does not exist")
-    model:tf.keras.Model = keras.models.load_model(mf)
+    model:keras.models.Model = keras.models.load_model(mf)
 
-    result = model.predict(np.copy(data), verbose=True)
+    result = model.predict(np.array(data), verbose=True)
 
     result = np.argmax(result, axis=1)
     results = [(0,(0,0))]

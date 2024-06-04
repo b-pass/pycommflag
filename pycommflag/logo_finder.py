@@ -92,23 +92,7 @@ def search(player:Player, search_beginning:bool=False, opts:Any=None) -> tuple|N
     ((top,left), (bottom,right)) = res
     
     log.debug(f"Final logo bounding box: {top},{left}->{bottom},{right}")
-
     logo_mask = logo_mask[top:bottom,left:right]
-    filt = 0
-    for y in range(5,logo_mask.shape[0]-10):
-        for x in range(5,logo_mask.shape[1]-10):
-            if logo_mask[y,x]:
-                ok = False
-                for yo in range(-2,3):
-                    for xo in range(-2,3):
-                        if (xo or yo) and logo_mask[y+yo,x+xo]:
-                            ok = True
-                            break
-                if not ok:
-                    logo_mask[y,x] = False
-                    filt += 1
-    if filt:
-        log.debug(f"Filtered {filt} logo mask elements that were isolated from others")
     
     lmc = np.count_nonzero(logo_mask)
     if lmc < 20:
@@ -128,6 +112,7 @@ def refine_logo(player, logo_mask, allow_failure=True):
     left = int(np.min(nz[1]))
     bottom = int(np.max(nz[0]))
     right = int(np.max(nz[1]))
+    
     if allow_failure and right - left < 5 or bottom - top < 5:
         log.info(f"No logo found (bounding box {top},{left}->{bottom},{right} is too small)")
         return None
@@ -147,13 +132,36 @@ def refine_logo(player, logo_mask, allow_failure=True):
         
         # recalculate after we truncated to shrink down on the real area as best we can
         nz = np.nonzero(logo_mask[top:bottom,left:right])
-        bottom = top+int(max(nz[0]))
-        right = left+int(max(nz[1]))
-        top = top+int(min(nz[0]))
-        left = left+int(min(nz[1]))
-        if allow_failure and right - left < 5 or bottom - top < 5:
-            log.info(f"No logo found (truncated bounding box at {top},{left}->{bottom},{right} too small)")
-            return None
+        bottom = top + int(np.max(nz[0]))
+        right = left + int(np.max(nz[1]))
+        top += int(np.min(nz[0])) 
+        left += int(np.min(nz[1]))
+    
+    logo_mask = logo_mask[top:bottom,left:right]
+    filt = 0
+    for y in range(5,logo_mask.shape[0]-10):
+        for x in range(5,logo_mask.shape[1]-10):
+            if logo_mask[y,x]:
+                ok = False
+                for yo in range(-2,3):
+                    for xo in range(-2,3):
+                        if (xo or yo) and logo_mask[y+yo,x+xo]:
+                            ok = True
+                            break
+                if not ok:
+                    logo_mask[y,x] = False
+                    filt += 1
+    if filt:
+        log.debug(f"Filtered {filt} logo mask elements that were isolated from others")
+        nz = np.nonzero(logo_mask)
+        bottom = top + int(np.max(nz[0]))
+        right = left + int(np.max(nz[1]))
+        top += int(np.min(nz[0])) 
+        left += int(np.min(nz[1]))
+
+    if allow_failure and right - left < 5 or bottom - top < 5:
+        log.info(f"No logo found (truncated bounding box at {top},{left}->{bottom},{right} too small)")
+        return None
     
     top -= 5
     left -= 5

@@ -44,7 +44,7 @@ def get_options():
                   help="Train the ML model")
     ml.add_argument('--data', dest="ml_data", nargs='+',
                   help="Data to train the model with, as a list of feature-log files")
-    ml.add_argument('--batch-size', dest='tf_batch_size', type=int, default=500,
+    ml.add_argument('--batch-size', dest='tf_batch_size', type=int, default=1000,
                   help="Model training batch size")
     ml.add_argument('--models', dest='models_dir', default='./models/',
                   help="Path to use for models (output for training, input for infrencing)")

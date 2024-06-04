@@ -67,15 +67,6 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
             logo = logo_finder.from_json(read_feature_log(feature_log).get('logo', None))
             if logo and not opts.quiet:
                 log.info(f"{feature_log} exists, re-using logo {logo[0]},{logo[1]}")
-        
-        if feature_log.endswith('.gz'):
-            import gzip
-            feature_log = gzip.open(feature_log, 'w')
-        else:
-            feature_log = open(feature_log, 'w+')
-    else:
-        feature_log.seek(0)
-        feature_log.truncate()
 
     player = Player(video_filename, no_deinterlace=opts.no_deinterlace)
 
@@ -87,6 +78,16 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
         logo = logo_finder.search(player, opts=opts)
         player.seek(0)
     
+    if type(feature_log) is str:
+        if feature_log.endswith('.gz'):
+            import gzip
+            feature_log = gzip.open(feature_log, 'w')
+        else:
+            feature_log = open(feature_log, 'w+')
+    else:
+        feature_log.seek(0)
+        feature_log.truncate()
+
     feature_log.write('{ "file_version":10')
 
     if opts.chanid: feature_log.write(f',\n"chanid":"{opts.chanid}"')
@@ -114,7 +115,7 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
     
     player.enable_audio()
     audio_interval = round(player.frame_rate)
-    audioProc = AudioProc(player.frame_rate)
+    audioProc = AudioProc()
     audioProc.start()
 
     videoProc = VideoProc(player.vt_start, logo, opts)
@@ -288,12 +289,11 @@ def mean_axis1_float_uint8(fcolor:np.ndarray)->np.ndarray:
     return np.stack((cb,cg,cr), axis=1).astype('uint8')
 
 class AudioProc(Thread):
-    def __init__(self, frame_rate, volume_window=.05, work_rate=60.0):
+    def __init__(self, volume_window=.05, work_rate=60.0):
         super().__init__(name="audioProc")
         import tensorflow as tf
         tf.config.threading.set_intra_op_parallelism_threads(1)
         tf.config.threading.set_inter_op_parallelism_threads(1)
-        self.frame_rate = frame_rate
         self.volume_window = max(2/29.97, volume_window)
         self.work_rate = max(1.0, work_rate)
         self.seg = ina_foss.Segmenter()
