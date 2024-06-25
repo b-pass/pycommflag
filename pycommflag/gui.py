@@ -30,6 +30,7 @@ class Window(tk.Tk):
         if tags and len(tags[-1][1]) < 2:
             tags[-1] = (tags[-1][0], (tags[-1][1][0], self.player.duration))
         for (t,(b,e)) in tags:
+            if b is None or t is None or e is None: continue
             if b > p:
                 self.tags.append((SceneType.SHOW,(p,b)))
             if type(t) is int:

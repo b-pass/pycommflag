@@ -1,6 +1,7 @@
 import logging as log
 import gc
 import math
+from queue import Empty as QueueEmpty
 from multiprocessing import Process, Queue
 import os
 import pickle
@@ -17,10 +18,39 @@ from keras.utils import Sequence
 from .feature_span import *
 from . import processor
 
-TIME_WINDOW = 2.0
+WINDOW_BEFORE = 0.5
+WINDOW_AFTER = 2.5
 UNITS = 64
 DROPOUT = .1
 EPOCHS = 15
+
+# clean up tags so they start/end exactly in a nearby blank block
+# this is because the training data is supplied by humans, and might be off a bit
+def _adjust_tags(tags:list,blanks:list,duration:float):
+    for ti in range(len(tags)):
+        best = [(duration,)]*4
+        (tt, (tb, te)) = tags[ti]
+        
+        for bi in range(len(blanks)):
+            (bv,(bs,be)) = blanks[bi]
+            if not bv or bs == 0.0 or be >= duration or (be-bs) > 5.0:
+                continue
+            n = 0
+            for t in (tb,te):
+                for b in (bs,be):
+                    d = abs(t - b)
+                    if best[n][0] > d: best[n] = (d,n,bi)
+                    n += 1
+        
+        for (d,n,bi) in best:
+            if d < 3:
+                (bv,(bs,be)) = blanks[bi]
+                if n == 0 or n == 1:
+                    tags[ti] = (tt, (be,te))
+                    #print(f'Adjust start of {ti} from {tb} to {be}')
+                else:
+                    tags[ti] = (tt, (tb,bs))
+                    #print(f'Adjust end of {ti} from {te} to {bs}')
 
 def flog_to_vecs(flog:dict)->tuple[list[float], list[list[float]], list[list[float]]]:
     version = flog.get('file_version', 10)
@@ -29,37 +59,38 @@ def flog_to_vecs(flog:dict)->tuple[list[float], list[list[float]], list[list[flo
 
     tags = flog.get('tags', [])
     
-    # clean up tags so they start/end exactly in the middle of the blank block
-    # this is because the training data is supplied by humans, and might be off a bit
-    # TODO, do we need to handle all-blank scenes at the start/end of a block differently?
-    # the reason would be because of inconsistent training data (sometimes the blank is part of the commercial, sometimes the show)
-    # but there are blanks in the middle of both also so maybe that doesnt matter....?
     if tags:
-        for (bv,(bs,be)) in processor.read_feature_spans(flog, 'blank').get('blank', []):
-            if not bv or bs == 0.0 or be >= endtime or (be-bs) >= 4.0:
-                continue
-            half = bs + (be - bs)
-            for ti in range(len(tags)):
-                (tt, (tb, te)) = tags[ti]
-                fixb = bs-.5 <= tb and tb <= be+.5
-                fixe = bs-.5 <= te and te <= be+.5
-                if fixb and not fixe:
-                    tags[ti] = (tt, (half, te))
-                elif fixe and not fixb:
-                    tags[ti] = (tt, (tb, half))
+        blanks = processor.read_feature_spans(flog, 'blank').get('blank', [])
+        if blanks:
+            _adjust_tags(tags,blanks,endtime)
     
-    # copy the frames so we don't mess up "flog"
-    frames = list(flog['frames'])
-
     frames_header = flog['frames_header']
     assert('time' in frames_header[0])
     assert('diff' in frames_header[3])
 
-    if frames[0] is None: frames.pop(0)
+    frames = flog['frames']
+    if frames[0] is None: 
+        frames = flog['frames'][1:]
 
     # everything we do is for 29.97 or 30 (close enough); support 59.94 and 60 too... 
-    if frame_rate >= 58:
-        frames = frames[::int(frame_rate/29)]
+    if frame_rate >= 48:
+        assert(frame_rate < 70) # sanity
+        old = frames
+        frames = []
+        for i in range(1, len(old), 2):
+            f = old[i]+[old[i][0]/endtime]
+            # audio features are spread across time anyway so we can omit individual frames without much worry
+            # but these video features can be important in a single frame, so make sure we capture that before dropping 
+            f[1] = max(f[1], old[i-1][1]) # logo
+            f[2] = max(f[1], old[i-1][1]) # blank
+            f[3] = max(f[1], old[i-1][1]) # diff
+            frames.append(f)
+    else:
+        # theres a way to do this in numpy with concatenate, does it matter?
+        old = frames
+        frames = []
+        for i in range(len(old)):
+            frames.append(old[i]+[old[i][0]/endtime])
     
     # ok now we can numpy....
     frames = np.array(frames)
@@ -71,11 +102,12 @@ def flog_to_vecs(flog:dict)->tuple[list[float], list[list[float]], list[list[flo
     frames[...,0] = (frames[...,0] % 1800.0) / 1800.0
 
     # normalize frame diffs
-    frames[...,3] = np.clip(frames[...,3] / 30, 0, 1.0)
+    frames[...,3] = np.clip(frames[...,3] / 25, 0, 1.0)
 
-    need = int((TIME_WINDOW * 29.97) / 2) + 1
+    before = int(WINDOW_BEFORE * 29.97) + 1
+    after = int(WINDOW_AFTER * 29.97) + 1
     
-    if len(frames) < need*5:
+    if len(frames) < (before+1+after)*3:
         return ([],[],[])
     
     # there is a 59x duplication of the same data across sample sets here so BE CAREFUL with slices
@@ -83,24 +115,24 @@ def flog_to_vecs(flog:dict)->tuple[list[float], list[list[float]], list[list[flo
     i = 0
 
     # the leading frames can't use slices because the first frame repeats (for padding)
-    while i <= need:
-        d = ([frames[0]] * (need - i)) + frames[max(0,i - need): i + need + 1].tolist()
+    while i <= before:
+        d = ([frames[0]] * (before - i)) + frames[0 : 1 + i + after].tolist()
         data.append(np.array(d))
-        #print(data[-1][0],data[-1][-1])
+        #print(len(data[-1]), data[-1][0],data[-1][-1])
         i += 1
 
     # the majority of frames use a simple numpy slice        
-    while i < (len(frames)-(need+1)):
-        data.append(frames[i - need : i + need + 1])
-        #print("!",data[-1][0],data[-1][-1])
+    while i < (len(frames)-(after+1)):
+        data.append(frames[i - before : 1 + i + after])
+        #print(len(data[-1]), "!",data[-1][0],data[-1][-1])
         i += 1
     
     # the trailing frames can't use slices because the last frame repeats (for padding)
     while i < len(frames):
-        d = frames[i - need : i + need + 1].tolist()
-        d += [frames[-1]] * (need*2+1 - len(d))
+        d = frames[i - before : 1 + i + after].tolist()
+        d += [frames[-1]] * (before+1+after - len(d))
         data.append(np.array(d))
-        #print("!",data[-1][0],data[-1][-1], "@", i, len(data[-1]))
+        #print(len(data[-1]), "?",data[-1][0],data[-1][-1], "@", i, len(data[-1]))
         i += 1
 
     # convert tags to a one-hot per-frame
@@ -256,7 +288,7 @@ def train(opts:Any=None):
     test_answers = None
     gc.collect()
 
-    tfile = tempfile.NamedTemporaryFile(prefix='train-', suffix='.pycf.model.h5')
+    tfile = tempfile.NamedTemporaryFile(prefix='train-', suffix='.pycf.model.h5', )
     model_path = tfile.name
     
     stop = False
@@ -268,18 +300,12 @@ def train(opts:Any=None):
 
         while sub.is_alive():
             try:
-                epoch, flag = queue.get()
+                epoch,stop = queue.get(timeout=0.1)
+            except QueueEmpty:
+                pass
             except KeyboardInterrupt:
                 stop = True
-                os.kill(sub.pid, 2) 
-                break
-            
-            # TODO save it either way?
-            if flag == 'done':
-                stop = True
-                break
-            elif flag == 'restart':
-                break
+                os.kill(sub.pid, 2)
         
         sub.join()
     
@@ -288,25 +314,26 @@ def train(opts:Any=None):
     print()
     print('Final Evaluation...')
 
-    #dmetrics = model.evaluate(train_dataset, verbose=0)
-    #print(dmetrics)
     import keras
+    #dmetrics = model.evaluate(train_dataset, verbose=0)
     tmetrics = keras.models.load_model(model_path).evaluate(test_dataset, verbose=1)
     print()
+    #print(dmetrics)
     print(tmetrics)
 
     if tmetrics[1] >= 0.80:
-        name = f'{opts.models_dir if opts and opts.models_dir else "."}{os.sep}pycf-{tmetrics[1]:.04f}-lstm{UNITS}-d{DROPOUT}-w{TIME_WINDOW}-{int(time.time())}.h5'
+        name = f'{opts.models_dir if opts and opts.models_dir else "."}{os.sep}pycf-{tmetrics[1]:.04f}-lstm{UNITS}-d{DROPOUT}-w{WINDOW_BEFORE}x{WINDOW_AFTER}-{int(time.time())}.h5'
         print()
         print('Saving as ' + name)
 
         import shutil
-        shutil.move(model_path, name)
+        shutil.copy(model_path, name)
     
     print()
+
     return 0
 
-def _train_some(model_path, train_dataset, test_dataset, epoch, queue):
+def _train_some(model_path, train_dataset, test_dataset, epoch, queue) -> tuple[int,bool]:
     import signal
     import keras
     from keras import layers, callbacks
@@ -319,9 +346,13 @@ def _train_some(model_path, train_dataset, test_dataset, epoch, queue):
     else:
         inputs = keras.Input(shape=train_dataset.shape)
         n = inputs
+        #n = layers.TimeDistributed(layers.Dropout(DROPOUT))(n)
+        n = layers.TimeDistributed(layers.Dense(32, activation='tanh'))(n)
         n = layers.LSTM(UNITS, dropout=DROPOUT)(n)
-        #n = layers.LSTM(UNITS, dropout=DROPOUT, return_sequences=True)(n)
+        #n = layers.LSTM(UNITS//2, dropout=DROPOUT, return_sequences=True)(n)
         #n = layers.LSTM(UNITS//2)(n)
+        n = layers.Dense(64, activation='relu')(n)
+        n = layers.Dense(32, activation='relu')(n)
         outputs = layers.Dense(SceneType.count(), activation='softmax')(n)
         model = keras.Model(inputs, outputs)
         model.summary()
@@ -339,7 +370,7 @@ def _train_some(model_path, train_dataset, test_dataset, epoch, queue):
             self.last_epoch = epoch
             return super().on_epoch_end(epoch, logs)
 
-    ecp = EpochCheckpoint(model_path, verbose=1, monitor='val_categorical_accuracy', mode='auto', save_best_only=False)
+    ecp = EpochCheckpoint(model_path, verbose=1, monitor='val_categorical_accuracy', mode='auto', save_best_only=True)
     cb.append(ecp)
 
     class MemoryChecker(callbacks.Callback):
@@ -351,7 +382,7 @@ def _train_some(model_path, train_dataset, test_dataset, epoch, queue):
         def on_epoch_end(self, epoch, logs=None):
             rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
             change = rss - self.start_rss
-            if change > 4000000:
+            if change > 7000000:
                 print(f'Now using too much memory ({rss//1024}MB)! {change//1024}MB more than at start which was {self.start_rss//1024}MB')
                 self.model.stop_training = True
                 self.exceeded = True
@@ -367,10 +398,18 @@ def _train_some(model_path, train_dataset, test_dataset, epoch, queue):
     oldsint = signal.signal(signal.SIGINT, handler)
     oldterm = signal.signal(signal.SIGTERM, handler)
 
-    model.fit(train_dataset, epochs=EPOCHS, initial_epoch=epoch, shuffle=True, callbacks=cb, validation_data=test_dataset)
+    class_weights = {
+        SceneType.SHOW.value : 0.75,
+        SceneType.COMMERCIAL.value : 1.5,
+        SceneType.CREDITS.value : 2,
+        SceneType.INTRO.value : 2,
+        SceneType.TRANSITION.value : 0, # unused?
+    }
 
-    model.save(model_path)
-    queue.put( (ecp.last_epoch+1, 'done' if ecp.last_epoch+1 >= EPOCHS else 'restart') )
+    model.fit(train_dataset, epochs=EPOCHS, initial_epoch=epoch, shuffle=True, callbacks=cb, validation_data=test_dataset, class_weight=class_weights)
+
+    #model.save(model_path) the checkpoint already saved the vest version
+    queue.put( (ecp.last_epoch+1, ecp.last_epoch+1 >= EPOCHS) )
     return
 
 def predict(feature_log:str|TextIO|dict, opts:Any)->list:
@@ -462,32 +501,8 @@ def predict(feature_log:str|TextIO|dict, opts:Any)->list:
     print('Post filter n=', len(results))
     print(results)
 
-    # now where there is a diff within a few frames of the start/end of a tag, move the tag
-    # TODO also do this for audio diffs? or silence ranges?
-    for (_,(db,de)) in spans.get('diff', []):
-        for ti in range(len(results)):
-            (tt, (tb, te)) = results[ti]
-            fixb = db-.1 < tb and tb < db+.1
-            fixe = de-.1 < te and te < de+.1
-            if fixb and not fixe:
-                results[ti] = (tt, (db, te))
-            elif fixe and not fixb:
-                results[ti] = (tt, (tb, de))
-    
-    # now where there is a blank within a few frames of the start/end of a tag, move the tag toward the middle of the blank
-    for (bv,(bs,be)) in spans.get('blank', []):
-        if not bv or bs == 0.0 or be >= duration or (be-bs) >= 4.0:
-            continue
-        half = bs + (be - bs)
-        for ti in range(len(results)):
-            (tt, (tb, te)) = results[ti]
-            fixb = bs-.5 <= tb and tb <= be+.5
-            fixe = bs-.5 <= te and te <= be+.5
-            if fixb and not fixe:
-                results[ti] = (tt, (half, te))
-            elif fixe and not fixb:
-                results[ti] = (tt, (tb, half))
-    
+    _adjust_tags(results, spans.get('blank', []), duration)
+
     print(f'\n\nFinal n={len(results)}:')
     print(results)
 

@@ -59,7 +59,7 @@ def search(player:Player, search_beginning:bool=False, opts:Any=None) -> tuple|N
     # in case we found something stuck on the screen, try to look beyond that
     stuck = []
     best = np.max(logo_sum)
-    while best > fcount*.95:
+    while best > fcount*.90:
         stuck_mask = logo_sum >= fcount*.8
         
         ((top,left), (bottom,right)) = refine_logo(player, stuck_mask, allow_failure=False)
@@ -81,7 +81,9 @@ def search(player:Player, search_beginning:bool=False, opts:Any=None) -> tuple|N
         best = np.max(logo_sum)
         log.debug(f'New best = {best*100/fcount}% of {fcount}')
 
-    if best <= fcount / 3:
+    log.debug(f"Logo detected at {best} ({round(best*100/fcount)}%)")
+
+    if best <= fcount / 2:
         log.info(f"No logo found (insufficient edge strength, best={best*100/fcount}%)")
         return None
     
@@ -91,7 +93,6 @@ def search(player:Player, search_beginning:bool=False, opts:Any=None) -> tuple|N
     if res is None: return None
     ((top,left), (bottom,right)) = res
     
-    log.debug(f"Final logo bounding box: {top},{left}->{bottom},{right}")
     logo_mask = logo_mask[top:bottom,left:right]
     
     lmc = np.count_nonzero(logo_mask)
@@ -99,6 +100,8 @@ def search(player:Player, search_beginning:bool=False, opts:Any=None) -> tuple|N
         log.info(f"No logo found (not enough edges within bounding box, got {lmc})")
         return None
     thresh = round(lmc * 2 / 3)
+    
+    log.debug(f"Final logo bounding box: {top},{left}->{bottom},{right} count_threshold={thresh}")
 
     return ((top,left), (bottom,right), logo_mask, thresh, *stuck)
 
