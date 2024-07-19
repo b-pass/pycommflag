@@ -20,39 +20,41 @@ from . import processor
 
 WINDOW_BEFORE = 0.5
 WINDOW_AFTER = 2.5
-UNITS = 64
-DROPOUT = .1
+RNN = 'lstm'
+UNITS = 32
+DROPOUT = 0.15
 EPOCHS = 15
 
 # clean up tags so they start/end exactly in a nearby blank block
 # this is because the training data is supplied by humans, and might be off a bit
 def _adjust_tags(tags:list,blanks:list,duration:float):
     for ti in range(len(tags)):
-        best = [(duration,)]*4
+        bbest = (duration,)
+        ebest = (duration,)
         (tt, (tb, te)) = tags[ti]
         
         for bi in range(len(blanks)):
             (bv,(bs,be)) = blanks[bi]
-            if not bv or bs == 0.0 or be >= duration or (be-bs) > 5.0:
+            if not bv or bs < 1.0 or (be-bs) > 5.0:
                 continue
-            n = 0
-            for t in (tb,te):
-                for b in (bs,be):
-                    d = abs(t - b)
-                    if best[n][0] > d: best[n] = (d,n,bi)
-                    n += 1
+            if be >= duration-1.0: 
+                break
+            
+            for b in (bs,be):
+                d = abs(tb - b)
+                if bbest[0] > d: bbest = (d,bi)
+            for b in (bs,be):
+                d = abs(te - b)
+                if ebest[0] > d: ebest = (d,bi)
         
-        for (d,n,bi) in best:
-            if d < 3:
-                (bv,(bs,be)) = blanks[bi]
-                if n == 0 or n == 1:
-                    tags[ti] = (tt, (be,te))
-                    #print(f'Adjust start of {ti} from {tb} to {be}')
-                else:
-                    tags[ti] = (tt, (tb,bs))
-                    #print(f'Adjust end of {ti} from {te} to {bs}')
+        if bbest[0] < 3:
+            #print(f'Adjust start of {ti} from {tb} to {be}')
+            tags[ti] = (tt,(blanks[bbest[1]][1][1],te))
+        if ebest[0] < 3:
+            #print(f'Adjust end of {ti} from {te} to {bs}')
+            tags[ti] = (tt,(tb,blanks[ebest[1]][1][0]))
 
-def flog_to_vecs(flog:dict)->tuple[list[float], list[list[float]], list[list[float]]]:
+def flog_to_vecs(flog:dict, noblanks=False, nologo=False)->tuple[list[float], list[list[float]], list[float], list[float]]:
     version = flog.get('file_version', 10)
     frame_rate = flog.get('frame_rate', 29.97)
     endtime = flog.get('duration', 0)
@@ -63,6 +65,13 @@ def flog_to_vecs(flog:dict)->tuple[list[float], list[list[float]], list[list[flo
         blanks = processor.read_feature_spans(flog, 'blank').get('blank', [])
         if blanks:
             _adjust_tags(tags,blanks,endtime)
+        ti = 0
+        while ti < len(tags):
+            if tags[ti][0] != SceneType.DO_NOT_USE and tags[ti][0] != SceneType.DO_NOT_USE.value:
+                if tags[ti][1][1] - tags[ti][1][0] < 10:
+                    del tags[ti]
+                    continue
+            ti += 1 
     
     frames_header = flog['frames_header']
     assert('time' in frames_header[0])
@@ -81,8 +90,8 @@ def flog_to_vecs(flog:dict)->tuple[list[float], list[list[float]], list[list[flo
             f = old[i]+[old[i][0]/endtime]
             # audio features are spread across time anyway so we can omit individual frames without much worry
             # but these video features can be important in a single frame, so make sure we capture that before dropping 
-            f[1] = max(f[1], old[i-1][1]) # logo
-            f[2] = max(f[1], old[i-1][1]) # blank
+            f[1] = max(f[1], old[i-1][1]) if not nologo else 0 # logo
+            f[2] = max(f[1], old[i-1][1]) if not noblanks else 0 # blank
             f[3] = max(f[1], old[i-1][1]) # diff
             frames.append(f)
     else:
@@ -90,7 +99,10 @@ def flog_to_vecs(flog:dict)->tuple[list[float], list[list[float]], list[list[flo
         old = frames
         frames = []
         for i in range(len(old)):
-            frames.append(old[i]+[old[i][0]/endtime])
+            f = old[i]+[old[i][0]/endtime]
+            if nologo: f[1] = 0
+            if noblanks: f[2] = 0
+            frames.append(f)
     
     # ok now we can numpy....
     frames = np.array(frames)
@@ -138,6 +150,8 @@ def flog_to_vecs(flog:dict)->tuple[list[float], list[list[float]], list[list[flo
     # convert tags to a one-hot per-frame
     bad = []
     answers = []
+    prev = None
+    weights = [1.0] * len(timestamps)
     tit = iter(tags)
     tag = next(tit, (SceneType.UNKNOWN, (0, endtime+1)))
     for ts in timestamps:
@@ -151,6 +165,13 @@ def flog_to_vecs(flog:dict)->tuple[list[float], list[list[float]], list[list[flo
             answers.append(None)
             continue
 
+        if prev != tt:
+            prev = tt
+            i = len(answers)
+            if i >= 30*frame_rate:
+                for x in range(i-before, i+1+after):
+                    weights[x] = 2.0
+        
         x = [0] * SceneType.count()
         x[tt if type(tt) is int else tt.value] = 1
         answers.append(np.array(x))
@@ -160,13 +181,15 @@ def flog_to_vecs(flog:dict)->tuple[list[float], list[list[float]], list[list[flo
         del timestamps[i]
         del data[i]
         del answers[i]
+        del weights[i]
     
     assert(len(timestamps) == len(data))
     assert(len(data) == len(answers))
+    assert(len(answers) == len(weights))
 
-    return (timestamps,data,answers)
+    return (timestamps,data,answers,weights)
 
-def load_data(opts)->tuple[list,list,list,list]:
+def load_data(opts)->tuple[list,list,list,list,list]:
     data = opts.ml_data
     if not data:
         return None
@@ -190,18 +213,32 @@ def load_data(opts)->tuple[list,list,list,list]:
 
     x = []
     y = []
+    w = []
     for f in data:
         if os.path.isdir(f):
             continue
         print("Loading",f)
         if flog := processor.read_feature_log(f):
-            (_,a,b) = flog_to_vecs(flog)
+            (_,a,b,c) = flog_to_vecs(flog)
             x += a
             y += b
-            flog = None
+            w += c
+            
+            #(_,a,b,c) = flog_to_vecs(flog, True, False)
+            #x += a
+            #y += b
+            #w += c
+
+            #(_,a,b,c) = flog_to_vecs(flog, False, True)
+            #x += a
+            #y += b
+            #w += c
+            
             a = None
             b = None
-        gc.collect()
+            c = None
+            flog = None
+            gc.collect()
     
     xt = []
     yt = []
@@ -210,27 +247,36 @@ def load_data(opts)->tuple[list,list,list,list]:
             continue
         print("Loading",f)
         if flog := processor.read_feature_log(f):
-            (_,a,b) = flog_to_vecs(flog)
+            (_,a,b,_) = flog_to_vecs(flog)
             xt += a
             yt += b
-            flog = None
+            
+            #(_,a,b,_) = flog_to_vecs(flog, True, False)
+            #xt += a
+            #yt += b
+            
+            #(_,a,b) = flog_to_vecs(flog, False, True)
+            #xt += a
+            #yt += b
+            
             a = None
             b = None
-        gc.collect()
+            flog = None
+            gc.collect()
     
     import random
     random.seed(time.time())
     need = len(x)//4 - len(xt)
     if need > len(x)/100:
         print('Need to move',need,'datum to the test/eval set')
-        z = list(zip(x,y))
+        z = list(zip(x,y,w))
         n=x=y=None
         random.shuffle(z)
-        (x,y) = zip(*z[need:])
+        (x,y,w) = zip(*z[need:])
         if len(xt) == 0:
-            (xt,yt) = zip(*z[:need])
+            (xt,yt,_) = zip(*z[:need])
         else:
-            (a,b) = zip(*z[:need])
+            (a,b,_) = zip(*z[:need])
             xt += a
             yt += b
     
@@ -238,14 +284,16 @@ def load_data(opts)->tuple[list,list,list,list]:
     #y = np.array(y)
     #xt = np.array(xt)
     #yt = np.array(yt)
+    gc.collect()
 
-    return (x,y,xt,yt)
+    return (x,y,w,xt,yt)
 
 class DataGenerator(Sequence):
-    def __init__(self, data, answers, batch_size):
+    def __init__(self, data, answers, weights=None, batch_size=1000):
         self.batch_size = batch_size
         self.data = data
         self.answers = answers
+        self.weights = weights
         self.len = math.ceil(len(self.answers) / self.batch_size)
         self.shape = (len(data[0]), len(data[0][0]))
     
@@ -254,12 +302,15 @@ class DataGenerator(Sequence):
     
     def __getitem__(self, index):
         index *= self.batch_size
-        return np.array(self.data[index:index+self.batch_size]), np.array(self.answers[index:index+self.batch_size])
+        if self.weights is not None:
+            return np.array(self.data[index:index+self.batch_size]), np.array(self.answers[index:index+self.batch_size]), np.array(self.weights[index:index+self.batch_size])
+        else:
+            return np.array(self.data[index:index+self.batch_size]), np.array(self.answers[index:index+self.batch_size])
 
 def train(opts:Any=None):
     # yield CPU time to useful tasks, this is a background thing...
     
-    (data,answers,test_data,test_answers) = load_data(opts)
+    (data,answers,sample_weights,test_data,test_answers) = load_data(opts)
     gc.collect()
     
     #print('Calculating loss weights')
@@ -276,13 +327,13 @@ def train(opts:Any=None):
     print("Data (x):",len(data)," Test (y):", len(test_data), "; Samples=",nsteps,"; Features=",nfeat)
 
     #train_dataset = tf.data.Dataset.from_tensor_slices((data, answers)).batch(batch_size)
-    train_dataset = DataGenerator(data, answers, opts.tf_batch_size)
+    train_dataset = DataGenerator(data, answers, sample_weights, batch_size=opts.tf_batch_size)
     data = None
     answers = None
     gc.collect()
 
     #test_dataset = tf.data.Dataset.from_tensor_slices((test_data, test_answers)).batch(batch_size)
-    test_dataset = DataGenerator(test_data, test_answers, opts.tf_batch_size)
+    test_dataset = DataGenerator(test_data, test_answers, batch_size=opts.tf_batch_size)
     have_test = test_answers is not None and len(test_answers) > 0
     test_data = None
     test_answers = None
@@ -322,7 +373,7 @@ def train(opts:Any=None):
     print(tmetrics)
 
     if tmetrics[1] >= 0.80:
-        name = f'{opts.models_dir if opts and opts.models_dir else "."}{os.sep}pycf-{tmetrics[1]:.04f}-lstm{UNITS}-d{DROPOUT}-w{WINDOW_BEFORE}x{WINDOW_AFTER}-{int(time.time())}.h5'
+        name = f'{opts.models_dir if opts and opts.models_dir else "."}{os.sep}pycf-{tmetrics[1]:.04f}-{RNN}{UNITS}-d{DROPOUT}-w{WINDOW_BEFORE}x{WINDOW_AFTER}-{int(time.time())}.h5'
         print()
         print('Saving as ' + name)
 
@@ -344,19 +395,21 @@ def _train_some(model_path, train_dataset, test_dataset, epoch, queue) -> tuple[
     if epoch > 0:
         model = keras.models.load_model(model_path)
     else:
-        inputs = keras.Input(shape=train_dataset.shape)
+        inputs = keras.Input(shape=train_dataset.shape, name="input")
         n = inputs
-        #n = layers.TimeDistributed(layers.Dropout(DROPOUT))(n)
-        n = layers.TimeDistributed(layers.Dense(32, activation='tanh'))(n)
-        n = layers.LSTM(UNITS, dropout=DROPOUT)(n)
-        #n = layers.LSTM(UNITS//2, dropout=DROPOUT, return_sequences=True)(n)
-        #n = layers.LSTM(UNITS//2)(n)
-        n = layers.Dense(64, activation='relu')(n)
-        n = layers.Dense(32, activation='relu')(n)
-        outputs = layers.Dense(SceneType.count(), activation='softmax')(n)
+        #n = layers.TimeDistributed(layers.Dropout(DROPOUT), name="dropout")(n)
+        n = layers.TimeDistributed(layers.Dense(32, activation='tanh'), name="dense-pre")(n)
+        #n = layers.LSTM(UNITS, dropout=DROPOUT, name="rnn")(n)
+        if RNN.lower() == "gru":
+            n = layers.Bidirectional(layers.GRU(UNITS, dropout=DROPOUT), name="rnn")(n)
+        else:
+            n = layers.Bidirectional(layers.LSTM(UNITS, dropout=DROPOUT), name="rnn")(n)
+        n = layers.Dense(UNITS//2, activation='relu', name="dense-post")(n)
+        n = layers.Dense(16, activation='relu', name="final")(n)
+        outputs = layers.Dense(SceneType.count(), activation='softmax', name="output")(n)
         model = keras.Model(inputs, outputs)
         model.summary()
-        model.compile(optimizer="adam", loss="categorical_crossentropy", metrics=['categorical_accuracy', 'mean_squared_error'])
+        model.compile(optimizer="adam", loss="categorical_crossentropy", metrics=['categorical_accuracy', 'categorical_crossentropy'])
         model.save(model_path)
 
     cb = []
@@ -382,7 +435,7 @@ def _train_some(model_path, train_dataset, test_dataset, epoch, queue) -> tuple[
         def on_epoch_end(self, epoch, logs=None):
             rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
             change = rss - self.start_rss
-            if change > 7000000:
+            if change > 6000000:
                 print(f'Now using too much memory ({rss//1024}MB)! {change//1024}MB more than at start which was {self.start_rss//1024}MB')
                 self.model.stop_training = True
                 self.exceeded = True
@@ -398,13 +451,14 @@ def _train_some(model_path, train_dataset, test_dataset, epoch, queue) -> tuple[
     oldsint = signal.signal(signal.SIGINT, handler)
     oldterm = signal.signal(signal.SIGTERM, handler)
 
-    class_weights = {
-        SceneType.SHOW.value : 0.75,
-        SceneType.COMMERCIAL.value : 1.5,
-        SceneType.CREDITS.value : 2,
-        SceneType.INTRO.value : 2,
-        SceneType.TRANSITION.value : 0, # unused?
-    }
+    #class_weights = {
+    #    SceneType.SHOW.value : 0.75,
+    #    SceneType.COMMERCIAL.value : 1.5,
+    #    SceneType.CREDITS.value : 2,
+    #    SceneType.INTRO.value : 2,
+    #    SceneType.TRANSITION.value : 0, # unused?
+    #}
+    class_weights = None
 
     model.fit(train_dataset, epochs=EPOCHS, initial_epoch=epoch, shuffle=True, callbacks=cb, validation_data=test_dataset, class_weight=class_weights)
 
@@ -423,7 +477,7 @@ def predict(feature_log:str|TextIO|dict, opts:Any)->list:
     
     assert(flog['frames'][-1][0] > frame_rate)
 
-    (times,data,answers) = flog_to_vecs(flog)
+    (times,data,_,_) = flog_to_vecs(flog)
     assert(len(times) == len(data))
 
     mf = opts.model_file
@@ -433,9 +487,9 @@ def predict(feature_log:str|TextIO|dict, opts:Any)->list:
         raise Exception(f"Model file '{mf}' does not exist")
     model:keras.models.Model = keras.models.load_model(mf)
 
-    result = model.predict(np.array(data), verbose=True)
+    prediction = model.predict(np.array(data), verbose=True)
 
-    result = np.argmax(result, axis=1)
+    result = np.argmax(prediction, axis=1)
     results = [(0,(0,0))]
     for i in range(len(result)):
         when = times[i]

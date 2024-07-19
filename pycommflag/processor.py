@@ -341,7 +341,7 @@ class AudioProc(Thread):
                     log.info(f'Missing {missing} audio samples before time {st} (got {len(sm)})')
                     # these are LEADING missing values
                     sm = np.append(np.zeros(missing, 'float32'), sm)
-                elif missing < 0:
+                elif missing < -1:
                     extra = -missing
                     log.info(f'Extra audio samples at time {st}? Got {len(sm)}, dropping {extra} of them...')
                     if extra == len(sm):
