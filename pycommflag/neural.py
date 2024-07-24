@@ -18,12 +18,14 @@ from keras.utils import Sequence
 from .feature_span import *
 from . import processor
 
-WINDOW_BEFORE = 0.5
-WINDOW_AFTER = 2.5
+WINDOW_BEFORE = 2.0
+WINDOW_AFTER = 2.0
+RATE = 29.97
 RNN = 'lstm'
 UNITS = 32
 DROPOUT = 0.15
-EPOCHS = 15
+EPOCHS = 25
+BATCH_SIZE = 2000
 
 # clean up tags so they start/end exactly in a nearby blank block
 # this is because the training data is supplied by humans, and might be off a bit
@@ -81,18 +83,21 @@ def flog_to_vecs(flog:dict, noblanks=False, nologo=False)->tuple[list[float], li
     if frames[0] is None: 
         frames = flog['frames'][1:]
 
-    # everything we do is for 29.97 or 30 (close enough); support 59.94 and 60 too... 
-    if frame_rate >= 48:
-        assert(frame_rate < 70) # sanity
+    step = round(frame_rate/RATE)
+    if step > 1:
+        # aggregate...
         old = frames
         frames = []
-        for i in range(1, len(old), 2):
+        for i in range(step-1, len(old), step):
             f = old[i]+[old[i][0]/endtime]
-            # audio features are spread across time anyway so we can omit individual frames without much worry
-            # but these video features can be important in a single frame, so make sure we capture that before dropping 
-            f[1] = max(f[1], old[i-1][1]) if not nologo else 0 # logo
-            f[2] = max(f[1], old[i-1][1]) if not noblanks else 0 # blank
-            f[3] = max(f[1], old[i-1][1]) # diff
+            for x in range(1,step):
+                # audio features are spread across time anyway so we can omit individual frames without much worry
+                # but these video features can be important in a single frame, so make sure we capture that before dropping 
+                f[1] += old[i-x][1] if not nologo else 0 # logo
+                f[2] += old[i-x][2] if not noblanks else 0 # blank
+                f[3] = max(f[3], old[i-x][3]) # diff
+            f[1] /= step
+            f[2] /= step
             frames.append(f)
     else:
         # theres a way to do this in numpy with concatenate, does it matter?
@@ -116,8 +121,8 @@ def flog_to_vecs(flog:dict, noblanks=False, nologo=False)->tuple[list[float], li
     # normalize frame diffs
     frames[...,3] = np.clip(frames[...,3] / 25, 0, 1.0)
 
-    before = int(WINDOW_BEFORE * 29.97) + 1
-    after = int(WINDOW_AFTER * 29.97) + 1
+    before = int(WINDOW_BEFORE * RATE) + 1
+    after = int(WINDOW_AFTER * RATE) + 1
     
     if len(frames) < (before+1+after)*3:
         return ([],[],[])
@@ -150,7 +155,7 @@ def flog_to_vecs(flog:dict, noblanks=False, nologo=False)->tuple[list[float], li
     # convert tags to a one-hot per-frame
     bad = []
     answers = []
-    prev = None
+    prev = SceneType.COMMERCIAL
     weights = [1.0] * len(timestamps)
     tit = iter(tags)
     tag = next(tit, (SceneType.UNKNOWN, (0, endtime+1)))
@@ -168,9 +173,8 @@ def flog_to_vecs(flog:dict, noblanks=False, nologo=False)->tuple[list[float], li
         if prev != tt:
             prev = tt
             i = len(answers)
-            if i >= 30*frame_rate:
-                for x in range(i-before, i+1+after):
-                    weights[x] = 2.0
+            for x in range(max(0,i-before), min(i+1+after,len(weights))):
+                weights[x] = 2.0
         
         x = [0] * SceneType.count()
         x[tt if type(tt) is int else tt.value] = 1
@@ -282,6 +286,7 @@ def load_data(opts)->tuple[list,list,list,list,list]:
     
     #x = np.array(x)
     #y = np.array(y)
+    #w = np.array(w)
     #xt = np.array(xt)
     #yt = np.array(yt)
     gc.collect()
@@ -289,23 +294,23 @@ def load_data(opts)->tuple[list,list,list,list,list]:
     return (x,y,w,xt,yt)
 
 class DataGenerator(Sequence):
-    def __init__(self, data, answers, weights=None, batch_size=1000):
-        self.batch_size = batch_size
+    def __init__(self, data, answers, weights=None):
         self.data = data
         self.answers = answers
         self.weights = weights
-        self.len = math.ceil(len(self.answers) / self.batch_size)
+        self.len = math.ceil(len(self.answers) / BATCH_SIZE)
         self.shape = (len(data[0]), len(data[0][0]))
     
     def __len__(self):
         return self.len
     
     def __getitem__(self, index):
-        index *= self.batch_size
+        #gc.collect()
+        index *= BATCH_SIZE
         if self.weights is not None:
-            return np.array(self.data[index:index+self.batch_size]), np.array(self.answers[index:index+self.batch_size]), np.array(self.weights[index:index+self.batch_size])
+            return np.array(self.data[index:index+BATCH_SIZE]), np.array(self.answers[index:index+BATCH_SIZE]), np.array(self.weights[index:index+BATCH_SIZE])
         else:
-            return np.array(self.data[index:index+self.batch_size]), np.array(self.answers[index:index+self.batch_size])
+            return np.array(self.data[index:index+BATCH_SIZE]), np.array(self.answers[index:index+BATCH_SIZE])
 
 def train(opts:Any=None):
     # yield CPU time to useful tasks, this is a background thing...
@@ -326,14 +331,14 @@ def train(opts:Any=None):
     nfeat = len(data[0][0])
     print("Data (x):",len(data)," Test (y):", len(test_data), "; Samples=",nsteps,"; Features=",nfeat)
 
-    #train_dataset = tf.data.Dataset.from_tensor_slices((data, answers)).batch(batch_size)
-    train_dataset = DataGenerator(data, answers, sample_weights, batch_size=opts.tf_batch_size)
+    #train_dataset = tf.data.Dataset.from_tensor_slices((data, answers)).batch(BATCH_SIZE)
+    train_dataset = DataGenerator(data, answers, sample_weights)
     data = None
     answers = None
     gc.collect()
 
-    #test_dataset = tf.data.Dataset.from_tensor_slices((test_data, test_answers)).batch(batch_size)
-    test_dataset = DataGenerator(test_data, test_answers, batch_size=opts.tf_batch_size)
+    #test_dataset = tf.data.Dataset.from_tensor_slices((test_data, test_answers)).batch(BATCH_SIZE)
+    test_dataset = DataGenerator(test_data, test_answers)
     have_test = test_answers is not None and len(test_answers) > 0
     test_data = None
     test_answers = None
@@ -344,6 +349,10 @@ def train(opts:Any=None):
     
     stop = False
     epoch = 0
+
+    #model_path = '/tmp/train-a0s9k10o.pycf.model.h5'
+    #epoch = 6
+
     while not stop:
         queue = Queue(1)
         sub = Process(target=_train_some, args=(model_path, train_dataset, test_dataset, epoch, queue))
