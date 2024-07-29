@@ -467,7 +467,7 @@ def read_feature_spans(log:str|TextIO|dict, *spans) -> dict[str, list]:
         if blankf is not None:
             blankf.add(lasttime, f[2])
         if difff is not None:
-            difff.add(lasttime, f[3] >= 15.0)
+            difff.add(lasttime, f[3] >= 15.0 or f[2])
         if volume is not None:
             volume.append((lasttime, f[4], f[5]))
         

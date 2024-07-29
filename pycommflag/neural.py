@@ -1,3 +1,4 @@
+from bisect import bisect_left
 import logging as log
 import gc
 import math
@@ -18,59 +19,96 @@ from keras.utils import Sequence
 from .feature_span import *
 from . import processor
 
-WINDOW_BEFORE = 2.0
-WINDOW_AFTER = 2.0
+WINDOW_BEFORE = 0.5
+WINDOW_AFTER = 4.5
 RATE = 29.97
 RNN = 'lstm'
 UNITS = 32
 DROPOUT = 0.15
-EPOCHS = 25
-BATCH_SIZE = 2000
+EPOCHS = 30
+BATCH_SIZE = 1000
 
 # clean up tags so they start/end exactly in a nearby blank block
 # this is because the training data is supplied by humans, and might be off a bit
-def _adjust_tags(tags:list,blanks:list,duration:float):
+def _adjust_tags(tags:list,blanks:list,diffs:list,duration:float):
+    filt = []
     for ti in range(len(tags)):
+        (tt, (tb, te)) = tags[ti]
+        tt = int(tt)
+
         bbest = (duration,)
         ebest = (duration,)
-        (tt, (tb, te)) = tags[ti]
-        
+        left = bisect_left(blanks, tb-30, 0, len(blanks), key=lambda b: b[1][0])
         for bi in range(len(blanks)):
             (bv,(bs,be)) = blanks[bi]
-            if not bv or bs < 1.0 or (be-bs) > 5.0:
+            if not bv or bs < 1.0 or be < tb-10:
                 continue
-            if be >= duration-1.0: 
+            if bs > te+10 or be >= duration-1:
                 break
             
             for b in (bs,be):
                 d = abs(tb - b)
                 if bbest[0] > d: bbest = (d,bi)
-            for b in (bs,be):
+            
                 d = abs(te - b)
                 if ebest[0] > d: ebest = (d,bi)
         
-        if bbest[0] < 3:
-            #print(f'Adjust start of {ti} from {tb} to {be}')
+        maxdist = 10 if tt in [SceneType.SHOW.value, SceneType.COMMERCIAL.value] else 2
+        
+        if bbest[0] < maxdist and bbest[0] > 0:
             tags[ti] = (tt,(blanks[bbest[1]][1][1],te))
-        if ebest[0] < 3:
-            #print(f'Adjust end of {ti} from {te} to {bs}')
-            tags[ti] = (tt,(tb,blanks[ebest[1]][1][0]))
+            #print(f'Adjust start of {ti} (type {tt}) from {tb} to blank at {tags[ti][1][0]}')
+        if ebest[0] < maxdist and ebest[0] > 0:
+            tags[ti] = (tt,(tags[ti][1][0],blanks[ebest[1]][1][0]))
+            #print(f'Adjust end of {ti} (type {tt}) from {te} to blank at {tags[ti][1][1]}')
+        
+        bbest = (duration,)
+        ebest = (duration,)
+        left = bisect_left(diffs, tb-30, 0, len(diffs), key=lambda d: d[1][0])
+        for di in range(left, len(diffs)):
+            (dv, (db, de)) = diffs[di]
+            if not dv or db < 1.0 or de < tb-10:
+                continue
+            if db > te+10 or de >= duration-1:
+                break
+            
+            for b in (db,de):
+                d = abs(tb - b)
+                if bbest[0] > d: bbest = (d,di)
+            
+                d = abs(te - b)
+                if ebest[0] > d: ebest = (d,di)
+        
+        if bbest[0] < 1 and bbest[0] > 0:
+            tags[ti] = (tt,(diffs[bbest[1]][1][1],te))
+            #print(f'Adjust start of {ti} (type {tt}) from {tb} to diff at {tags[ti][1][0]}')
+        if ebest[0] < 1 and ebest[0] > 0:
+            tags[ti] = (tt,(tags[ti][1][0],diffs[ebest[1]][1][0]))
+            #print(f'Adjust end of {ti} (type {tt}) from {te} to diff at {tags[ti][1][1]}')
+                
+        if tags[ti][1][0] >= tags[ti][1][1]:
+            filt.append(ti)
+    
+    for x in reversed(filt):
+        #print('Tag evaporated:',tags[x])
+        del tags[x]
+    
+    return tags
 
-def flog_to_vecs(flog:dict, noblanks=False, nologo=False)->tuple[list[float], list[list[float]], list[float], list[float]]:
+def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[list[float], list[list[float]], list[float], list[float]]:
     version = flog.get('file_version', 10)
     frame_rate = flog.get('frame_rate', 29.97)
     endtime = flog.get('duration', 0)
 
     tags = flog.get('tags', [])
     
-    if tags:
-        blanks = processor.read_feature_spans(flog, 'blank').get('blank', [])
-        if blanks:
-            _adjust_tags(tags,blanks,endtime)
+    if tags and fitlerForTraining:
+        spans = processor.read_feature_spans(flog, 'blank', 'diff')
+        tags = _adjust_tags(tags,spans.get('blank', []),spans.get('diff', []),endtime)
         ti = 0
         while ti < len(tags):
             if tags[ti][0] != SceneType.DO_NOT_USE and tags[ti][0] != SceneType.DO_NOT_USE.value:
-                if tags[ti][1][1] - tags[ti][1][0] < 10:
+                if tags[ti][1][1] - tags[ti][1][0] < 5:
                     del tags[ti]
                     continue
             ti += 1 
@@ -93,8 +131,8 @@ def flog_to_vecs(flog:dict, noblanks=False, nologo=False)->tuple[list[float], li
             for x in range(1,step):
                 # audio features are spread across time anyway so we can omit individual frames without much worry
                 # but these video features can be important in a single frame, so make sure we capture that before dropping 
-                f[1] += old[i-x][1] if not nologo else 0 # logo
-                f[2] += old[i-x][2] if not noblanks else 0 # blank
+                f[1] += old[i-x][1] # logo
+                f[2] += old[i-x][2] # blank
                 f[3] = max(f[3], old[i-x][3]) # diff
             f[1] /= step
             f[2] /= step
@@ -104,10 +142,7 @@ def flog_to_vecs(flog:dict, noblanks=False, nologo=False)->tuple[list[float], li
         old = frames
         frames = []
         for i in range(len(old)):
-            f = old[i]+[old[i][0]/endtime]
-            if nologo: f[1] = 0
-            if noblanks: f[2] = 0
-            frames.append(f)
+            frames.append(old[i]+[old[i][0]/endtime])
     
     # ok now we can numpy....
     frames = np.array(frames)
@@ -170,12 +205,17 @@ def flog_to_vecs(flog:dict, noblanks=False, nologo=False)->tuple[list[float], li
             answers.append(None)
             continue
 
+        if fitlerForTraining and prev == tt and frames[len(answers)][2] <= 0 and frames[len(answers)][3] <= 10:
+            bad.append(len(answers))
+            answers.append(None)
+            continue
+
         if prev != tt:
             prev = tt
             i = len(answers)
             for x in range(max(0,i-before), min(i+1+after,len(weights))):
                 weights[x] = 2.0
-        
+
         x = [0] * SceneType.count()
         x[tt if type(tt) is int else tt.value] = 1
         answers.append(np.array(x))
@@ -353,9 +393,12 @@ def train(opts:Any=None):
     #model_path = '/tmp/train-a0s9k10o.pycf.model.h5'
     #epoch = 6
 
-    while not stop:
+    if True:
+        _train_some(model_path, train_dataset, test_dataset, epoch)
+    else:
+      while not stop:
         queue = Queue(1)
-        sub = Process(target=_train_some, args=(model_path, train_dataset, test_dataset, epoch, queue))
+        sub = Process(target=_train_proc, args=(model_path, train_dataset, test_dataset, epoch, queue))
         sub.start()
 
         while sub.is_alive():
@@ -393,7 +436,10 @@ def train(opts:Any=None):
 
     return 0
 
-def _train_some(model_path, train_dataset, test_dataset, epoch, queue) -> tuple[int,bool]:
+def _train_proc(model_path, train_dataset, test_dataset, epoch, queue):
+    queue.put( _train_some(model_path, train_dataset, test_dataset, epoch) )
+
+def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,bool]:
     import signal
     import keras
     from keras import layers, callbacks
@@ -472,8 +518,7 @@ def _train_some(model_path, train_dataset, test_dataset, epoch, queue) -> tuple[
     model.fit(train_dataset, epochs=EPOCHS, initial_epoch=epoch, shuffle=True, callbacks=cb, validation_data=test_dataset, class_weight=class_weights)
 
     #model.save(model_path) the checkpoint already saved the vest version
-    queue.put( (ecp.last_epoch+1, ecp.last_epoch+1 >= EPOCHS) )
-    return
+    return (ecp.last_epoch+1, ecp.last_epoch+1 >= EPOCHS)
 
 def predict(feature_log:str|TextIO|dict, opts:Any)->list:
     import tensorflow as tf
@@ -555,16 +600,16 @@ def predict(feature_log:str|TextIO|dict, opts:Any)->list:
                 if results[i+1][1][1] <= nextstart:
                     del results[i+1]
                 else:
-                    results[i+1][1] = (nextstart, results[i+1][1][1])
+                    results[i+1] = (results[i+1][0], (nextstart, results[i+1][1][1]))
                     break
 
         # its ok now, move on
         i += 1
     
-    print('Post filter n=', len(results))
+    print(f'Post filter n={len(results)}')
     print(results)
 
-    _adjust_tags(results, spans.get('blank', []), duration)
+    results = _adjust_tags(results, spans.get('blank', []), spans.get('diff', []), duration)
 
     print(f'\n\nFinal n={len(results)}:')
     print(results)
