@@ -19,13 +19,13 @@ from keras.utils import Sequence
 from .feature_span import *
 from . import processor
 
-WINDOW_BEFORE = 0.5
-WINDOW_AFTER = 4.5
+WINDOW_BEFORE = 2.5
+WINDOW_AFTER = 2.5
 RATE = 29.97
 RNN = 'lstm'
 UNITS = 32
-DROPOUT = 0.15
-EPOCHS = 30
+DROPOUT = 0.2
+EPOCHS = 35
 BATCH_SIZE = 1000
 
 # clean up tags so they start/end exactly in a nearby blank block
@@ -154,13 +154,13 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[list[float], list[li
     frames[...,0] = (frames[...,0] % 1800.0) / 1800.0
 
     # normalize frame diffs
-    frames[...,3] = np.clip(frames[...,3] / 25, 0, 1.0)
+    frames[...,3] = np.clip(frames[...,3] / 30, 0, 1.0)
 
     before = int(WINDOW_BEFORE * RATE) + 1
     after = int(WINDOW_AFTER * RATE) + 1
     
     if len(frames) < (before+1+after)*3:
-        return ([],[],[])
+        return ([],[],[],[])
     
     # there is a 59x duplication of the same data across sample sets here so BE CAREFUL with slices
     data = []
@@ -214,7 +214,7 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[list[float], list[li
             prev = tt
             i = len(answers)
             for x in range(max(0,i-before), min(i+1+after,len(weights))):
-                weights[x] = 2.0
+                weights[x] = 2.
 
         x = [0] * SceneType.count()
         x[tt if type(tt) is int else tt.value] = 1
