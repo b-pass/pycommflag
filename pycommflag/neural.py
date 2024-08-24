@@ -1,7 +1,7 @@
 from bisect import bisect_left
 import logging as log
 import gc
-import math
+from math import ceil, floor
 from queue import Empty as QueueEmpty
 from multiprocessing import Process, Queue
 import os
@@ -19,8 +19,10 @@ from keras.utils import Sequence
 from .feature_span import *
 from . import processor
 
-WINDOW_BEFORE = 2.5
-WINDOW_AFTER = 2.5
+WINDOW_BEFORE = 15
+WINDOW_AFTER = 15
+SUMMARY_RATE = 4
+
 RATE = 29.97
 RNN = 'lstm'
 UNITS = 32
@@ -95,6 +97,24 @@ def _adjust_tags(tags:list,blanks:list,diffs:list,duration:float):
     
     return tags
 
+def condense(frames, step):
+    if step > 1:
+        # audio features are spread across time anyway so we can omit individual frames without much worry
+        # but these video features can be important in a single frame, so make sure we capture that before dropping 
+        old = frames
+        frames = old[::step]
+        if len(frames) == 1:
+            frames[0][1] = np.average(old[:,1]) # logo
+            frames[0][2] = np.average(old[:,2]) # blank
+            frames[0][3] = np.count_nonzero(old[:,3] > 15) / len(old) # diff
+        else:
+            for i in range(len(frames)):
+                frames[i][1] = np.average(old[i*step : (i+1)*step,1]) # logo
+                frames[i][2] = np.average(old[i*step : (i+1)*step,2]) # blank
+                frames[i][3] = np.count_nonzero(old[i*step : (i+1)*step,3] > 15) / step # diff
+        old = None
+    return frames
+
 def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[list[float], list[list[float]], list[float], list[float]]:
     version = flog.get('file_version', 10)
     frame_rate = flog.get('frame_rate', 29.97)
@@ -121,70 +141,75 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[list[float], list[li
     if frames[0] is None: 
         frames = flog['frames'][1:]
 
-    step = round(frame_rate/RATE)
-    if step > 1:
-        # aggregate...
-        old = frames
-        frames = []
-        for i in range(step-1, len(old), step):
-            f = old[i]+[old[i][0]/endtime]
-            for x in range(1,step):
-                # audio features are spread across time anyway so we can omit individual frames without much worry
-                # but these video features can be important in a single frame, so make sure we capture that before dropping 
-                f[1] += old[i-x][1] # logo
-                f[2] += old[i-x][2] # blank
-                f[3] = max(f[3], old[i-x][3]) # diff
-            f[1] /= step
-            f[2] /= step
-            frames.append(f)
-    else:
-        # theres a way to do this in numpy with concatenate, does it matter?
-        old = frames
-        frames = []
-        for i in range(len(old)):
-            frames.append(old[i]+[old[i][0]/endtime])
-    
     # ok now we can numpy....
     frames = np.array(frames)
+    
+    # normalize frame rate
+    frames = condense(frames, round(frame_rate/RATE))
+
+    # add a column for time percentage
+    time_perc = frames[...,0]/endtime
+    frames = np.append(frames, time_perc[:,np.newaxis], axis=1)
+    time_perc = None
 
     # copy the real timestamps
     timestamps = frames[...,0].tolist()
-
+    
     # normalize the timestamps upto 30 minutes
     frames[...,0] = (frames[...,0] % 1800.0) / 1800.0
 
     # normalize frame diffs
     frames[...,3] = np.clip(frames[...,3] / 30, 0, 1.0)
 
-    before = int(WINDOW_BEFORE * RATE) + 1
-    after = int(WINDOW_AFTER * RATE) + 1
-    
-    if len(frames) < (before+1+after)*3:
-        return ([],[],[],[])
-    
-    # there is a 59x duplication of the same data across sample sets here so BE CAREFUL with slices
+    # +/- 1s is all frames, plus the WINDOW before/after which is condensed to SUMMARY_RATE 
+    rate = round(RATE)
+    summary = round(RATE/SUMMARY_RATE)
+    wbefore = round(WINDOW_BEFORE * SUMMARY_RATE)
+    wafter = round(WINDOW_AFTER * SUMMARY_RATE)
     data = []
+
+    if len(frames) < (WINDOW_BEFORE + WINDOW_AFTER) * 2 * rate:
+        return None
+    
+    # we do not use numpy for these because there is MUCH duplication, so we save memory by using pylists.
+    condensed = condense(frames, summary).tolist()
+    frames = frames.tolist()
+
     i = 0
-
-    # the leading frames can't use slices because the first frame repeats (for padding)
-    while i <= before:
-        d = ([frames[0]] * (before - i)) + frames[0 : 1 + i + after].tolist()
-        data.append(np.array(d))
-        #print(len(data[-1]), data[-1][0],data[-1][-1])
-        i += 1
-
-    # the majority of frames use a simple numpy slice        
-    while i < (len(frames)-(after+1)):
-        data.append(frames[i - before : 1 + i + after])
-        #print(len(data[-1]), "!",data[-1][0],data[-1][-1])
+    while True:
+        ci = i//summary
+        if ci > wbefore: 
+            break
+        data.append(
+            condensed[0:1] * (wbefore - ci) + 
+            condensed[0 : ci] +
+            frames[0:1] * max(0, rate-i) +
+            frames[max(0, i-rate) : i+rate+1] +
+            condensed[ci + 1 : ci + wafter + 1]
+        )
+        #if len(data[-1]) != len(data[0]): raise Exception(f"{i}, {np.array(data[0]).shape} {np.array(data[-1]).shape}")
         i += 1
     
-    # the trailing frames can't use slices because the last frame repeats (for padding)
+    while i < len(frames) - (WINDOW_AFTER+1)*rate:
+        ci = i//summary
+        data.append(
+            condensed[ci - (wbefore + 1) + 1 : ci] +
+            frames[i-rate : i+rate+1] +
+            condensed[ci+1 : ci + wafter + 1]
+        )
+        #if len(data[-1]) != len(data[0]): raise Exception(f"{i}, {np.array(data[0]).shape} {np.array(data[-1]).shape}")
+        i += 1
+    
     while i < len(frames):
-        d = frames[i - before : 1 + i + after].tolist()
-        d += [frames[-1]] * (before+1+after - len(d))
-        data.append(np.array(d))
-        #print(len(data[-1]), "?",data[-1][0],data[-1][-1], "@", i, len(data[-1]))
+        ci = i//summary
+        data.append(
+            condensed[ci - (wbefore + 1) + 1 : ci] +
+            frames[i-rate : i+rate+1] +
+            frames[-1:] * max(0, i + rate + 1 - len(frames)) +
+            condensed[ci + 1 : ci + wafter + 1] +
+            condensed[-1:] * max(0,ci + wafter + 1 - len(condensed))
+        )
+        #if len(data[-1]) != len(data[0]): raise Exception(f"{i}, {np.array(data[0]).shape} {np.array(data[-1]).shape}")
         i += 1
 
     # convert tags to a one-hot per-frame
@@ -213,8 +238,8 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[list[float], list[li
         if prev != tt:
             prev = tt
             i = len(answers)
-            for x in range(max(0,i-before), min(i+1+after,len(weights))):
-                weights[x] = 2.
+            for x in range(max(0,i-round(RATE)), min(i+1+round(RATE),len(weights))):
+                weights[x] = 2.0
 
         x = [0] * SceneType.count()
         x[tt if type(tt) is int else tt.value] = 1
@@ -338,7 +363,7 @@ class DataGenerator(Sequence):
         self.data = data
         self.answers = answers
         self.weights = weights
-        self.len = math.ceil(len(self.answers) / BATCH_SIZE)
+        self.len = ceil(len(self.answers) / BATCH_SIZE)
         self.shape = (len(data[0]), len(data[0][0]))
     
     def __len__(self):
@@ -390,8 +415,8 @@ def train(opts:Any=None):
     stop = False
     epoch = 0
 
-    #model_path = '/tmp/train-a0s9k10o.pycf.model.h5'
-    #epoch = 6
+    #model_path = '/tmp/train-3koyrut2.pycf.model.h5'
+    #epoch = 24
 
     if True:
         _train_some(model_path, train_dataset, test_dataset, epoch)
@@ -425,7 +450,7 @@ def train(opts:Any=None):
     print(tmetrics)
 
     if tmetrics[1] >= 0.80:
-        name = f'{opts.models_dir if opts and opts.models_dir else "."}{os.sep}pycf-{tmetrics[1]:.04f}-{RNN}{UNITS}-d{DROPOUT}-w{WINDOW_BEFORE}x{WINDOW_AFTER}-{int(time.time())}.h5'
+        name = f'{opts.models_dir if opts and opts.models_dir else "."}{os.sep}pycf-{tmetrics[1]:.04f}-{RNN}{UNITS}-d{DROPOUT}-w{WINDOW_BEFORE}x{WINDOW_AFTER}x{SUMMARY_RATE}-{int(time.time())}.h5'
         print()
         print('Saving as ' + name)
 

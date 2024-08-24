@@ -17,9 +17,9 @@ def search(player:Player, search_beginning:bool=False, opts:Any=None) -> tuple|N
         search_seconds = player.duration
         player.seek(0)
     else:
-        search_seconds = 600 if player.duration <= 3700 else 900
+        search_seconds = 900
         if not search_beginning and player.duration >= search_seconds*2:
-            player.seek(player.duration/3)
+            player.seek(player.duration/2)
         else:
             player.seek(0)
     

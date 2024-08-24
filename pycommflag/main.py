@@ -13,6 +13,9 @@ def run(opts) -> None|int:
     
     if opts.gui and not opts.feature_log:
         opts.feature_log = opts.gui
+        from .processor import read_feature_log
+        if f := read_feature_log(opts.feature_log).get('filename', None):
+            opts.filename = f
 
     if not opts.chanid and not opts.starttime:
         import re
