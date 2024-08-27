@@ -21,7 +21,7 @@ from . import processor
 
 WINDOW_BEFORE = 15
 WINDOW_AFTER = 15
-SUMMARY_RATE = 4
+SUMMARY_RATE = 2
 
 RATE = 29.97
 RNN = 'lstm'
@@ -293,16 +293,6 @@ def load_data(opts)->tuple[list,list,list,list,list]:
             y += b
             w += c
             
-            #(_,a,b,c) = flog_to_vecs(flog, True, False)
-            #x += a
-            #y += b
-            #w += c
-
-            #(_,a,b,c) = flog_to_vecs(flog, False, True)
-            #x += a
-            #y += b
-            #w += c
-            
             a = None
             b = None
             c = None
@@ -319,14 +309,6 @@ def load_data(opts)->tuple[list,list,list,list,list]:
             (_,a,b,_) = flog_to_vecs(flog)
             xt += a
             yt += b
-            
-            #(_,a,b,_) = flog_to_vecs(flog, True, False)
-            #xt += a
-            #yt += b
-            
-            #(_,a,b) = flog_to_vecs(flog, False, True)
-            #xt += a
-            #yt += b
             
             a = None
             b = None
