@@ -156,7 +156,7 @@ class Window(tk.Tk):
         #self.taggers.append((tk.Button(tags), SceneType.TRANSITION, 'Transition'))
         self.taggers.append((tk.Button(tags), SceneType.INTRO, 'Intro'))
         self.taggers.append((tk.Button(tags), SceneType.CREDITS, 'Credits'))
-        self.taggers.append((tk.Button(tags), SceneType.DO_NOT_USE, 'Bad'))
+        self.taggers.append((tk.Button(tags), SceneType.DO_NOT_USE, 'Ignore'))
 
         c = 0
         for (b,t,l) in self.taggers:

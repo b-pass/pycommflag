@@ -41,7 +41,7 @@ def _adjust_tags(tags:list,blanks:list,diffs:list,duration:float):
         bbest = (duration,)
         ebest = (duration,)
         left = bisect_left(blanks, tb-30, 0, len(blanks), key=lambda b: b[1][0])
-        for bi in range(len(blanks)):
+        for bi in range(left, len(blanks)):
             (bv,(bs,be)) = blanks[bi]
             if not bv or bs < 1.0 or be < tb-10:
                 continue
@@ -99,7 +99,7 @@ def _adjust_tags(tags:list,blanks:list,diffs:list,duration:float):
 
 def condense(frames, step):
     if step > 1:
-        # audio features are spread across time anyway so we can omit individual frames without much worry
+        # audio features are spread across time anyway so we dont need to sumarize them unless the condense step is more than 0.5s
         # but these video features can be important in a single frame, so make sure we capture that before dropping 
         old = frames
         frames = old[::step]

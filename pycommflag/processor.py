@@ -338,10 +338,13 @@ class AudioProc(Thread):
                 nexttime = st + len(sm)/16000
                 
                 if missing > 0:
+                    # these are LEADING missing values, the last frame actually didnt have enough but we only tell by the NEXT pts
                     log.info(f'Missing {missing} audio samples before time {st} (got {len(sm)})')
-                    # these are LEADING missing values
                     sm = np.append(np.zeros(missing, 'float32'), sm)
                 elif missing < -1:
+                    # these are LEADING extra samples
+                    # sometimes we get bad PTS for audio where drops 512 and then the next one has the dropped samples
+                    # BUT the PTS was wrong, and the hole isn't in the same place... a 1/32 hole was created and we can't fill it
                     extra = -missing
                     log.info(f'Extra audio samples at time {st}? Got {len(sm)}, dropping {extra} of them...')
                     if extra == len(sm):
