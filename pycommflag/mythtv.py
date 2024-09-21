@@ -4,7 +4,11 @@ import logging as log
 import av
 from .feature_span import SceneType
 
+g_connection = None
 def _open():
+    global g_connection
+    if g_connection is not None:
+        return g_connection
     dbc = {}
     cfgfile = os.path.join(os.path.expanduser('~'), '.mythtv/config.xml')
     if not os.path.exists(cfgfile):
@@ -14,12 +18,13 @@ def _open():
     for e in xml.parse(cfgfile).find('Database').iter():
         dbc[e.tag.lower()] = e.text
     import MySQLdb as mysql
-    return mysql.connect(
+    g_connection = mysql.connect(
         host=dbc.get('host', "localhost"),
         user=dbc.get('username', "mythtv"),
         passwd=dbc.get('password', "mythtv"),
         db=dbc.get('databasename', "mythconverg"),
     )
+    return g_connection
 
 def _get_filename(cursor, chanid, starttime):
     cursor.execute("SELECT s.dirname, r.basename FROM recorded r, storagegroup s "\
@@ -30,7 +35,22 @@ def _get_filename(cursor, chanid, starttime):
             return os.path.join(d,f)
     return None
 
-def get_filename(chanid, starttime)->str|None:
+def get_filename(opts)->str|None:
+    chanid = opts.chanid
+    starttime = opts.starttime
+    if not chanid or not starttime:
+        if opts.mythjob:
+            conn = _open()
+            if conn is not None:
+                with conn.cursor() as c:
+                    c.execute("SELECT chanid, starttime FROM jobqueue WHERE id = %s", (opts.mythjob,))
+                    for (ci,st) in c.fetchall():
+                        f = _get_filename(c, ci, st)
+                        if f is not None:
+                            return f
+                log.error(f"No mythtv recording found for job {opts.mythjob}")
+        return None
+    
     conn = _open()
     if conn is None:
         return None
@@ -96,7 +116,12 @@ def get_breaks(chanid, starttime)->list[tuple[float,float]]:
             result[-1] = (result[-1][0], v)
     return result
 
-def set_breaks(chanid, starttime, marks)->None:
+def set_breaks(opts, marks)->None:
+    chanid = opts.chanid
+    starttime = opts.starttime
+    if not chanid or not starttime:
+        return
+    
     conn = _open()
     if conn is None:
         return
@@ -106,6 +131,9 @@ def set_breaks(chanid, starttime, marks)->None:
         if not filename:
             return
 
+        log.debug(f"Set breaks in myth DB for {chanid}_{starttime}")
+
+        nbreaks = 0
         rate = 29.97
         with av.open(filename) as container:
             try:
@@ -125,7 +153,7 @@ def set_breaks(chanid, starttime, marks)->None:
                 st = SceneType(st)
             if st == SceneType.DO_NOT_USE:
                 continue
-            print(st,b,e)
+            #print(st,b,e)
 
             # MythTV stores commbreaks as frame numbers in its DB
             # Which is from like 1999
@@ -152,16 +180,41 @@ def set_breaks(chanid, starttime, marks)->None:
             fe = int(m) + round((e - o/1000) * rate)
             
             if st == SceneType.COMMERCIAL:
-                print("\t....",st,fb,fe)
+                nbreaks += 1
+                log.debug(f".... {st} {fb} {fe}")
                 c.execute("INSERT INTO recordedmarkup (chanid,starttime,mark,type) "\
                           "VALUES(%s,%s,%s,4),(%s,%s,%s,5);",
                           (chanid, starttime, fb, chanid, starttime, fe))
             elif st == SceneType.INTRO or st == SceneType.CREDITS:
-                print("\t....",st,fe, '(B)')
+                log.debug(f".... {st} {fe} (B)")
                 c.execute("INSERT INTO recordedmarkup (chanid,starttime,mark,type) "\
                           "VALUES(%s,%s,%s,2)",
                           (chanid, starttime, fe))
             else:
                 pass
-            
-        
+    
+    set_job_status(opts, msg=f'Found {nbreaks} commercial breaks', status='success')
+
+def set_job_status(opts, msg='', status='run'):
+    if not opts.mythjob:
+        return
+    
+    conn = _open()
+    if conn is None:
+        return
+
+    if status == 'start':
+        status = 3
+    elif status == 'run':
+        status = 4
+    elif status == 'done':
+        status = 256
+    elif status == 'finish' or status == 'finished' or status == 'success':
+        status = 272 # Finished (Successfully completed)
+    elif status == 'abort':
+        status = 288
+    else:#if status == 'error':
+        status = 304 # errored
+    
+    with conn.cursor() as c:
+        c.execute('UPDATE jobqueue SET comment = "%s", status = "%d" WHERE id = "%s"', (msg, status, opts.mythjob))

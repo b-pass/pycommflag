@@ -75,6 +75,7 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
     elif logo is not None:
         pass
     else:
+        mythtv.set_job_status(opts,'Searching for logo')
         logo = logo_finder.search(player, opts=opts)
         player.seek(0)
     
@@ -110,6 +111,7 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
 
     percent = ftotal/100.0
     report = math.ceil(ftotal/1000) if not opts.quiet else ftotal*10
+    mythreport = 0
     rt = time.perf_counter()
     p = 0
     
@@ -122,6 +124,7 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
     videoProc.start()
 
     if not opts.quiet: print('\nExtracting features...', end='\r') 
+    mythtv.set_job_status(opts, 'Extracting features - 0%')
 
     # not doing format/aspect because everything is widescreen all the time now
     # that was very early '00s... except ultra wide screen movies, and sometimes ultra-wide commercials?
@@ -137,6 +140,9 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
             perc = min(fcount/percent,100.0)
             timeleft = round( (100.0 - perc) * ((time.time() - start) / perc) )+1
             print("Extracting, %5.1f%% @%5.1f fps, %4d seconds left               " % (perc, p/(rt - ro), timeleft), end='\r')
+            if int(perc//5) != mythreport or perc >= 99:
+                mythreport = int(perc//5)
+                mythtv.set_job_status(opts, f'Extracting features - {perc}%')
             #gc.collect()
             p = 0
         if fcount%audio_interval == 0:
@@ -210,6 +216,7 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
     feature_log.close()
 
     if die:
+        mythtv.set_job_status(opts, 'interrupted', status='abort')
         raise KeyboardInterrupt()
     
     if not opts.quiet:

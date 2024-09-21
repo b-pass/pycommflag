@@ -17,8 +17,11 @@ def run(opts) -> None|int:
         if f := read_feature_log(opts.feature_log).get('filename', None):
             opts.filename = f
 
-    if not opts.chanid and not opts.starttime:
+    if not opts.chanid or not opts.starttime:
         import re
+        if opts.mythjob:
+            from .mythtv import get_filename
+            opts.filename = get_filename(opts)
         if opts.feature_log:
             if m:=re.match(r'(?:.*[\//])?cf_(\d{4,6})_(\d{12,})(?:\.[a-zA-Z0-9]{2,5}){1,4}', opts.feature_log):
                 opts.chanid = m[1]
@@ -30,7 +33,7 @@ def run(opts) -> None|int:
     
     if not opts.filename and opts.chanid and opts.starttime:
         from .mythtv import get_filename
-        opts.filename = get_filename(opts.chanid, opts.starttime)
+        opts.filename = get_filename(opts)
     
     if opts.reprocess:
         from .processor import reprocess
@@ -38,9 +41,9 @@ def run(opts) -> None|int:
         
         from .neural import predict
         result = predict(opts.reprocess, opts=opts)
-        if result and opts.chanid and opts.starttime:
+        if result and opts.chanid:
             from .mythtv import set_breaks
-            set_breaks(opts.chanid, opts.starttime, result)
+            set_breaks(opts, result)
         return 0
     
     if opts.gui:
@@ -69,9 +72,9 @@ def run(opts) -> None|int:
         if res is not None:
             flog['tags'] = res
             processor.write_feature_log(flog, opts.feature_log)
-            if res and opts.chanid and opts.starttime:
+            if res and opts.chanid:
                 from .mythtv import set_breaks
-                set_breaks(opts.chanid, opts.starttime, res)
+                set_breaks(opts, res)
             return 0
         else:
             return 1
@@ -98,8 +101,8 @@ def run(opts) -> None|int:
     from .neural import predict
     result = predict(feature_log, opts=opts)
 
-    print("Not saving result because this thing is probably broken")
-    #if result and opts.chanid and opts.starttime:
-    #    from .mythtv import set_breaks
-    #    set_breaks(opts.chanid, opts.starttime, result)
+    if result and opts.chanid:
+        from .mythtv import set_breaks
+        set_breaks(opts, result)
     return 0
+

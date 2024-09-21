@@ -57,13 +57,15 @@ def get_options():
                     help="Channel ID of recording, filename will be fetched from the mythtv database")
     mcf.add_argument('--starttime', dest="starttime",
                     help="Start timestamp of recording, filename will be fetched from the mythtv database")
-    mcf.add_argument('--queue', dest="queue", action="store_true",
-                    help="Insert a job into the mythtv job queue")
+    mcf.add_argument('-j','--jobid', dest="mythjob", type=int,
+                    help="Update status information in the mythtv job queue")
+    mcf.add_argument('--noprogress', dest='quiet', action='store_true',
+                    help="Quiet output (compatibility flag)")
     mcf.add_argument('--rebuild', dest="rebuild", action="store_true",
-                    help="Rebuild seek table (this will just exec mythcommflag directly to do this)")
-    mcf.add_argument('-j','--job', dest="mythjob", type=int,
-                    help="Run a job from the mythtv job queue (this will populate chanid and starttime from the job entry)")
-    # progress? quiet? logs?
+                    help="Rebuild recorded seek table (compatibility flag, this will just exec mythcommflag directly to do this)")
+    mcf.add_argument('--queue', dest="queue", action="store_true",
+                    help="Insert a job into the mythtv job queue (compatibility flag, this will just exec mythcommflag directly to do this)")
+    # progress? logs?
     #mcf.add_argument('--mythtv-out', dest="mythtv_output", action="store_true",
     #                help="Write flagging output to mythtv database even though --chanid and --starttime were not specified")
     #mcf.add_argument('--no-mythtv-out', dest="no_mythtv_output", action="store_true",
