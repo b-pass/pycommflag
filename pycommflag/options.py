@@ -59,6 +59,8 @@ def get_options():
                     help="Start timestamp of recording, filename will be fetched from the mythtv database")
     mcf.add_argument('-j','--jobid', dest="mythjob", type=int,
                     help="Update status information in the mythtv job queue")
+    mcf.add_argument('-e', '--exitcode', dest='exitcode', action='store_true',
+                    help='Use non-standard exit status compatible with running instead of mythcommflag in the jobqueue (exit number of commercial breaks)')
     mcf.add_argument('--noprogress', dest='quiet', action='store_true',
                     help="Quiet output (compatibility flag)")
     mcf.add_argument('--rebuild', dest="rebuild", action="store_true",

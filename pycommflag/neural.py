@@ -27,7 +27,7 @@ RATE = 29.97
 RNN = 'lstm'
 UNITS = 32
 DROPOUT = 0.2
-EPOCHS = 35
+EPOCHS = 25
 BATCH_SIZE = 1000
 
 # clean up tags so they start/end exactly in a nearby blank block
@@ -438,6 +438,8 @@ def train(opts:Any=None):
 
         import shutil
         shutil.copy(model_path, name)
+        try: os.chmod(name, 0o644)
+        except: pass
     
     print()
 

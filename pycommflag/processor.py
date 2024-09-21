@@ -85,6 +85,8 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
             feature_log = gzip.open(feature_log, 'w')
         else:
             feature_log = open(feature_log, 'w+')
+        try: os.chmod(feature_log, 0o666)
+        except: pass
     else:
         feature_log.seek(0)
         feature_log.truncate()
@@ -142,7 +144,7 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
             print("Extracting, %5.1f%% @%5.1f fps, %4d seconds left               " % (perc, p/(rt - ro), timeleft), end='\r')
             if int(perc//5) != mythreport or perc >= 99:
                 mythreport = int(perc//5)
-                mythtv.set_job_status(opts, f'Extracting features - {perc}%')
+                mythtv.set_job_status(opts, f'Extracting features - {perc:.1f}%')
             #gc.collect()
             p = 0
         if fcount%audio_interval == 0:

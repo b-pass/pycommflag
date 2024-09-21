@@ -5,14 +5,18 @@ import av
 from .feature_span import SceneType
 
 g_connection = None
+g_off = False
 def _open():
     global g_connection
-    if g_connection is not None:
+    global g_off
+    if g_connection is not None or g_off:
         return g_connection
+    
     dbc = {}
     cfgfile = os.path.join(os.path.expanduser('~'), '.mythtv/config.xml')
     if not os.path.exists(cfgfile):
-        log.debug(f"No mythtv config file at '{cfgfile}', so no mythtv extensions will work")
+        log.info(f"No mythtv config file at '{cfgfile}', so no mythtv extensions will work")
+        g_off = True
         return None
     import xml.etree.ElementTree as xml
     for e in xml.parse(cfgfile).find('Database').iter():
@@ -36,9 +40,7 @@ def _get_filename(cursor, chanid, starttime):
     return None
 
 def get_filename(opts)->str|None:
-    chanid = opts.chanid
-    starttime = opts.starttime
-    if not chanid or not starttime:
+    if not opts.chanid or not opts.starttime:
         if opts.mythjob:
             conn = _open()
             if conn is not None:
@@ -47,10 +49,17 @@ def get_filename(opts)->str|None:
                     for (ci,st) in c.fetchall():
                         f = _get_filename(c, ci, st)
                         if f is not None:
+                            if not opts.chanid:
+                                opts.chanid = ci
+                            if not opts.starttime:
+                                opts.starttime = st
                             return f
                 log.error(f"No mythtv recording found for job {opts.mythjob}")
         return None
     
+    chanid = opts.chanid
+    starttime = opts.starttime
+
     conn = _open()
     if conn is None:
         return None
@@ -194,6 +203,8 @@ def set_breaks(opts, marks)->None:
                 pass
     
     set_job_status(opts, msg=f'Found {nbreaks} commercial breaks', status='success')
+    if opts.mythjob and opts.exitcode:
+        sys.exit(nbreaks) # yes, this is dumb, but its what the jobqueue code looks for when we run as the CommercialFlag command
 
 def set_job_status(opts, msg='', status='run'):
     if not opts.mythjob:
@@ -217,4 +228,4 @@ def set_job_status(opts, msg='', status='run'):
         status = 304 # errored
     
     with conn.cursor() as c:
-        c.execute('UPDATE jobqueue SET comment = "%s", status = "%d" WHERE id = "%s"', (msg, status, opts.mythjob))
+        c.execute('UPDATE jobqueue SET comment = %s, status = %s WHERE id = %s', (msg, status, opts.mythjob))
