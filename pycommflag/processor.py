@@ -141,10 +141,11 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
             rt = time.perf_counter()
             perc = min(fcount/percent,100.0)
             timeleft = round( (100.0 - perc) * ((time.time() - start) / perc) )+1
-            print("Extracting, %5.1f%% @%5.1f fps, %4d seconds left               " % (perc, p/(rt - ro), timeleft), end='\r')
+            logmsg = "Extracting, %5.1f%% @%5.1f fps, %4d seconds left" % (perc, p/(rt - ro), timeleft)
+            print(logmsg + "               ", end='\r')
             if int(perc//5) != mythreport or perc >= 99:
                 mythreport = int(perc//5)
-                mythtv.set_job_status(opts, f'Extracting features - {perc:.1f}%')
+                mythtv.set_job_status(opts, logmsg)
             #gc.collect()
             p = 0
         if fcount%audio_interval == 0:
@@ -255,7 +256,7 @@ class VideoProc(Thread):
     def _proc(self, ftime, fcolor, logo_present):
         self.fcount += 1
 
-        column = mean_axis1_float_uint8(fcolor).astype('int16')
+        column = mean_axis1(fcolor, dtype='int16')
         if self.prev_col is not None:
             diff = column - self.prev_col
             diff = np.mean(np.std(np.abs(diff), (0)))
@@ -284,9 +285,9 @@ class VideoProc(Thread):
     def frame_header(self):
         return ["time","logo_present","is_blank","diff"]
 
-def mean_axis1_float_uint8(fcolor:np.ndarray)->np.ndarray:
+def mean_axis1(fcolor:np.ndarray, dtype='uint8')->np.ndarray:
     # the below code is equivalent to:
-    #    return fcolor.mean(axis=(1),dtype='float32').astype('uint8')
+    #    return fcolor.mean(axis=(1),dtype='float32').astype(dtype)
     # but is almost TEN TIMES faster!
     
     # pick out the individual color channels by skipping by 3, and then average them
@@ -295,7 +296,7 @@ def mean_axis1_float_uint8(fcolor:np.ndarray)->np.ndarray:
     cb = fcolor[...,2::3].mean(axis=(1), dtype='uint32')
     
     # and now convert those stacks back into a 720x3
-    return np.stack((cb,cg,cr), axis=1).astype('uint8')
+    return np.stack((cb,cg,cr), axis=1).astype(dtype)
 
 class AudioProc(Thread):
     def __init__(self, volume_window=.05, work_rate=60.0):

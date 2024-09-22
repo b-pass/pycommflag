@@ -530,6 +530,9 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
     return (ecp.last_epoch+1, ecp.last_epoch+1 >= EPOCHS)
 
 def predict(feature_log:str|TextIO|dict, opts:Any)->list:
+    from .mythtv import set_job_status
+    set_job_status(opts, "Inferencing...")
+
     import tensorflow as tf
     import keras
 
@@ -579,8 +582,8 @@ def predict(feature_log:str|TextIO|dict, opts:Any)->list:
         else:
             i += 1
 
-    print(f'\n\nMerged n={len(results)}')
-    print(results)
+    log.debug(f'Merged n={len(results)}')
+    log.debug(str(results))
 
     # commercials must be at least 60 (opts.comm_min_len) seconds long, if it's less, it is deleted
     # commercials must be less than 360 seconds long (opts.comm_max_len), if it's more then it is just show after that
@@ -615,13 +618,13 @@ def predict(feature_log:str|TextIO|dict, opts:Any)->list:
         # its ok now, move on
         i += 1
     
-    print(f'Post filter n={len(results)}')
-    print(results)
+    log.debug(f'Post filter n={len(results)}')
+    log.debug(str(results))
 
     results = _adjust_tags(results, spans.get('blank', []), spans.get('diff', []), duration)
 
-    print(f'\n\nFinal n={len(results)}:')
-    print(results)
+    log.debug(f'Final n={len(results)}:')
+    log.info(str(results))
 
     flog['tags'] = results
     processor.write_feature_log(flog, feature_log)
