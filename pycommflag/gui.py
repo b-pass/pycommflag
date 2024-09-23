@@ -312,7 +312,7 @@ class Window(tk.Tk):
             # stolen from processor
             n += 1
             fcolor = frame.to_ndarray(format="rgb24")
-            c = processor.mean_axis1_float_uint8(fcolor).astype('int16')
+            c = processor.mean_axis1(fcolor, dtype='int16')
             if prev is None:
                 prev = c
                 continue

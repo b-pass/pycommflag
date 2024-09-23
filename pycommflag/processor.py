@@ -357,10 +357,10 @@ class AudioProc(Thread):
                     # BUT the PTS was wrong, and the hole isn't in the same place... a 1/32 hole was created and we can't fill it
                     extra = -missing
                     log.info(f'Extra audio samples at time {st}? Got {len(sm)}, dropping {extra} of them...')
-                    if extra == len(sm):
+                    if extra >= len(sm):
                         continue
                     sm = sm[extra:]
-                    if len(ss) >= extra:
+                    if ss is not None:
                         ss = ss[extra:]
 
                 # resample code might leave TRAILING holes in ss; so pad it if needed

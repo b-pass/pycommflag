@@ -59,17 +59,18 @@ def search(player:Player, search_beginning:bool=False, opts:Any=None) -> tuple|N
     # in case we found something stuck on the screen, try to look beyond that
     stuck = []
     best = np.max(logo_sum)
-    while best > fcount*.90:
-        stuck_mask = logo_sum >= fcount*.8
+    while best >= fcount*.90:
+        stuck_mask = logo_sum >= best*.95
         
         ((top,left), (bottom,right)) = refine_logo(player, stuck_mask, allow_failure=False)
         stuck.append( ((top,left), (bottom,right)) )
         
         pos = (top + (bottom-top)//2, left + (right-left)//2)
+
         log.info(f'Stuck logo ({best*100/fcount}%) at {pos[0]},{pos[1]} -- nuke quarter of the screen')
         if pos[0] >= player.shape[0]/2:
             if pos[1] >= player.shape[1]/2:
-                logo_sum[player.shape[0]//2:,player.shape[1]//2:] = 0
+                logo_sum[player.shape[0]//2:, player.shape[1]//2:] = 0
             else:
                 logo_sum[player.shape[0]//2:, :player.shape[1]//2] = 0
         else:
@@ -124,6 +125,8 @@ def refine_logo(player, logo_mask, allow_failure=True):
     if bottom-top >= player.shape[0]/2 or right-left >= player.shape[1]/2:
         pos = (top + (bottom-top)//2, left + (right-left)//2)
         
+        log.debug(f"Need to clip logo bounding box {top},{left}->{bottom},{right} at {pos}, it is too large")
+
         if pos[0] >= player.shape[0]/2:
             top = int(player.shape[0]/2)
         else:

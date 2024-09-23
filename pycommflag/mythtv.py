@@ -53,6 +53,7 @@ def get_filename(opts)->str|None:
                                 opts.chanid = ci
                             if not opts.starttime:
                                 opts.starttime = st
+                            log.debug(f"Resolved job queue to file {f}")
                             return f
                 log.error(f"No mythtv recording found for job {opts.mythjob}")
         return None
