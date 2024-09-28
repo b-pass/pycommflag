@@ -23,6 +23,9 @@ def search(player:Player, search_beginning:bool=False, opts:Any=None) -> tuple|N
         else:
             player.seek(0)
     
+    if (fo:=int(player.frame_rate / 24)) > 1:
+        skip *= fo
+    
     fcount = 0
     ftotal = int(search_seconds * player.frame_rate)
     logo_sum = np.zeros(player.shape, np.uint32)
@@ -62,27 +65,27 @@ def search(player:Player, search_beginning:bool=False, opts:Any=None) -> tuple|N
     while best >= fcount*.90:
         stuck_mask = logo_sum >= best*.95
         
-        ((top,left), (bottom,right)) = refine_logo(player, stuck_mask, allow_failure=False)
-        stuck.append( ((top,left), (bottom,right)) )
-        
-        pos = (top + (bottom-top)//2, left + (right-left)//2)
+        h = player.shape[0]//2
+        w = player.shape[1]//2
+        count = 0
+        t = 0
+        l = 0
 
-        log.info(f'Stuck logo ({best*100/fcount}%) at {pos[0]},{pos[1]} -- nuke quarter of the screen')
-        if pos[0] >= player.shape[0]/2:
-            if pos[1] >= player.shape[1]/2:
-                logo_sum[player.shape[0]//2:, player.shape[1]//2:] = 0
-            else:
-                logo_sum[player.shape[0]//2:, :player.shape[1]//2] = 0
-        else:
-            if pos[1] >= player.shape[1]/2:
-                logo_sum[:player.shape[0]//2, player.shape[1]//2:] = 0
-            else:
-                logo_sum[:player.shape[0]//2, :player.shape[1]//2] = 0
+        for y in (0, h):
+            for x in (0, w):
+                c = np.count_nonzero(stuck_mask[y:y+h, x:x+w])
+                if c >= count:
+                    count = c
+                    t = y
+                    l = x
+        
+        log.info(f'Stuck logo ({best*100/fcount}%), concentrated at in quad {t},{l} with count={count}, NUKE IT')
+        logo_sum[t:t+h, l:l+w] = 0
         
         best = np.max(logo_sum)
         log.debug(f'New best = {best*100/fcount}% of {fcount}')
 
-    log.debug(f"Logo detected at {best} ({round(best*100/fcount)}%)")
+    log.debug(f"Logo detected {best} ({round(best*100/fcount)}%)")
 
     if best <= fcount / 2:
         log.info(f"No logo found (insufficient edge strength, best={best*100/fcount}%)")
@@ -90,24 +93,7 @@ def search(player:Player, search_beginning:bool=False, opts:Any=None) -> tuple|N
     
     logo_mask = logo_sum >= (best - fcount*.15)
 
-    res = refine_logo(player, logo_mask)
-    if res is None: return None
-    ((top,left), (bottom,right)) = res
-    
-    logo_mask = logo_mask[top:bottom,left:right]
-    
-    lmc = np.count_nonzero(logo_mask)
-    if lmc < 20:
-        log.info(f"No logo found (not enough edges within bounding box, got {lmc})")
-        return None
-    thresh = round(lmc * 2 / 3)
-    
-    log.debug(f"Final logo bounding box: {top},{left}->{bottom},{right} count_threshold={thresh}")
-
-    return ((top,left), (bottom,right), logo_mask, thresh, *stuck)
-
-def refine_logo(player, logo_mask, allow_failure=True):
-    if allow_failure and np.count_nonzero(logo_mask) < 50:
+    if np.count_nonzero(logo_mask) < 50:
         log.info("No logo found (not enough edges)")
         return None
     
@@ -117,36 +103,44 @@ def refine_logo(player, logo_mask, allow_failure=True):
     bottom = int(np.max(nz[0]))
     right = int(np.max(nz[1]))
     
-    if allow_failure and right - left < 5 or bottom - top < 5:
-        log.info(f"No logo found (bounding box {top},{left}->{bottom},{right} is too small)")
-        return None
-
     # if the bound is more than half the image then clip it
     if bottom-top >= player.shape[0]/2 or right-left >= player.shape[1]/2:
-        pos = (top + (bottom-top)//2, left + (right-left)//2)
-        
-        log.debug(f"Need to clip logo bounding box {top},{left}->{bottom},{right} at {pos}, it is too large")
+        log.debug(f"Need to clip logo bounding box {top},{left}->{bottom},{right}, it is too large")
 
-        if pos[0] >= player.shape[0]/2:
-            top = int(player.shape[0]/2)
-        else:
-            bottom = int(player.shape[0]/2)
-        if pos[1] >= player.shape[1]/2:
-            left = int(player.shape[1]/2)
-        else:
-            right = int(player.shape[1]/2)
-        
+        h = player.shape[0]//2
+        w = player.shape[1]//2
+        i = 0
+        count = 0
+        top = left = 0
+        bottom = h
+        right = w
+
+        for y in (0, h):
+            for x in (0, w):
+                c = np.count_nonzero(logo_mask[y:y+h, x:x+w])
+                if c >= count:
+                    count = c
+                    top = y
+                    left = x
+        bottom = top + h
+        right = left + w
+
         # recalculate after we truncated to shrink down on the real area as best we can
         nz = np.nonzero(logo_mask[top:bottom,left:right])
         bottom = top + int(np.max(nz[0]))
         right = left + int(np.max(nz[1]))
         top += int(np.min(nz[0])) 
         left += int(np.min(nz[1]))
+
+        log.debug(f"Clipped to bounding box {top},{left}->{bottom},{right} with count={count}")
     
-    logo_mask = logo_mask[top:bottom,left:right]
+    if right - left < 5 or bottom - top < 5:
+        log.info(f"No logo found (bounding box {top},{left}->{bottom},{right} is too small)")
+        return None
+
     filt = 0
-    for y in range(5,logo_mask.shape[0]-10):
-        for x in range(5,logo_mask.shape[1]-10):
+    for y in range(top+5,bottom-5+1):
+        for x in range(left+5,right-5+1):
             if logo_mask[y,x]:
                 ok = False
                 for yo in range(-2,3):
@@ -159,22 +153,32 @@ def refine_logo(player, logo_mask, allow_failure=True):
                     filt += 1
     if filt:
         log.debug(f"Filtered {filt} logo mask elements that were isolated from others")
-        nz = np.nonzero(logo_mask)
+        nz = np.nonzero(logo_mask[top:bottom,left:right])
         bottom = top + int(np.max(nz[0]))
         right = left + int(np.max(nz[1]))
         top += int(np.min(nz[0])) 
         left += int(np.min(nz[1]))
 
-    if allow_failure and right - left < 5 or bottom - top < 5:
+    if right - left < 5 or bottom - top < 5:
         log.info(f"No logo found (truncated bounding box at {top},{left}->{bottom},{right} too small)")
         return None
     
-    top -= 5
-    left -= 5
-    bottom += 5
-    right += 5
+    top -= 2
+    left -= 2
+    bottom += 2
+    right += 2
 
-    return ((top,left), (bottom,right))
+    logo_mask = logo_mask[top:bottom,left:right]
+    
+    lmc = np.count_nonzero(logo_mask)
+    if lmc < 20:
+        log.info(f"No logo found (not enough edges within bounding box, got {lmc})")
+        return None
+    thresh = round(lmc * 2 / 3)
+    
+    log.debug(f"Final logo bounding box: {top},{left}->{bottom},{right} count_threshold={thresh}")
+
+    return ((top,left), (bottom,right), logo_mask, thresh, *stuck)
 
 def logo_in_frame(frame :VideoFrame, logo :tuple) -> tuple[int, int]:
     if not logo:
