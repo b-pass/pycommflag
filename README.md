@@ -6,6 +6,7 @@ identify ("flag") segments of a video as being one of several categories:
 'content' (aka 'show'), 'commercial' (aka 'advertizing'), 'credits', or 
 'intro'.
 
+pycommflag is also a drop-in replacement for mythcommflag.  mythcommflag was revolutionary in its day, but it is now old and has seen no significant algorithmic updates in more than 15 years.  pycommflag stands on the shoulders of giants, many ideas in pycommflag are inspired by mythcommflag, and pycommflag would absolutely not exist without it!
 
 ## Features
 
