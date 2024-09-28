@@ -27,7 +27,7 @@ RATE = 29.97
 RNN = 'lstm'
 UNITS = 32
 DROPOUT = 0.2
-EPOCHS = 25
+EPOCHS = 40
 BATCH_SIZE = 1000
 
 # clean up tags so they start/end exactly in a nearby blank block
@@ -122,25 +122,42 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[list[float], list[li
 
     tags = flog.get('tags', [])
     
-    if tags and fitlerForTraining:
-        spans = processor.read_feature_spans(flog, 'blank', 'diff')
-        tags = _adjust_tags(tags,spans.get('blank', []),spans.get('diff', []),endtime)
-        ti = 0
-        while ti < len(tags):
-            if tags[ti][0] != SceneType.DO_NOT_USE and tags[ti][0] != SceneType.DO_NOT_USE.value:
-                if tags[ti][1][1] - tags[ti][1][0] < 5:
-                    del tags[ti]
-                    continue
-            ti += 1 
-    
     frames_header = flog['frames_header']
     assert('time' in frames_header[0])
     assert('diff' in frames_header[3])
 
+    if tags and fitlerForTraining:
+        spans = processor.read_feature_spans(flog, 'blank', 'diff')
+        tags = _adjust_tags(tags,spans.get('blank', []),spans.get('diff', []),endtime)
+        
+        # clean up tiny gaps between identified breaks (including true 0-length gaps)
+        i = 1
+        while i < len(tags):
+            if tags[i][0] == tags[i-1][0] and (tags[i][1][0] - tags[i-1][1][1]) < 30:
+                tags[i-1] = (tags[i][0], (tags[i-1][1][0], tags[i][1][1]))
+                del tags[i]
+            else:
+                i += 1
+        
+        i = 0
+        while i < len(tags):
+            clen = tags[i][1][1] - tags[i][1][0]
+            if clen < 10 and tags[i][0] in [SceneType.COMMERCIAL, SceneType.COMMERCIAL.value]:
+                if i+1 >= len(tags) and clen >= 5 and tags[i][1][1]+clen+10 >= endtime:
+                    # dont require full length if it is near the end of the recording
+                    break
+                # tiny commercial, delete it
+                del tags[i]
+            else:
+                i += 1
+    
     frames = flog['frames']
     if frames[0] is None: 
         frames = flog['frames'][1:]
 
+    if len(frames) < (WINDOW_BEFORE + WINDOW_AFTER) * 2 * round(RATE):
+        return None
+    
     # ok now we can numpy....
     frames = np.array(frames)
     
@@ -168,9 +185,6 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[list[float], list[li
     wafter = round(WINDOW_AFTER * SUMMARY_RATE)
     data = []
 
-    if len(frames) < (WINDOW_BEFORE + WINDOW_AFTER) * 2 * rate:
-        return None
-    
     # we do not use numpy for these because there is MUCH duplication, so we save memory by using pylists.
     condensed = condense(frames, summary).tolist()
     frames = frames.tolist()
@@ -230,16 +244,20 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[list[float], list[li
             answers.append(None)
             continue
 
-        if fitlerForTraining and prev == tt and frames[len(answers)][2] <= 0 and frames[len(answers)][3] <= 10:
-            bad.append(len(answers))
-            answers.append(None)
-            continue
+        #if fitlerForTraining and prev == tt and frames[len(answers)][2] <= 0 and frames[len(answers)][3] <= 10:
+        #    bad.append(len(answers))
+        #    answers.append(None)
+        #    continue
 
         if prev != tt:
             prev = tt
             i = len(answers)
+            for x in range(max(0,i-round(WINDOW_BEFORE*RATE)), max(0,i-round(RATE))):
+                weights[x] = 1.5
             for x in range(max(0,i-round(RATE)), min(i+1+round(RATE),len(weights))):
                 weights[x] = 2.0
+            for x in range(min(i+1+round(RATE),len(weights)), min(i+1+round(WINDOW_AFTER*RATE),len(weights))):
+                weights[x] = 1.5
 
         x = [0] * SceneType.count()
         x[tt if type(tt) is int else tt.value] = 1
@@ -288,7 +306,7 @@ def load_data(opts)->tuple[list,list,list,list,list]:
             continue
         print("Loading",f)
         if flog := processor.read_feature_log(f):
-            (_,a,b,c) = flog_to_vecs(flog)
+            (_,a,b,c) = flog_to_vecs(flog,True)
             x += a
             y += b
             w += c
@@ -306,7 +324,7 @@ def load_data(opts)->tuple[list,list,list,list,list]:
             continue
         print("Loading",f)
         if flog := processor.read_feature_log(f):
-            (_,a,b,_) = flog_to_vecs(flog)
+            (_,a,b,_) = flog_to_vecs(flog,True)
             xt += a
             yt += b
             
@@ -397,8 +415,8 @@ def train(opts:Any=None):
     stop = False
     epoch = 0
 
-    #model_path = '/tmp/train-3koyrut2.pycf.model.h5'
-    #epoch = 24
+    model_path = '/tmp/train-m1afzw61.pycf.model.h5'
+    epoch = 25
 
     if True:
         _train_some(model_path, train_dataset, test_dataset, epoch)
@@ -453,7 +471,8 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
     import keras
     from keras import layers, callbacks
     
-    os.nice(10) # lower priority in case of other tasks on this server
+    try: os.nice(19) # lower priority in case of other tasks on this server
+    except: pass
 
     model:keras.models.Model = None
     if epoch > 0:
@@ -478,9 +497,8 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
 
     cb = []
 
-    #cb.append(keras.callbacks.EarlyStopping(monitor='categorical_accuracy', patience=50))
-    #if have_test:
-    #    cb.append(keras.callbacks.EarlyStopping(monitor='val_categorical_accuracy', patience=50))
+    cb.append(keras.callbacks.EarlyStopping(monitor='categorical_accuracy', patience=10))
+    cb.append(keras.callbacks.EarlyStopping(monitor='val_categorical_accuracy', patience=5))
     
     class EpochCheckpoint(callbacks.ModelCheckpoint):
         def on_epoch_end(self, epoch, logs=None):

@@ -203,6 +203,9 @@ def set_breaks(opts, marks)->None:
             else:
                 pass
     
+        c.execute("UPDATE recorded SET commflagged = %s "\
+                  "WHERE chanid = %s AND starttime = %s", (1 if nbreaks else 0, chanid, starttime))
+        
     set_job_status(opts, msg=f'Found {nbreaks} commercial breaks', status='success')
     if opts.mythjob and opts.exitcode:
         sys.exit(nbreaks) # yes, this is dumb, but its what the jobqueue code looks for when we run as the CommercialFlag command
