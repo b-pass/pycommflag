@@ -13,13 +13,13 @@ pycommflag is also a drop-in replacement for mythcommflag.  mythcommflag was rev
 - Graphically edit flags and save them for training ML models
 - Train ML models on hand-curated data, and use the trained models to flag or re-flag
 - Run modes:
- - Command line
- - From the mythtv JobQueue as a user job
- - From the mythtv JobQueue as a replacement for mythcommflag
- - Integrate into a python application as a module
+    - Command line
+    - From the mythtv JobQueue as a user job
+    - From the mythtv JobQueue as a replacement for mythcommflag
+    - Integrate into a python application as a module
 - Output options:
- - Json
- - MythTV `recordedmarkup` table (can then be used commercial flags in mythfrontend or with kodi-pvr-mythtv)
+    - Json
+    - MythTV `recordedmarkup` table (can then be used commercial flags in mythfrontend or with kodi-pvr-mythtv)
 
 # Installation
 
