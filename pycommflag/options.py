@@ -13,7 +13,7 @@ def get_options():
                         help="Use a temporary file for the feature log (which won't persist anywhere)")
     parser.add_argument('-c','--break-text', dest='comm_file', type=str,
                         help="Output location for commercial break results")
-    parser.add_argument('-r', '--reprocess', dest="reprocess", type=str, 
+    parser.add_argument('-r', '--reprocess', dest="reprocess", type=str, nargs='+',
                         help="Input location of feature data log to be reprocessed.")
     parser.add_argument('-g', '--gui', dest='gui', type=str, 
                         help="Display this feature log for GUI editing.")

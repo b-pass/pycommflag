@@ -238,26 +238,20 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[list[float], list[li
             tag = next(tit, (SceneType.UNKNOWN, (0, endtime+1)))
         tt = tag[0] if ts >= tag[1][0] else SceneType.UNKNOWN
         if type(tt) is not int: tt = tt.value
+        
         #if tt != SceneType.COMMERCIAL.value and tt != SceneType.SHOW.value:
         if tt == SceneType.DO_NOT_USE.value:
             bad.append(len(answers))
             answers.append(None)
             continue
 
-        #if fitlerForTraining and prev == tt and frames[len(answers)][2] <= 0 and frames[len(answers)][3] <= 10:
-        #    bad.append(len(answers))
-        #    answers.append(None)
-        #    continue
-
         if prev != tt:
             prev = tt
             i = len(answers)
-            for x in range(max(0,i-round(WINDOW_BEFORE*RATE)), max(0,i-round(RATE))):
-                weights[x] = 1.5
+            for x in range(max(0,i-round(WINDOW_BEFORE*RATE)), min(i+1+round(WINDOW_AFTER*RATE),len(weights))):
+                weights[x] = 1.5 if tt in [SceneType.COMMERCIAL.value, SceneType.SHOW.value] else 1.2
             for x in range(max(0,i-round(RATE)), min(i+1+round(RATE),len(weights))):
                 weights[x] = 2.0
-            for x in range(min(i+1+round(RATE),len(weights)), min(i+1+round(WINDOW_AFTER*RATE),len(weights))):
-                weights[x] = 1.5
 
         x = [0] * SceneType.count()
         x[tt if type(tt) is int else tt.value] = 1
@@ -415,8 +409,8 @@ def train(opts:Any=None):
     stop = False
     epoch = 0
 
-    model_path = '/tmp/train-m1afzw61.pycf.model.h5'
-    epoch = 25
+    #model_path = 0/tmp/blah''
+    #epoch = 25
 
     if True:
         _train_some(model_path, train_dataset, test_dataset, epoch)
@@ -547,7 +541,7 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
     #model.save(model_path) the checkpoint already saved the vest version
     return (ecp.last_epoch+1, ecp.last_epoch+1 >= EPOCHS)
 
-def predict(feature_log:str|TextIO|dict, opts:Any)->list:
+def predict(feature_log:str|TextIO|dict, opts:Any, write_log=True)->list:
     from .mythtv import set_job_status
     set_job_status(opts, "Inferencing...")
 
@@ -557,7 +551,6 @@ def predict(feature_log:str|TextIO|dict, opts:Any)->list:
     flog = processor.read_feature_log(feature_log)
     duration = flog.get('duration', 0)
     frame_rate = flog.get('frame_rate', 29.97)
-    spans = processor.read_feature_spans(flog, 'diff', 'blank')
     
     assert(flog['frames'][-1][0] > frame_rate)
 
@@ -639,12 +632,22 @@ def predict(feature_log:str|TextIO|dict, opts:Any)->list:
     log.debug(f'Post filter n={len(results)}')
     log.debug(str(results))
 
+    spans = processor.read_feature_spans(flog, 'diff', 'blank')
+    
     results = _adjust_tags(results, spans.get('blank', []), spans.get('diff', []), duration)
 
     log.debug(f'Final n={len(results)}:')
     log.info(str(results))
 
+    if orig_tags := flog.get('tags', []):
+        log.debug(f'Old tags n={len(orig_tags)}')
+        log.info(str(orig_tags))
+
     flog['tags'] = results
-    processor.write_feature_log(flog, feature_log)
+
+    if write_log:
+        if type(write_log) is not str:
+            write_log = feature_log
+        processor.write_feature_log(flog, write_log)
 
     return results

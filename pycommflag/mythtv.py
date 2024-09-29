@@ -126,7 +126,7 @@ def get_breaks(chanid, starttime)->list[tuple[float,float]]:
             result[-1] = (result[-1][0], v)
     return result
 
-def set_breaks(opts, marks)->None:
+def set_breaks(opts, marks, chanid=None, starttime=None)->None:
     chanid = opts.chanid
     starttime = opts.starttime
     if not chanid or not starttime:

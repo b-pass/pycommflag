@@ -40,13 +40,29 @@ def run(opts) -> None|int:
     
     if opts.reprocess:
         from .processor import reprocess
-        reprocess(opts.reprocess, opts=opts)
+        i = 0
+        for fl in opts.reprocess:
+            i += 1
+            print(f'* Reprocessing {fl} [{i} of {len(opts.reprocess)}]')
+            flog = reprocess(fl, opts=opts)
+            if not flog:
+                print(f'Skipped (bad file)')
+                continue
+
+            vf = flog.get('filename', '')
+            opts.chanid = flog.get('chanid', '')
+            opts.starttime = flog.get('starttime', '')
+            
+            if vf and not os.path.exists(vf):
+                print(f'Skipped ({vf} does not exist)')
+                continue
         
-        from .neural import predict
-        result = predict(opts.reprocess, opts=opts)
-        if result and opts.chanid:
-            from .mythtv import set_breaks
-            set_breaks(opts, result)
+            from .neural import predict
+            result = predict(flog, opts=opts, write_log=fl)
+            if result and opts.chanid:
+                from .mythtv import set_breaks
+                set_breaks(opts, result)
+        
         return 0
     
     if opts.gui:

@@ -38,7 +38,7 @@ def write_feature_log(flog:dict, log_file:str|TextIO):
     if type(log_file) is str:
         if log_file.endswith('.gz'):
             import gzip
-            log_file = gzip.open(log_file, 'w')
+            log_file = gzip.open(log_file, 'wt')
         else:
             log_file = open(log_file, 'w+')
     else:
@@ -54,6 +54,7 @@ def write_feature_log(flog:dict, log_file:str|TextIO):
             log_file.write(',\n')
         log_file.write(f'"{k}" : {json.dumps(v)}')
     log_file.write("\n}\n")
+    log_file.close()
 
 def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> None:
     # if we ever implement "live" processing then don't do this...
@@ -82,7 +83,7 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
     if type(feature_log) is str:
         if feature_log.endswith('.gz'):
             import gzip
-            feature_log = gzip.open(feature_log, 'w')
+            feature_log = gzip.open(feature_log, 'wt')
         else:
             feature_log = open(feature_log, 'w+')
         try: os.chmod(feature_log, 0o666)
