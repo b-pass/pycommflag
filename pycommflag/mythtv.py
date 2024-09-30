@@ -158,6 +158,8 @@ def set_breaks(opts, marks, chanid=None, starttime=None)->None:
                   "WHERE chanid = %s AND starttime = %s AND (type = 2 OR type = 4 OR type = 5) ",
                   (chanid, starttime))
         
+        intro = None
+        cred_done = False
         for (st,(b,e)) in marks:
             if type(st) is int:
                 st = SceneType(st)
@@ -195,19 +197,27 @@ def set_breaks(opts, marks, chanid=None, starttime=None)->None:
                 c.execute("INSERT INTO recordedmarkup (chanid,starttime,mark,type) "\
                           "VALUES(%s,%s,%s,4),(%s,%s,%s,5);",
                           (chanid, starttime, fb, chanid, starttime, fe))
-            elif st == SceneType.INTRO or st == SceneType.CREDITS:
+            elif st == SceneType.INTRO:
+                intro = (chanid, starttime,fe)
+            elif st == SceneType.CREDITS and not cred_done:
+                cred_done = True
                 log.debug(f".... {st} {fe} (B)")
                 c.execute("INSERT INTO recordedmarkup (chanid,starttime,mark,type) "\
                           "VALUES(%s,%s,%s,2)",
                           (chanid, starttime, fe))
             else:
                 pass
-    
+        
+        if intro is not None:
+            log.debug(f".... {intro[1]} {intro[2]} (B)")
+            c.execute("INSERT INTO recordedmarkup (chanid,starttime,mark,type) "\
+                        "VALUES(%s,%s,%s,2)", intro)
+        
         c.execute("UPDATE recorded SET commflagged = %s "\
                   "WHERE chanid = %s AND starttime = %s", (1 if nbreaks else 0, chanid, starttime))
         
     set_job_status(opts, msg=f'Found {nbreaks} commercial breaks', status='success')
-    if opts.mythjob and opts.exitcode:
+    if opts.exitcode:
         sys.exit(nbreaks) # yes, this is dumb, but its what the jobqueue code looks for when we run as the CommercialFlag command
 
 def set_job_status(opts, msg='', status='run'):
