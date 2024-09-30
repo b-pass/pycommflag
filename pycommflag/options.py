@@ -1,4 +1,5 @@
 import argparse
+import os
 
 # todo: automatically gz/ungz the feaature logs
 
@@ -46,7 +47,7 @@ def get_options():
                   help="Data to train the model with, as a list of feature-log files")
     ml.add_argument('--batch-size', dest='tf_batch_size', type=int, default=1000,
                   help="Model training batch size")
-    ml.add_argument('--models', dest='models_dir', default='./models/',
+    ml.add_argument('--models', dest='models_dir', default=os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', 'models'),
                   help="Path to use for models (output for training, input for infrencing)")
     ml.add_argument('--model', dest='model_file', default='',
                   help="Path to model to use for inference/prediction")

@@ -14,7 +14,6 @@ import time
 from typing import Any,TextIO,BinaryIO
 
 import numpy as np
-from keras.utils import Sequence
 
 from .feature_span import *
 from . import processor
@@ -29,6 +28,14 @@ UNITS = 32
 DROPOUT = 0.2
 EPOCHS = 40
 BATCH_SIZE = 1000
+
+SceneType_one_hot = {SceneType.DO_NOT_USE:None,SceneType.DO_NOT_USE.value:None}
+for i in range(0, SceneType.count()):
+    import numpy as np
+    x = [0] * SceneType.count()
+    x[i] = 1
+    SceneType_one_hot[i] = np.array(x, dtype='float32')
+    SceneType_one_hot[SceneType(i)] = SceneType_one_hot[i]
 
 # clean up tags so they start/end exactly in a nearby blank block
 # this is because the training data is supplied by humans, and might be off a bit
@@ -55,7 +62,7 @@ def _adjust_tags(tags:list,blanks:list,diffs:list,duration:float):
                 d = abs(te - b)
                 if ebest[0] > d: ebest = (d,bi)
         
-        maxdist = 10 if tt in [SceneType.SHOW.value, SceneType.COMMERCIAL.value] else 2
+        maxdist = 10 if tt in [SceneType.SHOW, SceneType.SHOW.value, SceneType.COMMERCIAL, SceneType.COMMERCIAL.value] else 2
         
         if bbest[0] < maxdist and bbest[0] > 0:
             tags[ti] = (tt,(blanks[bbest[1]][1][1],te))
@@ -87,7 +94,7 @@ def _adjust_tags(tags:list,blanks:list,diffs:list,duration:float):
         if ebest[0] < 1 and ebest[0] > 0:
             tags[ti] = (tt,(tags[ti][1][0],diffs[ebest[1]][1][0]))
             #print(f'Adjust end of {ti} (type {tt}) from {te} to diff at {tags[ti][1][1]}')
-                
+        
         if tags[ti][1][0] >= tags[ti][1][1]:
             filt.append(ti)
     
@@ -128,12 +135,12 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[list[float], list[li
 
     if tags and fitlerForTraining:
         spans = processor.read_feature_spans(flog, 'blank', 'diff')
-        tags = _adjust_tags(tags,spans.get('blank', []),spans.get('diff', []),endtime)
+        tags = _adjust_tags(tags, spans.get('blank', []), spans.get('diff', []), endtime)
         
         # clean up tiny gaps between identified breaks (including true 0-length gaps)
         i = 1
         while i < len(tags):
-            if tags[i][0] == tags[i-1][0] and (tags[i][1][0] - tags[i-1][1][1]) < 30:
+            if tags[i][0] == tags[i-1][0] and (tags[i][1][0] - tags[i-1][1][1]) < 20:
                 tags[i-1] = (tags[i][0], (tags[i-1][1][0], tags[i][1][1]))
                 del tags[i]
             else:
@@ -142,11 +149,8 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[list[float], list[li
         i = 0
         while i < len(tags):
             clen = tags[i][1][1] - tags[i][1][0]
-            if clen < 10 and tags[i][0] in [SceneType.COMMERCIAL, SceneType.COMMERCIAL.value]:
-                if i+1 >= len(tags) and clen >= 5 and tags[i][1][1]+clen+10 >= endtime:
-                    # dont require full length if it is near the end of the recording
-                    break
-                # tiny commercial, delete it
+            if clen < 10 and not (tags[i][1][1]+clen+10 >= endtime or tags[i][0] in [SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value]):
+                # delete the tiny segment
                 del tags[i]
             else:
                 i += 1
@@ -159,7 +163,7 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[list[float], list[li
         return None
     
     # ok now we can numpy....
-    frames = np.array(frames)
+    frames = np.array(frames, dtype='float32')
     
     # normalize frame rate
     frames = condense(frames, round(frame_rate/RATE))
@@ -252,10 +256,8 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[list[float], list[li
                 weights[x] = 1.5 if tt in [SceneType.COMMERCIAL.value, SceneType.SHOW.value] else 1.2
             for x in range(max(0,i-round(RATE)), min(i+1+round(RATE),len(weights))):
                 weights[x] = 2.0
-
-        x = [0] * SceneType.count()
-        x[tt if type(tt) is int else tt.value] = 1
-        answers.append(np.array(x))
+        
+        answers.append(SceneType_one_hot[tt])
 
     for i in reversed(bad):
         assert(answers[i] is None)
@@ -343,15 +345,16 @@ def load_data(opts)->tuple[list,list,list,list,list]:
             xt += a
             yt += b
     
-    #x = np.array(x)
-    #y = np.array(y)
-    #w = np.array(w)
-    #xt = np.array(xt)
-    #yt = np.array(yt)
+    #x = np.array(x, dtype='float32')
+    #y = np.array(y, dtype='float32')
+    #w = np.array(w, dtype='float32')
+    #xt = np.array(xt, dtype='float32')
+    #yt = np.array(yt, dtype='float32')
     gc.collect()
 
     return (x,y,w,xt,yt)
 
+from keras.utils import Sequence
 class DataGenerator(Sequence):
     def __init__(self, data, answers, weights=None):
         self.data = data
@@ -367,9 +370,9 @@ class DataGenerator(Sequence):
         #gc.collect()
         index *= BATCH_SIZE
         if self.weights is not None:
-            return np.array(self.data[index:index+BATCH_SIZE]), np.array(self.answers[index:index+BATCH_SIZE]), np.array(self.weights[index:index+BATCH_SIZE])
+            return np.array(self.data[index:index+BATCH_SIZE], dtype='float32'), np.array(self.answers[index:index+BATCH_SIZE], dtype='float32'), np.array(self.weights[index:index+BATCH_SIZE], dtype='float32')
         else:
-            return np.array(self.data[index:index+BATCH_SIZE]), np.array(self.answers[index:index+BATCH_SIZE])
+            return np.array(self.data[index:index+BATCH_SIZE], dtype='float32'), np.array(self.answers[index:index+BATCH_SIZE], dtype='float32')
 
 def train(opts:Any=None):
     # yield CPU time to useful tasks, this is a background thing...
@@ -472,18 +475,18 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
     if epoch > 0:
         model = keras.models.load_model(model_path)
     else:
-        inputs = keras.Input(shape=train_dataset.shape, name="input")
+        inputs = keras.Input(shape=train_dataset.shape, dtype='float32', name="input")
         n = inputs
         #n = layers.TimeDistributed(layers.Dropout(DROPOUT), name="dropout")(n)
-        n = layers.TimeDistributed(layers.Dense(32, activation='tanh'), name="dense-pre")(n)
+        n = layers.TimeDistributed(layers.Dense(32, dtype='float32', activation='tanh'), name="dense-pre")(n)
         #n = layers.LSTM(UNITS, dropout=DROPOUT, name="rnn")(n)
         if RNN.lower() == "gru":
-            n = layers.Bidirectional(layers.GRU(UNITS, dropout=DROPOUT), name="rnn")(n)
+            n = layers.Bidirectional(layers.GRU(UNITS, dropout=DROPOUT, dtype='float32'), name="rnn")(n)
         else:
-            n = layers.Bidirectional(layers.LSTM(UNITS, dropout=DROPOUT), name="rnn")(n)
-        n = layers.Dense(UNITS//2, activation='relu', name="dense-post")(n)
-        n = layers.Dense(16, activation='relu', name="final")(n)
-        outputs = layers.Dense(SceneType.count(), activation='softmax', name="output")(n)
+            n = layers.Bidirectional(layers.LSTM(UNITS, dropout=DROPOUT, dtype='float32'), name="rnn")(n)
+        n = layers.Dense(UNITS//2, dtype='float32', activation='relu', name="dense-post")(n)
+        n = layers.Dense(16, dtype='float32', activation='relu', name="final")(n)
+        outputs = layers.Dense(SceneType.count(), dtype='float32', activation='softmax', name="output")(n)
         model = keras.Model(inputs, outputs)
         model.summary()
         model.compile(optimizer="adam", loss="categorical_crossentropy", metrics=['categorical_accuracy', 'categorical_crossentropy'])
@@ -516,7 +519,7 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
                 self.model.stop_training = True
                 self.exceeded = True
 
-    cb.append(MemoryChecker())
+    #cb.append(MemoryChecker())
     
     def handler(signum, frame):
         print("\nStopping (gracefully)...\n")
@@ -527,16 +530,7 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
     oldsint = signal.signal(signal.SIGINT, handler)
     oldterm = signal.signal(signal.SIGTERM, handler)
 
-    #class_weights = {
-    #    SceneType.SHOW.value : 0.75,
-    #    SceneType.COMMERCIAL.value : 1.5,
-    #    SceneType.CREDITS.value : 2,
-    #    SceneType.INTRO.value : 2,
-    #    SceneType.TRANSITION.value : 0, # unused?
-    #}
-    class_weights = None
-
-    model.fit(train_dataset, epochs=EPOCHS, initial_epoch=epoch, shuffle=True, callbacks=cb, validation_data=test_dataset, class_weight=class_weights)
+    model.fit(train_dataset, epochs=EPOCHS, initial_epoch=epoch, shuffle=True, callbacks=cb, validation_data=test_dataset)
 
     #model.save(model_path) the checkpoint already saved the vest version
     return (ecp.last_epoch+1, ecp.last_epoch+1 >= EPOCHS)
@@ -564,7 +558,7 @@ def predict(feature_log:str|TextIO|dict, opts:Any, write_log=True)->list:
         raise Exception(f"Model file '{mf}' does not exist")
     model:keras.models.Model = keras.models.load_model(mf)
 
-    prediction = model.predict(np.array(data), verbose=True)
+    prediction = model.predict(np.array(data, dtype='float32'), verbose=True)
 
     result = np.argmax(prediction, axis=1)
     results = [(0,(0,0))]
@@ -583,6 +577,8 @@ def predict(feature_log:str|TextIO|dict, opts:Any, write_log=True)->list:
         else:
             i += 1
 
+    log.debug(f'Raw result n={len(results)}')
+
     # clean up tiny gaps between identified breaks (including true 0-length gaps)
     # show must be at least 30 seconds long (opts.show_min_len), or we just combine it into the commercial break its in the middle of
     i = 1
@@ -593,8 +589,7 @@ def predict(feature_log:str|TextIO|dict, opts:Any, write_log=True)->list:
         else:
             i += 1
 
-    log.debug(f'Merged n={len(results)}')
-    log.debug(str(results))
+    #log.debug(f'Merged n={len(results)}: {str(results)}')
 
     # commercials must be at least 60 (opts.comm_min_len) seconds long, if it's less, it is deleted
     # commercials must be less than 360 seconds long (opts.comm_max_len), if it's more then it is just show after that
@@ -629,19 +624,17 @@ def predict(feature_log:str|TextIO|dict, opts:Any, write_log=True)->list:
         # its ok now, move on
         i += 1
     
-    log.debug(f'Post filter n={len(results)}')
-    log.debug(str(results))
+    log.debug(f'Post filter n={len(results)}: {str(results)}')
 
     spans = processor.read_feature_spans(flog, 'diff', 'blank')
     
     results = _adjust_tags(results, spans.get('blank', []), spans.get('diff', []), duration)
 
-    log.debug(f'Final n={len(results)}:')
-    log.info(str(results))
-
     if orig_tags := flog.get('tags', []):
-        log.debug(f'Old tags n={len(orig_tags)}')
-        log.info(str(orig_tags))
+        log.debug(f'OLD tags n={len(orig_tags)} -> {str(orig_tags)}')
+        log.debug(f'NEW tags n={len(results)} -> {str(results)}')
+    else:
+        log.debug(f'Final tags n={len(results)}: {str(results)}')
 
     flog['tags'] = results
 

@@ -26,13 +26,7 @@ def read_feature_log(feature_log_file:str|TextIO|dict) -> dict:
             feature_log_file = open(feature_log_file, 'r')
     else:
         feature_log_file.seek(0)
-    
-    try:
-        return json.load(feature_log_file)
-    except json.JSONDecodeError:
-        # partial file, probably closed in the middle of a frame array; try to recover....
-        feature_log_file.seek(0)
-        return json.loads(feature_log_file.read() + ']}')
+    return json.load(feature_log_file)
 
 def write_feature_log(flog:dict, log_file:str|TextIO):
     if type(log_file) is str:
@@ -41,6 +35,8 @@ def write_feature_log(flog:dict, log_file:str|TextIO):
             log_file = gzip.open(log_file, 'wt')
         else:
             log_file = open(log_file, 'w+')
+        try: os.chmod(log_file, 0o666)
+        except: pass
     else:
         log_file.seek(0)
         log_file.truncate()
