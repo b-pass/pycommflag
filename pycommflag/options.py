@@ -12,8 +12,8 @@ def get_options():
                         help="In/Out location of feature log. If a video file is processed then this file will be overwritten. cf_[filename].json")
     parser.add_argument('--no-log', dest="no_feature_log", action='store_true',
                         help="Use a temporary file for the feature log (which won't persist anywhere)")
-    parser.add_argument('-c','--break-text', dest='comm_file', type=str,
-                        help="Output location for commercial break results")
+    parser.add_argument('-o','--output-type', dest='output_type', type=str, default="auto",
+                        help="Output type [auto, mythtv, edl, txt] (auto will try mythtv and fall back to edl). EDL/TXT files are saved alongside the input video file")
     parser.add_argument('-r', '--reprocess', dest="reprocess", type=str, nargs='+',
                         help="Input location of feature data log to be reprocessed.")
     parser.add_argument('-g', '--gui', dest='gui', type=str, 

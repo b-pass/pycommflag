@@ -20,6 +20,8 @@ pycommflag is also a drop-in replacement for mythcommflag.  mythcommflag was rev
 - Output options:
     - Json
     - MythTV `recordedmarkup` table (can then be used commercial flags in mythfrontend or with kodi-pvr-mythtv)
+    - EDL (Edit Decision List - tab separated format) 
+    - Text (comskip text format (`FILE PROCESSING COMPLETE`...))
 
 # Installation
 

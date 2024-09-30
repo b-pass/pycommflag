@@ -59,10 +59,8 @@ def run(opts) -> None|int:
         
             from .neural import predict
             result = predict(flog, opts=opts, write_log=fl)
-            if result and opts.chanid:
-                from .mythtv import set_breaks
-                set_breaks(opts, result)
-        
+            output(opts, result, flog)
+
         return 0
     
     if opts.gui:
@@ -91,9 +89,7 @@ def run(opts) -> None|int:
         if res is not None:
             flog['tags'] = res
             processor.write_feature_log(flog, opts.feature_log)
-            if res and opts.chanid:
-                from .mythtv import set_breaks
-                set_breaks(opts, res)
+            output(opts, res, flog)
             return 0
         else:
             return 1
@@ -119,9 +115,39 @@ def run(opts) -> None|int:
     
     from .neural import predict
     result = predict(feature_log, opts=opts)
+    output(opts, result, feature_log)
 
-    if result and opts.chanid:
-        from .mythtv import set_breaks
-        set_breaks(opts, result)
     return 0
 
+def output(opts, result, feature_log):
+    if result is None:
+        return
+    
+    if opts.output_type in ['mythtv', 'myth', 'auto', '', None] and opts.chanid:
+        from .mythtv import set_breaks
+        if set_breaks(opts, result, feature_log):
+            return
+        if opts.output_type in ['mythtv', 'myth']:
+            return # was not auto, so dont try edl or txt 
+    
+    vf:str = opts.filename
+    if feature_log:
+        vf = feature_log.get("filename", vf)
+    if not vf:
+        vf = opts.feature_log
+    
+    if not vf:
+        return
+    
+    if vf.ends_with('.gz'):
+        vf = vf[:-3]
+    
+    dot = vf.rfind('.')
+    ofn = vf[:dot] if dot > 0 else vf
+    
+    if opts.output_type in ['txt', 'text']:
+        from .edl import output_txt
+        output_txt(ofn + '.txt', result, feature_log)
+    else:
+        from .edl import output_edl
+        output_edl(ofn + '.edl', result, feature_log)

@@ -126,33 +126,37 @@ def get_breaks(chanid, starttime)->list[tuple[float,float]]:
             result[-1] = (result[-1][0], v)
     return result
 
-def set_breaks(opts, marks, chanid=None, starttime=None)->None:
+def set_breaks(opts, marks, flog=None)->bool:
     chanid = opts.chanid
     starttime = opts.starttime
     if not chanid or not starttime:
-        return
+        return False
     
     conn = _open()
     if conn is None:
-        return
+        return False
     
     with conn.cursor() as c:
         filename = _get_filename(c, chanid, starttime)
         if not filename:
-            return
+            return False
 
         log.debug(f"Set breaks in myth DB for {chanid}_{starttime}")
 
         nbreaks = 0
-        rate = 29.97
-        with av.open(filename) as container:
-            try:
-                for f in container.decode(video=0):
-                    break
-            except:
-                pass
-            #duration = container.duration / av.time_base
-            rate = container.streams.video[0].average_rate
+        rate = None
+        if flog:
+            rate = flog.get("frame_rate", None)
+            duration = flog.get("duration", 0)
+        if not rate:
+            with av.open(filename) as container:
+                try:
+                    for f in container.decode(video=0):
+                        break
+                except:
+                    pass
+                duration = container.duration / av.time_base
+                rate = container.streams.video[0].average_rate
         
         c.execute("DELETE FROM recordedmarkup "\
                   "WHERE chanid = %s AND starttime = %s AND (type = 2 OR type = 4 OR type = 5) ",
@@ -219,6 +223,7 @@ def set_breaks(opts, marks, chanid=None, starttime=None)->None:
     set_job_status(opts, msg=f'Found {nbreaks} commercial breaks', status='success')
     if opts.exitcode:
         sys.exit(nbreaks) # yes, this is dumb, but its what the jobqueue code looks for when we run as the CommercialFlag command
+    return True
 
 def set_job_status(opts, msg='', status='run'):
     if not opts.mythjob:
