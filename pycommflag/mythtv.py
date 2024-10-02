@@ -213,7 +213,7 @@ def set_breaks(opts, marks, flog=None)->bool:
                 pass
         
         if intro is not None:
-            log.debug(f".... {intro[1]} {intro[2]} (B)")
+            log.debug(f".... {SceneType.INTRO} {intro[2]} (B)")
             c.execute("INSERT INTO recordedmarkup (chanid,starttime,mark,type) "\
                         "VALUES(%s,%s,%s,2)", intro)
         

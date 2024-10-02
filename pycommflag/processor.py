@@ -52,7 +52,7 @@ def write_feature_log(flog:dict, log_file:str|TextIO):
     log_file.write("\n}\n")
     log_file.close()
 
-def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> None:
+def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> dict:
     # if we ever implement "live" processing then don't do this...
     
     # yield CPU time to useful tasks, this is a background thing.

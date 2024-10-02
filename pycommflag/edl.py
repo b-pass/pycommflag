@@ -5,7 +5,7 @@ def output_edl(outfile, marks, flog=None):
     with open(outfile, 'wt') as of:
         for (t,(s,e)) in marks:
             et = 3 if t in [SceneType.COMMERCIAL, SceneType.COMMERCIAL.value] else 2
-            of.write(f'{s}\t{e}\t{et}\n')
+            of.write(f'{round(s, 5)}\t{round(e, 5)}\t{et}\n')
 
 def output_txt(outfile, marks, flog):
     rate = flog.get('frame_rate', 29.97)

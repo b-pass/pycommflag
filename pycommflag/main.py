@@ -110,12 +110,13 @@ def run(opts) -> None|int:
     else:
         feature_log = opts.feature_log
     
-    from .processor import process_video
+    from .processor import process_video, read_feature_log
     process_video(opts.filename, feature_log, opts)
+    flog = read_feature_log(feature_log)
     
     from .neural import predict
-    result = predict(feature_log, opts=opts)
-    output(opts, result, feature_log)
+    result = predict(flog, opts=opts)
+    output(opts, result, flog)
 
     return 0
 
@@ -123,7 +124,7 @@ def output(opts, result, feature_log):
     if result is None:
         return
     
-    if opts.output_type in ['mythtv', 'myth', 'auto', '', None] and opts.chanid:
+    if opts.output_type in ['mythtv', 'myth', 'auto', '', None]:
         from .mythtv import set_breaks
         if set_breaks(opts, result, feature_log):
             return
