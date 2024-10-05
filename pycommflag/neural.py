@@ -252,8 +252,8 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[list[float], list[li
         if prev != tt:
             prev = tt
             i = len(answers)
-            for x in range(max(0,i-round(WINDOW_BEFORE*RATE)), min(i+1+round(WINDOW_AFTER*RATE),len(weights))):
-                weights[x] = 1.5 if tt in [SceneType.COMMERCIAL.value, SceneType.SHOW.value] else 1.2
+            #for x in range(max(0,i-round(WINDOW_BEFORE*RATE)), min(i+1+round(WINDOW_AFTER*RATE),len(weights))):
+            #    weights[x] = 1.5 if tt in [SceneType.COMMERCIAL.value, SceneType.SHOW.value] else 1.2
             for x in range(max(0,i-round(RATE)), min(i+1+round(RATE),len(weights))):
                 weights[x] = 2.0
         
@@ -376,7 +376,9 @@ class DataGenerator(Sequence):
 
 def train(opts:Any=None):
     # yield CPU time to useful tasks, this is a background thing...
-    
+    try: os.nice(19)
+    except: pass
+
     (data,answers,sample_weights,test_data,test_answers) = load_data(opts)
     gc.collect()
     
@@ -467,9 +469,6 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
     import signal
     import keras
     from keras import layers, callbacks
-    
-    try: os.nice(19) # lower priority in case of other tasks on this server
-    except: pass
 
     model:keras.models.Model = None
     if epoch > 0:
@@ -535,7 +534,7 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
     #model.save(model_path) the checkpoint already saved the vest version
     return (ecp.last_epoch+1, ecp.last_epoch+1 >= EPOCHS)
 
-def predict(feature_log:str|TextIO|dict, opts:Any, write_log=True)->list:
+def predict(feature_log:str|TextIO|dict, opts:Any, write_log=None)->list:
     from .mythtv import set_job_status
     set_job_status(opts, "Inferencing...")
 
@@ -589,7 +588,18 @@ def predict(feature_log:str|TextIO|dict, opts:Any, write_log=True)->list:
         else:
             i += 1
 
-    #log.debug(f'Merged n={len(results)}: {str(results)}')
+    spans = processor.read_feature_spans(flog, 'diff', 'blank')
+    
+    results = _adjust_tags(results, spans.get('blank', []), spans.get('diff', []), duration)
+    i = 1
+    while i < len(results):
+        if results[i][0] == results[i-1][0] and (results[i][1][0] - results[i-1][1][1]) < opts.show_min_len:
+            results[i-1] = (results[i][0], (results[i-1][1][0], results[i][1][1]))
+            del results[i]
+        else:
+            i += 1
+
+    log.debug(f'Merge/Adjust n={len(results)}: {str(results)}')
 
     # commercials must be at least 60 (opts.comm_min_len) seconds long, if it's less, it is deleted
     # commercials must be less than 360 seconds long (opts.comm_max_len), if it's more then it is just show after that
@@ -624,11 +634,7 @@ def predict(feature_log:str|TextIO|dict, opts:Any, write_log=True)->list:
         # its ok now, move on
         i += 1
     
-    log.debug(f'Post filter n={len(results)}: {str(results)}')
-
-    spans = processor.read_feature_spans(flog, 'diff', 'blank')
-    
-    results = _adjust_tags(results, spans.get('blank', []), spans.get('diff', []), duration)
+    #log.debug(f'Post n={len(results)}: {str(results)}')
 
     if orig_tags := flog.get('tags', []):
         log.debug(f'OLD tags n={len(orig_tags)} -> {str(orig_tags)}')
@@ -638,9 +644,7 @@ def predict(feature_log:str|TextIO|dict, opts:Any, write_log=True)->list:
 
     flog['tags'] = results
 
-    if write_log:
-        if type(write_log) is not str:
-            write_log = feature_log
+    if write_log is not None:
         processor.write_feature_log(flog, write_log)
 
     return results

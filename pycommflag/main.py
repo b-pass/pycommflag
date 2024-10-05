@@ -7,6 +7,14 @@ def run(opts) -> None|int:
     if opts.rebuild or opts.queue:
         os.execvp("mythcommflag", ["mythcommflag"] + sys.argv[1:])
 
+    if opts.exitcode:
+        # make sure to return >= 256 for unhandled exceptions
+        # otherwise mythtv will stupidly interpret python's exit(1) as a number of commercials
+        def myexcepthook(type, value, tb):
+            sys.__excepthook__(type, value, tb)
+            sys.exit(256)
+        sys.excepthook = myexcepthook
+
     if opts.train:
         from .neural import train
         return train(opts=opts)
@@ -43,6 +51,8 @@ def run(opts) -> None|int:
         i = 0
         for fl in opts.reprocess:
             i += 1
+            if not os.path.exists(fl):
+                continue
             print(f'* Reprocessing {fl} [{i} of {len(opts.reprocess)}]')
             flog = reprocess(fl, opts=opts)
             if not flog:
@@ -58,7 +68,7 @@ def run(opts) -> None|int:
                 continue
         
             from .neural import predict
-            result = predict(flog, opts=opts, write_log=fl)
+            result = predict(flog, opts, fl)
             output(opts, result, flog)
 
         return 0
@@ -115,7 +125,7 @@ def run(opts) -> None|int:
     flog = read_feature_log(feature_log)
     
     from .neural import predict
-    result = predict(flog, opts=opts)
+    result = predict(flog, opts, feature_log)
     output(opts, result, flog)
 
     return 0
@@ -140,10 +150,15 @@ def output(opts, result, feature_log):
     if not vf:
         return
     
-    if vf.ends_with('.gz'):
+    if vf.endswith('.gz'):
         vf = vf[:-3]
+    if vf.endswith('.json'):
+        vf = vf[:-5]
     
-    dot = vf.rfind('.')
+    if '.' in os.path.basename(vf):
+        dot = vf.rfind('.')
+    else:
+        dot = -1
     ofn = vf[:dot] if dot > 0 else vf
     
     if opts.output_type in ['txt', 'text']:
