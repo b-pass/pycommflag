@@ -126,6 +126,7 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[list[float], list[li
     version = flog.get('file_version', 10)
     frame_rate = flog.get('frame_rate', 29.97)
     endtime = flog.get('duration', 0)
+    have_logo = not not flog.get('logo', None)
 
     tags = flog.get('tags', [])
     
@@ -164,6 +165,9 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[list[float], list[li
     
     # ok now we can numpy....
     frames = np.array(frames, dtype='float32')
+
+    if not have_logo:
+        frames[..., 1] = 0
     
     # normalize frame rate
     frames = condense(frames, round(frame_rate/RATE))
@@ -190,6 +194,7 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[list[float], list[li
     data = []
 
     # we do not use numpy for these because there is MUCH duplication, so we save memory by using pylists.
+    # alternate is np.repeat, which would make new arrays for each iteration below.
     condensed = condense(frames, summary).tolist()
     frames = frames.tolist()
 
@@ -231,9 +236,8 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[list[float], list[li
         i += 1
 
     # convert tags to a one-hot per-frame
-    bad = []
     answers = []
-    prev = SceneType.COMMERCIAL
+    prev = SceneType.DO_NOT_USE.value
     weights = [1.0] * len(timestamps)
     tit = iter(tags)
     tag = next(tit, (SceneType.UNKNOWN, (0, endtime+1)))
@@ -243,28 +247,28 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[list[float], list[li
         tt = tag[0] if ts >= tag[1][0] else SceneType.UNKNOWN
         if type(tt) is not int: tt = tt.value
         
+        i = len(answers)
         #if tt != SceneType.COMMERCIAL.value and tt != SceneType.SHOW.value:
         if tt == SceneType.DO_NOT_USE.value:
-            bad.append(len(answers))
-            answers.append(None)
-            continue
-
-        if prev != tt:
-            prev = tt
-            i = len(answers)
+            #bad.append(i)
+            timestamps[i] = None
+            data[i] = None
+            weights[i] = 0
+        elif prev != tt and prev != SceneType.DO_NOT_USE.value:
             #for x in range(max(0,i-round(WINDOW_BEFORE*RATE)), min(i+1+round(WINDOW_AFTER*RATE),len(weights))):
-            #    weights[x] = 1.5 if tt in [SceneType.COMMERCIAL.value, SceneType.SHOW.value] else 1.2
+            #    if weights[x] > 0:
+            #        weights[x] = 1.5 if tt in [SceneType.COMMERCIAL.value, SceneType.SHOW.value] else 1.2
             for x in range(max(0,i-round(RATE)), min(i+1+round(RATE),len(weights))):
-                weights[x] = 2.0
+                if weights[x] > 0:
+                    weights[x] = 2.0
         
+        prev = tt
         answers.append(SceneType_one_hot[tt])
 
-    for i in reversed(bad):
-        assert(answers[i] is None)
-        del timestamps[i]
-        del data[i]
-        del answers[i]
-        del weights[i]
+    timestamps = [x for x in timestamps if x is not None]
+    data = [x for x in data if x is not None]
+    answers = [x for x in answers if x is not None]
+    weights = [x for x in weights if x > 0]
     
     assert(len(timestamps) == len(data))
     assert(len(data) == len(answers))
@@ -306,12 +310,6 @@ def load_data(opts)->tuple[list,list,list,list,list]:
             x += a
             y += b
             w += c
-            
-            a = None
-            b = None
-            c = None
-            flog = None
-            gc.collect()
     
     xt = []
     yt = []
@@ -323,11 +321,12 @@ def load_data(opts)->tuple[list,list,list,list,list]:
             (_,a,b,_) = flog_to_vecs(flog,True)
             xt += a
             yt += b
-            
-            a = None
-            b = None
-            flog = None
-            gc.collect()
+    
+    
+    a = None
+    b = None
+    c = None
+    flog = None
     
     import random
     random.seed(time.time())
@@ -350,6 +349,11 @@ def load_data(opts)->tuple[list,list,list,list,list]:
     #w = np.array(w, dtype='float32')
     #xt = np.array(xt, dtype='float32')
     #yt = np.array(yt, dtype='float32')
+    
+    a = None
+    b = None
+    c = None
+    flog = None
     gc.collect()
 
     return (x,y,w,xt,yt)
@@ -369,10 +373,13 @@ class DataGenerator(Sequence):
     def __getitem__(self, index):
         #gc.collect()
         index *= BATCH_SIZE
-        if self.weights is not None:
-            return np.array(self.data[index:index+BATCH_SIZE], dtype='float32'), np.array(self.answers[index:index+BATCH_SIZE], dtype='float32'), np.array(self.weights[index:index+BATCH_SIZE], dtype='float32')
+        a = np.array(self.data[index:index+BATCH_SIZE], dtype='float32')
+        b = np.array(self.answers[index:index+BATCH_SIZE], dtype='float32')
+        if self.weights:
+            c = np.array(self.weights[index:index+BATCH_SIZE], dtype='float32')
+            return a,b,c
         else:
-            return np.array(self.data[index:index+BATCH_SIZE], dtype='float32'), np.array(self.answers[index:index+BATCH_SIZE], dtype='float32')
+            return a,b
 
 def train(opts:Any=None):
     # yield CPU time to useful tasks, this is a background thing...
@@ -414,8 +421,8 @@ def train(opts:Any=None):
     stop = False
     epoch = 0
 
-    #model_path = 0/tmp/blah''
-    #epoch = 25
+    #model_path = '/tmp/train-xyz.h5'
+    #epoch = 10
 
     if True:
         _train_some(model_path, train_dataset, test_dataset, epoch)
@@ -529,10 +536,11 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
     oldsint = signal.signal(signal.SIGINT, handler)
     oldterm = signal.signal(signal.SIGTERM, handler)
 
-    model.fit(train_dataset, epochs=EPOCHS, initial_epoch=epoch, shuffle=True, callbacks=cb, validation_data=test_dataset)
+    if not model.stop_training:
+        model.fit(train_dataset, epochs=EPOCHS, initial_epoch=epoch, shuffle=True, callbacks=cb, validation_data=test_dataset)
 
     #model.save(model_path) the checkpoint already saved the vest version
-    return (ecp.last_epoch+1, ecp.last_epoch+1 >= EPOCHS)
+    return (ecp.last_epoch+1, model.stop_training or ecp.last_epoch+1 >= EPOCHS)
 
 def predict(feature_log:str|TextIO|dict, opts:Any, write_log=None)->list:
     from .mythtv import set_job_status

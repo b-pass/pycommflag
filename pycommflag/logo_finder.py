@@ -87,7 +87,7 @@ def search(player:Player, search_beginning:bool=False, opts:Any=None) -> tuple|N
 
     log.debug(f"Logo detected {best} ({round(best*100/fcount)}%)")
 
-    if best <= fcount / 2:
+    if best <= fcount*.6:
         log.info(f"No logo found (insufficient edge strength, best={best*100/fcount}%)")
         return None
     

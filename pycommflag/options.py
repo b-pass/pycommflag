@@ -76,7 +76,7 @@ def get_options():
     parser.add_argument_group(mcf)
 
     tune = parser.add_argument_group('Fine Tuning')
-    tune.add_argument('--break-max-len', dest="break_max_len", type=int, default=360,
+    tune.add_argument('--break-max-len', dest="break_max_len", type=int, default=335,
                       help="Longest allowed commercial break (in seconds)")
     tune.add_argument('--break-min-len', dest="break_min_len", type=float, default=59,
                       help="Shortest allowed commercial break (in seconds)")

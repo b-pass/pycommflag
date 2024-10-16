@@ -528,9 +528,13 @@ class Window(tk.Tk):
         self.setpos = self.player.duration
         self.settype = SceneType.DO_NOT_USE
         self.end_tag(None)
+        self.settype = None
         self.save_and_close()
     
     def save_and_close(self):
+        if self.settype is not None:
+            self.end_tag(None)
+        
         self.result = []
         for (t,(b,e)) in self.tags:
             if t != SceneType.SHOW:
