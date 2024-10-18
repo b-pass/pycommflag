@@ -183,7 +183,7 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[list[float], list[li
     # normalize the timestamps upto 30 minutes
     frames[...,0] = (frames[...,0] % 1800.0) / 1800.0
 
-    # normalize frame diffs
+    # normalize frame diffs to ~30
     frames[...,3] = np.clip(frames[...,3] / 30, 0, 1.0)
 
     # +/- 1s is all frames, plus the WINDOW before/after which is condensed to SUMMARY_RATE 

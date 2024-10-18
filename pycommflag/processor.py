@@ -177,28 +177,34 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
 
     assert(AudioSegmentLabel.count() == 4)
     header += ['silence', 'speech', 'music', 'noise']
-
-    sentinel = frames[-1][0]+1
     
     # normalize with the max volume of the whole recording
     vscale = np.max(np.array(audioProc.rms)[..., 1:3])
     vit = iter(audioProc.rms)
-    volume = next(vit, (sentinel,0,0))
+    volume = next(vit, (player.duration,0,0))
 
     ait = iter(audioProc.fspan.to_list())
-    audio = next(ait, (AudioSegmentLabel.SILENCE,(0,sentinel)))
+    audio = next(ait, (AudioSegmentLabel.SILENCE,(0,player.duration)))
     
     for frame in frames:
         ft = frame[0]
         
         # mark up each frame with the calculated audio type and volume level
         while ft > volume[0]:
-            volume = next(vit, (sentinel,0,0))
+            try:
+                volume = next(vit)
+            except StopIteration:
+                volume = (player.duration,0,0)
+                break
         frame += [round(float(volume[1]/vscale),6), round(float(volume[2]/vscale),6)]
     
         # convert audio to one-hot and then add it
         while ft >= audio[1][1]:
-            audio = next(ait, (AudioSegmentLabel.SILENCE,(0,sentinel)))
+            try:
+                audio = next(ait)
+            except StopIteration:
+                audio = (AudioSegmentLabel.SILENCE,(0,player.duration))
+                break
         x = [0] * AudioSegmentLabel.count()
         x[audio[0].value if ft >= audio[1][0] else AudioSegmentLabel.SILENCE.value] = 1
         frame += x
