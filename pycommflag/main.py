@@ -54,7 +54,13 @@ def run(opts) -> None|int:
             if not os.path.exists(fl):
                 continue
             print(f'* Reprocessing {fl} [{i} of {len(opts.reprocess)}]')
-            flog = reprocess(fl, opts=opts)
+            try:
+                flog = reprocess(fl, opts=opts)
+            except Exception as e:
+                print('EXCEPTION')
+                print(e)
+                print()
+                continue
             if not flog:
                 print(f'Skipped (bad file)')
                 continue
@@ -73,6 +79,11 @@ def run(opts) -> None|int:
 
         return 0
     
+    if opts.eval:
+        from .neural import eval
+        eval(opts)
+        return 0
+
     if opts.gui:
         from . import gui, processor
         if not opts.feature_log:

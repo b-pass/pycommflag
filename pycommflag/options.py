@@ -44,13 +44,15 @@ def get_options():
     ml.add_argument('-t', '--train', dest="train", action='store_true', 
                   help="Train the ML model")
     ml.add_argument('--data', dest="ml_data", nargs='+',
-                  help="Data to train the model with, as a list of feature-log files")
+                  help="Data to train/eval with, as a list of feature-log files")
     ml.add_argument('--batch-size', dest='tf_batch_size', type=int, default=1000,
                   help="Model training batch size")
     ml.add_argument('--models', dest='models_dir', default=os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', 'models'),
                   help="Path to use for models (output for training, input for infrencing)")
     ml.add_argument('--model', dest='model_file', default='',
                   help="Path to model to use for inference/prediction")
+    ml.add_argument('--eval', dest="eval", nargs='+',
+                  help="List of model files to evaluate against the supplied data")
     parser.add_argument_group(ml)
     
     mcf = parser.add_argument_group('MythTV Options', description="Commandline compatibility with mythcommflag")

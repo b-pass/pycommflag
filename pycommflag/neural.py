@@ -70,7 +70,8 @@ def _adjust_tags(tags:list,blanks:list,diffs:list,duration:float):
         if ebest[0] < maxdist and ebest[0] > 0:
             tags[ti] = (tt,(tags[ti][1][0],blanks[ebest[1]][1][0]))
             #print(f'Adjust end of {ti} (type {tt}) from {te} to blank at {tags[ti][1][1]}')
-        
+        continue
+
         bbest = (duration,)
         ebest = (duration,)
         left = bisect_left(diffs, tb-30, 0, len(diffs), key=lambda d: d[1][0])
@@ -276,7 +277,7 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[list[float], list[li
 
     return (timestamps,data,answers,weights)
 
-def load_data(opts)->tuple[list,list,list,list,list]:
+def load_data(opts, do_not_test=False)->tuple[list,list,list,list,list]:
     data = opts.ml_data
     if not data:
         return None
@@ -316,12 +317,11 @@ def load_data(opts)->tuple[list,list,list,list,list]:
     for f in test:
         if os.path.isdir(f):
             continue
-        print("Loading",f)
+        print("Loading test",f)
         if flog := processor.read_feature_log(f):
             (_,a,b,_) = flog_to_vecs(flog,True)
             xt += a
             yt += b
-    
     
     a = None
     b = None
@@ -331,7 +331,7 @@ def load_data(opts)->tuple[list,list,list,list,list]:
     import random
     random.seed(time.time())
     need = len(x)//4 - len(xt)
-    if need > len(x)/100:
+    if need > len(x)/100 and not do_not_test:
         print('Need to move',need,'datum to the test/eval set')
         z = list(zip(x,y,w))
         n=x=y=None
@@ -360,11 +360,11 @@ def load_data(opts)->tuple[list,list,list,list,list]:
 
 from keras.utils import Sequence
 class DataGenerator(Sequence):
-    def __init__(self, data, answers, weights=None):
+    def __init__(self, data, answers=None, weights=None):
         self.data = data
         self.answers = answers
         self.weights = weights
-        self.len = ceil(len(self.answers) / BATCH_SIZE)
+        self.len = ceil(len(self.data) / BATCH_SIZE)
         self.shape = (len(data[0]), len(data[0][0]))
     
     def __len__(self):
@@ -373,13 +373,16 @@ class DataGenerator(Sequence):
     def __getitem__(self, index):
         #gc.collect()
         index *= BATCH_SIZE
-        a = np.array(self.data[index:index+BATCH_SIZE], dtype='float32')
-        b = np.array(self.answers[index:index+BATCH_SIZE], dtype='float32')
-        if self.weights:
-            c = np.array(self.weights[index:index+BATCH_SIZE], dtype='float32')
-            return a,b,c
+        d = np.array(self.data[index:index+BATCH_SIZE], dtype='float32')
+        if self.answers:
+            a = np.array(self.answers[index:index+BATCH_SIZE], dtype='float32')
+            if self.weights:
+                w = np.array(self.weights[index:index+BATCH_SIZE], dtype='float32')
+                return d,a,w
+            else:
+                return d,a
         else:
-            return a,b
+            return d
 
 def train(opts:Any=None):
     # yield CPU time to useful tasks, this is a background thing...
@@ -421,8 +424,8 @@ def train(opts:Any=None):
     stop = False
     epoch = 0
 
-    #model_path = '/tmp/train-xyz.h5'
-    #epoch = 10
+    model_path = '/tmp/blah.h5'
+    epoch = 19
 
     if True:
         _train_some(model_path, train_dataset, test_dataset, epoch)
@@ -501,7 +504,7 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
     cb = []
 
     cb.append(keras.callbacks.EarlyStopping(monitor='categorical_accuracy', patience=10))
-    cb.append(keras.callbacks.EarlyStopping(monitor='val_categorical_accuracy', patience=5))
+    cb.append(keras.callbacks.EarlyStopping(monitor='val_categorical_accuracy', patience=10))
     
     class EpochCheckpoint(callbacks.ModelCheckpoint):
         def on_epoch_end(self, epoch, logs=None):
@@ -656,3 +659,42 @@ def predict(feature_log:str|TextIO|dict, opts:Any, write_log=None)->list:
         processor.write_feature_log(flog, write_log)
 
     return results
+
+def eval(opts:Any):
+    # yield CPU time to useful tasks, this is a background thing...
+    try: os.nice(19)
+    except: pass
+    
+    print("EVALUATE!")
+    
+    import tensorflow as tf
+    import keras
+
+    datasets = []
+    for f in opts.ml_data:
+        if os.path.isdir(f):
+            continue
+        print("Loading",f)
+        if flog := processor.read_feature_log(f):
+            (_,a,b,_) = flog_to_vecs(flog,True)
+            datasets.append((f, DataGenerator(a,b)))
+            a = b = _ = None
+
+    for mf in opts.eval:
+        gc.collect()
+        print()
+        print("Evaluating",mf,"...")
+        model:keras.models.Model = keras.models.load_model(mf)
+
+        for (dname,ds) in datasets:
+            print(mf, dname, ' -> ', end=None)
+            try:
+                print(model.evaluate(ds, verbose=0))
+            except Exception as e:
+                print(str(e))
+                break
+        
+        print()
+        print()
+    
+    print("Done")
