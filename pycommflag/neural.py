@@ -18,16 +18,18 @@ import numpy as np
 from .feature_span import *
 from . import processor
 
+# data params, both for train and for inference
 WINDOW_BEFORE = 15
 WINDOW_AFTER = 15
 SUMMARY_RATE = 2
-
 RATE = 29.97
+
+# training params
 RNN = 'lstm'
 UNITS = 32
 DROPOUT = 0.2
 EPOCHS = 40
-BATCH_SIZE = 1000
+BATCH_SIZE = 256
 
 SceneType_one_hot = {SceneType.DO_NOT_USE:None,SceneType.DO_NOT_USE.value:None}
 for i in range(0, SceneType.count()):
@@ -123,13 +125,13 @@ def condense(frames, step):
         old = None
     return frames
 
-def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[list[float], list[list[float]], list[float], list[float]]:
+def flog_to_vecs(flog:dict, fitlerForTraining=False, clean=True)->tuple[list[float], list[list[float]], list[float], list[float]]:
     version = flog.get('file_version', 10)
     frame_rate = flog.get('frame_rate', 29.97)
     endtime = flog.get('duration', 0)
     have_logo = not not flog.get('logo', None)
 
-    tags = flog.get('tags', [])
+    tags = flog.get('tags', []) if clean else []
     
     frames_header = flog['frames_header']
     assert('time' in frames_header[0])
@@ -160,6 +162,21 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[list[float], list[li
     frames = flog['frames']
     if frames[0] is None: 
         frames = flog['frames'][1:]
+    
+    if len(tags) > 1 and tags[-1][0] in (SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value) and tags[-1][1][1]+1 >= endtime and endtime > 1:
+        flog['duration'] = endtime = min(endtime, tags[-1][1][0])
+        e = len(frames) - 1
+        while frames[e][0] >= endtime:
+            e -= 1
+        if e > 0:
+            del frames[e+1:]
+    
+    if len(tags) > 1 and tags[0][0] in (SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value) and tags[0][1][0] < 5:
+        b = 0
+        while frames[b][0] < tags[0][1][1]:
+            b += 1
+        if b:
+            del frames[:b]
 
     if len(frames) < (WINDOW_BEFORE + WINDOW_AFTER) * 2 * round(RATE):
         return None
@@ -237,21 +254,27 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[list[float], list[li
         i += 1
 
     # convert tags to a one-hot per-frame
+    noneFilt = False
     answers = []
     prev = SceneType.DO_NOT_USE.value
     weights = [1.0] * len(timestamps)
     tit = iter(tags)
     tag = next(tit, (SceneType.UNKNOWN, (0, endtime+1)))
     for ts in timestamps:
+        i = len(answers)
+        if ts >= endtime:
+            del timestamps[i:]
+            del data[i:]
+            del weights[i:]
+            break
+
         while ts >= tag[1][1]:
             tag = next(tit, (SceneType.UNKNOWN, (0, endtime+1)))
         tt = tag[0] if ts >= tag[1][0] else SceneType.UNKNOWN
         if type(tt) is not int: tt = tt.value
         
-        i = len(answers)
-        #if tt != SceneType.COMMERCIAL.value and tt != SceneType.SHOW.value:
         if tt == SceneType.DO_NOT_USE.value:
-            #bad.append(i)
+            noneFilt = True
             timestamps[i] = None
             data[i] = None
             weights[i] = 0
@@ -266,10 +289,11 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[list[float], list[li
         prev = tt
         answers.append(SceneType_one_hot[tt])
 
-    timestamps = [x for x in timestamps if x is not None]
-    data = [x for x in data if x is not None]
-    answers = [x for x in answers if x is not None]
-    weights = [x for x in weights if x > 0]
+    if noneFilt:
+        timestamps = [x for x in timestamps if x is not None]
+        data = [x for x in data if x is not None]
+        answers = [x for x in answers if x is not None]
+        weights = [x for x in weights if x > 0]
     
     assert(len(timestamps) == len(data))
     assert(len(data) == len(answers))
@@ -424,8 +448,8 @@ def train(opts:Any=None):
     stop = False
     epoch = 0
 
-    model_path = '/tmp/blah.h5'
-    epoch = 19
+    #model_path = '/tmp/blah.h5'
+    #epoch = 19
 
     if True:
         _train_some(model_path, train_dataset, test_dataset, epoch)
@@ -558,7 +582,7 @@ def predict(feature_log:str|TextIO|dict, opts:Any, write_log=None)->list:
     
     assert(flog['frames'][-1][0] > frame_rate)
 
-    (times,data,_,_) = flog_to_vecs(flog)
+    (times,data,answers,_) = flog_to_vecs(flog, clean=False)
     assert(len(times) == len(data))
 
     mf = opts.model_file
@@ -568,7 +592,7 @@ def predict(feature_log:str|TextIO|dict, opts:Any, write_log=None)->list:
         raise Exception(f"Model file '{mf}' does not exist")
     model:keras.models.Model = keras.models.load_model(mf)
 
-    prediction = model.predict(np.array(data, dtype='float32'), verbose=True)
+    prediction = model.predict(np.array(data, dtype='float32'), verbose=True, batch_size=BATCH_SIZE)
 
     result = np.argmax(prediction, axis=1)
     results = [(0,(0,0))]
@@ -660,41 +684,68 @@ def predict(feature_log:str|TextIO|dict, opts:Any, write_log=None)->list:
 
     return results
 
+def eval_many(opts:Any):
+    print("EVALUATE many", len(opts.eval))
+
+    import tensorflow as tf
+    import keras
+
+    for f in opts.ml_data:
+        if os.path.isdir(f):
+            continue
+        
+        dataset = []
+        gc.collect()
+
+        try:
+            if flog := processor.read_feature_log(f):
+                (_,a,b,_) = flog_to_vecs(flog,True)
+                dataset = DataGenerator(a,b)
+            else:
+                print('Load failed')
+                continue
+        except Exception as e:
+            print(str(e))
+            continue
+        
+        for mf in opts.eval:
+            try:
+                print(f,mf,keras.models.load_model(mf).evaluate(dataset))
+            except Exception as e:
+                print(f,mf,str(e))
+        print()
+    
+    print()
+    print("Done")
+
 def eval(opts:Any):
     # yield CPU time to useful tasks, this is a background thing...
     try: os.nice(19)
     except: pass
     
-    print("EVALUATE!")
+    if len(opts.eval) > 1:
+        return eval_many(opts)
+    
+    print("EVALUATE single")
     
     import tensorflow as tf
     import keras
 
-    datasets = []
+    model:keras.models.Model = keras.models.load_model(opts.eval[0])
+    
     for f in opts.ml_data:
         if os.path.isdir(f):
             continue
-        print("Loading",f)
-        if flog := processor.read_feature_log(f):
-            (_,a,b,_) = flog_to_vecs(flog,True)
-            datasets.append((f, DataGenerator(a,b)))
-            a = b = _ = None
-
-    for mf in opts.eval:
         gc.collect()
-        print()
-        print("Evaluating",mf,"...")
-        model:keras.models.Model = keras.models.load_model(mf)
-
-        for (dname,ds) in datasets:
-            print(mf, dname, ' -> ', end=None)
-            try:
-                print(model.evaluate(ds, verbose=0))
-            except Exception as e:
-                print(str(e))
-                break
-        
-        print()
-        print()
+        print(f)
+        try:
+            if flog := processor.read_feature_log(f):
+                (_,a,b,_) = flog_to_vecs(flog,True)
+                print(model.evaluate(DataGenerator(a,b), verbose=0))
+            else:
+                print('Load failed')
+        except Exception as e:
+            print(str(e))
     
+    print()
     print("Done")

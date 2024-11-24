@@ -187,10 +187,12 @@ class Player:
                 vs = self.container.streams.video[self.streams.get('video', 0)]
                 self.vpts += math.ceil( (1.0/self.frame_rate)/vs.time_base )
                 if fail%100 == 0:
+                    log.debug(f"InvalidDataError during decode -- seeking ahead #{fail}, from {ovtp} to {self.vpts}")
                     if fail >= 1000:
                         log.critical(f"Repeated InvalidDataError, skipped {fail} frames but found nothing good")
+                        import sys
+                        sys.exit(1)
                         raise
-                    log.debug(f"InvalidDataError during decode -- seeking ahead #{fail}, from {ovtp} to {self.vpts}")
                     if fail >= 500:
                         self.trouble = True
                     self._resync(self.vpts)

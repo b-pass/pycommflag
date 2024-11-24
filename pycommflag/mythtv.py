@@ -248,3 +248,20 @@ def set_job_status(opts, msg='', status='run'):
     
     with conn.cursor() as c:
         c.execute('UPDATE jobqueue SET comment = %s, status = %s WHERE id = %s', (msg, status, opts.mythjob))
+
+
+def check_method(chanid)->str|None:
+    try:
+        conn = _open()
+        if conn is not None:
+            with conn.cursor() as c:
+                c.execute("SELECT commmethod FROM channel "\
+                        "WHERE chanid = %s "\
+                        "LIMIT 1",
+                        (chanid,))
+                (m,) = c.fetchone()
+                if int(m) == 0:
+                    return False
+    except:
+        pass
+    return True

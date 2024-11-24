@@ -72,10 +72,24 @@ def run(opts) -> None|int:
             if vf and not os.path.exists(vf):
                 print(f'Skipped ({vf} does not exist)')
                 continue
+
+            if opts.chanid:
+                from .mythtv import check_method
+                if not check_method(opts.chanid):
+                    print("Channel has flagging disabled")
+                    output(opts, [], flog)
+                    continue
         
             from .neural import predict
-            result = predict(flog, opts, fl)
-            output(opts, result, flog)
+            try:
+                result = predict(flog, opts, fl)
+                output(opts, result, flog)
+            except Exception as e:
+                import traceback
+                print('EXCEPTION')
+                print(traceback.format_exc())
+                print()
+                continue
 
         return 0
     
@@ -122,6 +136,12 @@ def run(opts) -> None|int:
         print(f'No such video file "{opts.filename}"')
         return 1
     
+    if opts.chanid:
+        from .mythtv import check_method
+        if not check_method(opts.chanid):
+            output(opts, [], None)
+            return 0
+    
     if opts.no_feature_log:
         import tempfile
         feature_log = tempfile.TemporaryFile('w+', prefix='cf_', suffix='.json')
@@ -141,7 +161,7 @@ def run(opts) -> None|int:
 
     return 0
 
-def output(opts, result, feature_log):
+def output(opts, result, feature_log=None):
     if result is None:
         return
     
