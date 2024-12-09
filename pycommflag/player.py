@@ -190,8 +190,8 @@ class Player:
                     log.debug(f"InvalidDataError during decode -- seeking ahead #{fail}, from {ovtp} to {self.vpts}")
                     if fail >= 1000:
                         log.critical(f"Repeated InvalidDataError, skipped {fail} frames but found nothing good")
-                        import sys
-                        sys.exit(1)
+                        import os
+                        os._exit(134)
                         raise
                     if fail >= 500:
                         self.trouble = True

@@ -27,9 +27,10 @@ RATE = 29.97
 # training params
 RNN = 'lstm'
 UNITS = 32
-DROPOUT = 0.2
+DROPOUT = 0.4
 EPOCHS = 40
 BATCH_SIZE = 256
+TEST_PERC = 0.25
 
 SceneType_one_hot = {SceneType.DO_NOT_USE:None,SceneType.DO_NOT_USE.value:None}
 for i in range(0, SceneType.count()):
@@ -259,7 +260,7 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False, clean=True)->tuple[list[flo
     prev = SceneType.DO_NOT_USE.value
     weights = [1.0] * len(timestamps)
     tit = iter(tags)
-    tag = next(tit, (SceneType.UNKNOWN, (0, endtime+1)))
+    tag = next(tit, (SceneType.UNKNOWN, (0, endtime+9999)))
     for ts in timestamps:
         i = len(answers)
         if ts >= endtime:
@@ -269,7 +270,7 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False, clean=True)->tuple[list[flo
             break
 
         while ts >= tag[1][1]:
-            tag = next(tit, (SceneType.UNKNOWN, (0, endtime+1)))
+            tag = next(tit, (SceneType.UNKNOWN, (0, endtime+9999)))
         tt = tag[0] if ts >= tag[1][0] else SceneType.UNKNOWN
         if type(tt) is not int: tt = tt.value
         
@@ -352,14 +353,14 @@ def load_data(opts, do_not_test=False)->tuple[list,list,list,list,list]:
     c = None
     flog = None
     
-    import random
-    random.seed(time.time())
-    need = len(x)//4 - len(xt)
+    z = list(zip(x,y,w))
+    from random import seed, shuffle
+    seed(time.time())
+    shuffle(z)
+
+    need = int(len(x)*TEST_PERC+1) - len(xt)
     if need > len(x)/100 and not do_not_test:
-        print('Need to move',need,'datum to the test/eval set')
-        z = list(zip(x,y,w))
-        n=x=y=None
-        random.shuffle(z)
+        print('Need to move',need,'datums to the test/eval set')
         (x,y,w) = zip(*z[need:])
         if len(xt) == 0:
             (xt,yt,_) = zip(*z[:need])
@@ -367,6 +368,8 @@ def load_data(opts, do_not_test=False)->tuple[list,list,list,list,list]:
             (a,b,_) = zip(*z[:need])
             xt += a
             yt += b
+    else:
+        (x,y,w) = zip(*z)
     
     #x = np.array(x, dtype='float32')
     #y = np.array(y, dtype='float32')
@@ -510,14 +513,18 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
     else:
         inputs = keras.Input(shape=train_dataset.shape, dtype='float32', name="input")
         n = inputs
-        #n = layers.TimeDistributed(layers.Dropout(DROPOUT), name="dropout")(n)
         n = layers.TimeDistributed(layers.Dense(32, dtype='float32', activation='tanh'), name="dense-pre")(n)
-        #n = layers.LSTM(UNITS, dropout=DROPOUT, name="rnn")(n)
+        #n = layers.TimeDistributed(layers.Dropout(DROPOUT), name="early-dropout", dtype='float32')(n)
+        #n = layers.TimeDistributed(layers.Dense(32, dtype='float32', activation='relu'), name="dense-pre-2")(n)
+        #n = layers.TimeDistributed(layers.Dropout(DROPOUT), name="early-dropout-maybe", dtype='float32')(n)
+        #n = layers.TimeDistributed(layers.Dense(16, dtype='float32', activation='relu'), name="dense-pre-3")(n)
         if RNN.lower() == "gru":
             n = layers.Bidirectional(layers.GRU(UNITS, dropout=DROPOUT, dtype='float32'), name="rnn")(n)
         else:
             n = layers.Bidirectional(layers.LSTM(UNITS, dropout=DROPOUT, dtype='float32'), name="rnn")(n)
-        n = layers.Dense(UNITS//2, dtype='float32', activation='relu', name="dense-post")(n)
+            #n = layers.TimeDistributed(layers.Dense(UNITS, dtype='float32', activation='tanh'), name="dense-mid")(n)
+            #n = layers.Bidirectional(layers.LSTM(UNITS, dropout=DROPOUT, dtype='float32'), name="MORE-rnn")(n)
+        n = layers.Dense(32, dtype='float32', activation='relu', name="dense-post")(n)
         n = layers.Dense(16, dtype='float32', activation='relu', name="final")(n)
         outputs = layers.Dense(SceneType.count(), dtype='float32', activation='softmax', name="output")(n)
         model = keras.Model(inputs, outputs)
@@ -564,7 +571,7 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
     oldterm = signal.signal(signal.SIGTERM, handler)
 
     if not model.stop_training:
-        model.fit(train_dataset, epochs=EPOCHS, initial_epoch=epoch, shuffle=True, callbacks=cb, validation_data=test_dataset)
+        model.fit(train_dataset, validation_data=test_dataset, epochs=EPOCHS, initial_epoch=epoch, callbacks=cb)
 
     #model.save(model_path) the checkpoint already saved the vest version
     return (ecp.last_epoch+1, model.stop_training or ecp.last_epoch+1 >= EPOCHS)

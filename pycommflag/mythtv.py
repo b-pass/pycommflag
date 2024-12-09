@@ -250,7 +250,7 @@ def set_job_status(opts, msg='', status='run'):
         c.execute('UPDATE jobqueue SET comment = %s, status = %s WHERE id = %s', (msg, status, opts.mythjob))
 
 
-def check_method(chanid)->str|None:
+def check_method(chanid):
     try:
         conn = _open()
         if conn is not None:
