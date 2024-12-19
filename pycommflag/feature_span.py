@@ -54,7 +54,7 @@ class SeparatorFeatureSpan(FeatureSpan):
         super().__init__()
         self._prev = None
     
-    def add(self, when, what):
+    def add(self, when:float, what:bool):
         if self._lastval:
             if what:
                 self._prev = when

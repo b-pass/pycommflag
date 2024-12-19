@@ -19,7 +19,7 @@ def search(player:Player, search_beginning:bool=False, opts:Any=None) -> tuple|N
     else:
         search_seconds = 900
         if not search_beginning and player.duration >= search_seconds*2:
-            player.seek(player.duration/2)
+            player.seek(player.duration/2 - search_seconds/2)
         else:
             player.seek(0)
     
@@ -62,7 +62,7 @@ def search(player:Player, search_beginning:bool=False, opts:Any=None) -> tuple|N
     # in case we found something stuck on the screen, try to look beyond that
     stuck = []
     best = np.max(logo_sum)
-    while best >= fcount*.90:
+    while best >= fcount*.94:
         stuck_mask = logo_sum >= best*.95
         
         h = player.shape[0]//2

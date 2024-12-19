@@ -11,7 +11,7 @@ import resource
 import sys
 import tempfile
 import time
-from typing import Any,TextIO,BinaryIO
+from typing import Any,TextIO,BinaryIO,List,Tuple
 
 import numpy as np
 
@@ -19,8 +19,8 @@ from .feature_span import *
 from . import processor
 
 # data params, both for train and for inference
-WINDOW_BEFORE = 15
-WINDOW_AFTER = 15
+WINDOW_BEFORE = 30
+WINDOW_AFTER = 30
 SUMMARY_RATE = 2
 RATE = 29.97
 
@@ -40,91 +40,151 @@ for i in range(0, SceneType.count()):
     SceneType_one_hot[i] = np.array(x, dtype='float32')
     SceneType_one_hot[SceneType(i)] = SceneType_one_hot[i]
 
-# clean up tags so they start/end exactly in a nearby blank block
-# this is because the training data is supplied by humans, and might be off a bit
-def _adjust_tags(tags:list,blanks:list,diffs:list,duration:float):
-    filt = []
-    for ti in range(len(tags)):
-        (tt, (tb, te)) = tags[ti]
-        tt = int(tt)
 
-        bbest = (duration,)
-        ebest = (duration,)
-        left = bisect_left(blanks, tb-30, 0, len(blanks), key=lambda b: b[1][0])
-        for bi in range(left, len(blanks)):
-            (bv,(bs,be)) = blanks[bi]
-            if not bv or bs < 1.0 or be < tb-10:
-                continue
-            if bs > te+10 or be >= duration-1:
-                break
-            
-            for b in (bs,be):
-                d = abs(tb - b)
-                if bbest[0] > d: bbest = (d,bi)
-            
-                d = abs(te - b)
-                if ebest[0] > d: ebest = (d,bi)
-        
-        maxdist = 10 if tt in [SceneType.SHOW, SceneType.SHOW.value, SceneType.COMMERCIAL, SceneType.COMMERCIAL.value] else 2
-        
-        if bbest[0] < maxdist and bbest[0] > 0:
-            tags[ti] = (tt,(blanks[bbest[1]][1][1],te))
-            #print(f'Adjust start of {ti} (type {tt}) from {tb} to blank at {tags[ti][1][0]}')
-        if ebest[0] < maxdist and ebest[0] > 0:
-            tags[ti] = (tt,(tags[ti][1][0],blanks[ebest[1]][1][0]))
-            #print(f'Adjust end of {ti} (type {tt}) from {te} to blank at {tags[ti][1][1]}')
-        continue
+def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]], 
+                blanks: List[Tuple[bool, Tuple[float, float]]], 
+                diffs: List[Tuple[float, Tuple[float, float]]], 
+                duration: float) -> List[Tuple[int, Tuple[float, float]]]:
+    """
+    Adjust tag boundaries to align with scene transitions using blank frames and diff values.
+    This is because the training data is supplied by humans, and might be off a bit.
 
-        bbest = (duration,)
-        ebest = (duration,)
-        left = bisect_left(diffs, tb-30, 0, len(diffs), key=lambda d: d[1][0])
-        for di in range(left, len(diffs)):
-            (dv, (db, de)) = diffs[di]
-            if not dv or db < 1.0 or de < tb-10:
-                continue
-            if db > te+10 or de >= duration-1:
-                break
-            
-            for b in (db,de):
-                d = abs(tb - b)
-                if bbest[0] > d: bbest = (d,di)
-            
-                d = abs(te - b)
-                if ebest[0] > d: ebest = (d,di)
-        
-        if bbest[0] < 1 and bbest[0] > 0:
-            tags[ti] = (tt,(diffs[bbest[1]][1][1],te))
-            #print(f'Adjust start of {ti} (type {tt}) from {tb} to diff at {tags[ti][1][0]}')
-        if ebest[0] < 1 and ebest[0] > 0:
-            tags[ti] = (tt,(tags[ti][1][0],diffs[ebest[1]][1][0]))
-            #print(f'Adjust end of {ti} (type {tt}) from {te} to diff at {tags[ti][1][1]}')
-        
-        if tags[ti][1][0] >= tags[ti][1][1]:
-            filt.append(ti)
+    Args:
+        tags: List of (tag_type, (start_time, end_time))
+        blanks: List of (is_blank, (start_time, end_time))
+        diffs: List of (diff_value, (start_time, end_time))
+        duration: Total duration of the video
     
-    for x in reversed(filt):
-        #print('Tag evaporated:',tags[x])
-        del tags[x]
-    
-    return tags
+    Returns:
+        Adjusted tags list with updated boundaries
+    """
+    def find_highest_diff_boundary(target_time: float, 
+                                 search_window: float, 
+                                 diffs: List[Tuple[float, Tuple[float, float]]]) -> float:
+        # Find diffs within window
+        window_start = target_time - search_window
+        window_end = target_time + search_window
+        
+        # Filter diffs within window
+        candidates = [
+            (diff_val, (start, end)) for diff_val, (start, end) in diffs 
+            if window_start <= start <= window_end or 
+               window_start <= end <= window_end
+        ]
+        
+        if not candidates:
+            return target_time
+            
+        # Find highest diff value and its corresponding boundary
+        max_diff = max(candidates, key=lambda x: x[0])
+        start, end = max_diff[1]
+        
+        # Return the closest boundary to target_time
+        return start if abs(start - target_time) < abs(end - target_time) else end
 
-def condense(frames, step):
-    if step > 1:
-        # audio features are spread across time anyway so we dont need to sumarize them unless the condense step is more than 0.5s
-        # but these video features can be important in a single frame, so make sure we capture that before dropping 
-        old = frames
-        frames = old[::step]
-        if len(frames) == 1:
-            frames[0][1] = np.average(old[:,1]) # logo
-            frames[0][2] = np.average(old[:,2]) # blank
-            frames[0][3] = np.count_nonzero(old[:,3] > 15) / len(old) # diff
-        else:
-            for i in range(len(frames)):
-                frames[i][1] = np.average(old[i*step : (i+1)*step,1]) # logo
-                frames[i][2] = np.average(old[i*step : (i+1)*step,2]) # blank
-                frames[i][3] = np.count_nonzero(old[i*step : (i+1)*step,3] > 15) / step # diff
-        old = None
-    return frames
+    def find_nearest_blank(target_time: float, 
+                         blanks: List[Tuple[bool, Tuple[float, float]]], 
+                         max_distance: float) -> float:
+        nearest_time = target_time
+        min_distance = max_distance
+        
+        for is_blank, (start, end) in blanks:
+            if not is_blank:
+                continue
+            
+            if start > target_time + max_distance:
+                break
+
+            if abs(start - target_time) < min_distance:
+                min_distance = abs(start - target_time)
+                nearest_time = start
+            
+            if abs(end - target_time) < min_distance:
+                min_distance = abs(end - target_time)
+                nearest_time = end
+        
+        return nearest_time if min_distance < max_distance else target_time
+
+    # Process each tag
+    filtered_tags = []
+    for tag_type, (start_time, end_time) in tags:
+        # Different max distances based on tag type
+        max_distance = 10 if tag_type in {SceneType.SHOW, SceneType.SHOW.value, 
+                                        SceneType.COMMERCIAL, SceneType.COMMERCIAL.value} else 2
+        
+        # First try to align with blank frames
+        new_start = find_nearest_blank(start_time, blanks, max_distance)
+        new_end = find_nearest_blank(end_time, blanks, max_distance)
+        
+        # If still at original positions, try aligning with diff boundaries
+        #if new_start == start_time:
+        #    new_start = find_highest_diff_boundary(start_time, 1.0, diffs)
+        #if new_end == end_time:
+        #    new_end = find_highest_diff_boundary(end_time, 1.0, diffs)
+           
+        # Only keep valid tags
+        if new_start < new_end:
+            filtered_tags.append((tag_type, (new_start, new_end)))
+    
+    return filtered_tags
+
+def condense(frames: np.ndarray, step: int) -> np.ndarray:
+    """
+    Condense video frames by averaging specific features over specified step sizes.
+    
+    Args:
+        frames: numpy array of shape (n_frames, n_features) where features at indices:
+               1: logo
+               2: blank
+               3: diff
+               Are summarized.
+               All other features are preserved from the first frame of each group.
+        step: number of frames to combine into one
+    
+    Returns:
+        Condensed numpy array with averaged features for logo, blank, diff
+        and preserved values for other features
+    """
+    if step <= 1:
+        return frames
+
+    # audio features are spread across time anyway so we dont need to sumarize them unless the condense step is more than 0.5s
+    
+    # Calculate number of frames after condensing
+    n_frames = len(frames)
+    
+    if n_frames <= step:
+        # Special case: all frames condense to one
+        result = frames[0].copy()  # Keep all features from first frame
+        result[1] = np.mean(frames[:, 1])  # Average logo
+        result[2] = np.mean(frames[:, 2])  # Average blank
+        result[3] = np.count_nonzero(frames[:, 3] > 15) / len(frames)  # Proportion of significant diffs
+        return result.reshape(1, -1)
+    
+    # Reshape the array to group frames by step size
+    # Use proper slicing to handle cases where n_frames is not divisible by step
+    valid_frames = frames[:(n_frames // step) * step].reshape(-1, step, frames.shape[1])
+    
+    # Initialize condensed array with first frame of each group
+    # This preserves all features that don't need averaging
+    condensed = valid_frames[:, 0].copy()
+    
+    # Update only the features that need condensing
+    condensed[:, 1] = np.mean(valid_frames[:, :, 1], axis=1)  # Average logo
+    condensed[:, 2] = np.mean(valid_frames[:, :, 2], axis=1)  # Average blank
+    condensed[:, 3] = np.count_nonzero(valid_frames[:, :, 3] > 15, axis=1) / step  # Diff ratio
+    
+    # Handle remaining frames if any
+    remaining = n_frames % step
+    if remaining:
+        last_frames = frames[-remaining:]
+        last_condensed = last_frames[0].copy()  # Keep all features from first remaining frame
+        last_condensed[1] = np.mean(last_frames[:, 1])  # Average logo
+        last_condensed[2] = np.mean(last_frames[:, 2])  # Average blank
+        last_condensed[3] = np.count_nonzero(last_frames[:, 3] > 15) / remaining  # Diff ratio
+        condensed = np.vstack([condensed, last_condensed])
+    
+    return condensed
 
 def flog_to_vecs(flog:dict, fitlerForTraining=False, clean=True)->tuple[list[float], list[list[float]], list[float], list[float]]:
     version = flog.get('file_version', 10)
@@ -139,7 +199,7 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False, clean=True)->tuple[list[flo
     assert('diff' in frames_header[3])
 
     if tags and fitlerForTraining:
-        spans = processor.read_feature_spans(flog, 'blank', 'diff')
+        spans = processor.read_feature_spans(flog, 'blank')
         tags = _adjust_tags(tags, spans.get('blank', []), spans.get('diff', []), endtime)
         
         # clean up tiny gaps between identified breaks (including true 0-length gaps)

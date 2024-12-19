@@ -51,7 +51,7 @@ def run(opts) -> None|int:
         i = 0
         for fl in opts.reprocess:
             i += 1
-            if not os.path.exists(fl):
+            if not os.path.exists(fl) or not os.path.isfile(fl):
                 continue
             print(f'* Reprocessing {fl} [{i} of {len(opts.reprocess)}]')
             try:
@@ -70,7 +70,11 @@ def run(opts) -> None|int:
             opts.starttime = flog.get('starttime', '')
             
             if vf and not os.path.exists(vf):
-                print(f'Skipped ({vf} does not exist)')
+                if len(opts.reprocess) > 1 and os.path.exists(os.path.join(os.path.dirname(fl), 'old')):
+                    print(f'Archived ({vf} does not exist)')
+                    os.rename(fl, os.path.join(os.path.dirname(fl), 'old', os.path.basename(fl)))
+                else:
+                    print(f'Skipped ({vf} does not exist)')
                 continue
 
             if opts.chanid:

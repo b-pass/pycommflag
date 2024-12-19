@@ -176,7 +176,7 @@ def set_breaks(opts, marks, flog=None)->bool:
             # But we're using times instead.
             # MythTV stores the time associated with each keyframe in the DB as type 33.
             # So we find the frame number of the timestamp closest to the one we want and 
-            # then use the frame rate to ship to the exact frame number we have flagged.
+            # then use the frame rate to skip to the exact frame number we have flagged.
 
             c.execute("SELECT `offset`,mark FROM recordedseek "\
                       "WHERE chanid = %s AND starttime = %s AND type = 33 "\
