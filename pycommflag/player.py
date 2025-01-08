@@ -2,6 +2,7 @@ import math
 import av
 import errno
 import logging as log
+import av.container
 import numpy as np
 
 class Player:
@@ -155,10 +156,21 @@ class Player:
         self.graph.configure()
 
     def _resync(self, pts):
-        self.container = av.open(self.filename)#, options={'probesize':'10000000'})
-        self.container.gen_pts = True
-        if self.trouble:
-            self.container.discard_corrupt = True
+        self.container:av.container.InputContainer = av.open(self.filename)#, options={'probesize':'10000000'})
+        try: 
+            self.container.gen_pts = True
+            #if self.trouble:
+            #    self.container.discard_corrupt = True
+        except:
+            pass
+        try:
+            f:int = 0
+            f |= av.container.Flags.gen_pts
+            #if self.trouble:
+            #    f |= av.container.Flags.discard_corrupt
+            self.container.flags = f
+        except:
+            pass
         self.container.streams.video[0].thread_type = "AUTO"
         self.container.streams.video[0].thread_count = 2
         self.container.streams.audio[0].thread_type = "AUTO"
@@ -204,7 +216,7 @@ class Player:
             if fail:
                 if self.graph:
                     self._create_graph()
-                log.info(f"Resync'd after {fail} skipped/dropped/corrupt/whatever frames")
+                log.info(f"Resync'd to {float(self.vpts*vs.time_base)} after {fail} skipped/dropped/corrupt/whatever frames")
                 fail = 0
             
             if type(frame) is av.AudioFrame:
@@ -218,6 +230,67 @@ class Player:
                         if e.errno != errno.EAGAIN:
                             raise
                         continue
+                self.vpts = frame.pts
+                yield frame
+        
+        return #raise StopIteration()
+    
+    def frames_stride(self, skip) -> iter:
+        if self.graph or 'audio' in self.streams:
+            count = 0
+            for frame in self.frames():
+                count += 1
+                if (count%skip) == 0:
+                    yield frame
+            return
+        
+        fail = 0
+        ovtp = self.vpts
+        iter = self.container.demux(**self.streams)
+        pkt_count = 0
+        while True:
+            try:
+                pkt = next(iter)
+                if pkt is None:
+                    continue
+                if (pkt_count%skip) != 0:
+                    if pkt.is_keyframe:
+                        pkt_count += len(pkt.decode())
+                    else:
+                        pkt_count += 1
+                    continue
+                frames = pkt.decode()
+                #print("decoded",len(frames),pkt_count,skip)
+                pkt_count += len(frames)
+                if not frames:
+                    continue
+                frame = frames[0]
+            except StopIteration:
+                break
+            except (av.error.InvalidDataError,av.error.UndefinedError) as e:
+                fail += 1
+                vs = self.container.streams.video[self.streams.get('video', 0)]
+                self.vpts += math.ceil( (1.0/self.frame_rate)/vs.time_base )
+                if fail%100 == 0:
+                    log.debug(f"InvalidDataError during decode -- seeking ahead #{fail}, from {ovtp} to {self.vpts}")
+                    if fail >= 1000:
+                        log.critical(f"Repeated InvalidDataError, skipped {fail} frames but found nothing good")
+                        import os
+                        os._exit(134)
+                        raise
+                    if fail >= 500:
+                        self.trouble = True
+                    self._resync(self.vpts)
+                else:
+                    self.container.seek(self.vpts, stream=vs, any_frame=True, backward=False)
+                iter = self.container.demux(**self.streams)
+                continue
+            
+            if fail:
+                log.info(f"Resync'd to {float(self.vpts*vs.time_base)} after {fail} skipped/dropped/corrupt/whatever packets")
+                fail = 0
+        
+            if type(frame) is av.VideoFrame:
                 self.vpts = frame.pts
                 yield frame
         

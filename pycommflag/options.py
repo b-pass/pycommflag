@@ -32,10 +32,8 @@ def get_options():
     logo = parser.add_argument_group('Logo Search')
     logo.add_argument('--no-logo', dest='no_logo', action='store_true', 
                     help="Disable logo searching")
-    logo.add_argument('--skip', dest="logo_skip", type=int, default=4,
-                    help="Only search every Nth frame during the logo search phase.  (Speeds up searching at a slight cost to accuracy.)")
-    logo.add_argument('--logo-search-all', dest="logo_search_all", action='store_true',
-                    help="Search the entire video for the logo (perfect detection)")
+    logo.add_argument('--logo-samples', dest="logo_samples", type=int, default=2,
+                    help="How many video frames per-second to use across the full length of video to find the logo")
     #logo.add_argument('--check-blanks', dest="blanks_check_logo", action="store_true",
     #                help="Include logo area when checking for blank frames (tends towards not marking frames blank if they have logo)")
     parser.add_argument_group(logo)

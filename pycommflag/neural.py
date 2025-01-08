@@ -25,7 +25,7 @@ SUMMARY_RATE = 2
 RATE = 29.97
 
 # training params
-RNN = 'lstm'
+RNN = 'c1d'
 UNITS = 32
 DROPOUT = 0.4
 EPOCHS = 40
@@ -574,16 +574,36 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
         inputs = keras.Input(shape=train_dataset.shape, dtype='float32', name="input")
         n = inputs
         n = layers.TimeDistributed(layers.Dense(32, dtype='float32', activation='tanh'), name="dense-pre")(n)
+        #skip = n
         #n = layers.TimeDistributed(layers.Dropout(DROPOUT), name="early-dropout", dtype='float32')(n)
         #n = layers.TimeDistributed(layers.Dense(32, dtype='float32', activation='relu'), name="dense-pre-2")(n)
         #n = layers.TimeDistributed(layers.Dropout(DROPOUT), name="early-dropout-maybe", dtype='float32')(n)
         #n = layers.TimeDistributed(layers.Dense(16, dtype='float32', activation='relu'), name="dense-pre-3")(n)
+        #n = layers.Add()([n,skip])
         if RNN.lower() == "gru":
             n = layers.Bidirectional(layers.GRU(UNITS, dropout=DROPOUT, dtype='float32'), name="rnn")(n)
-        else:
+        elif RNN.lower() == 'lstm':
             n = layers.Bidirectional(layers.LSTM(UNITS, dropout=DROPOUT, dtype='float32'), name="rnn")(n)
             #n = layers.TimeDistributed(layers.Dense(UNITS, dtype='float32', activation='tanh'), name="dense-mid")(n)
             #n = layers.Bidirectional(layers.LSTM(UNITS, dropout=DROPOUT, dtype='float32'), name="MORE-rnn")(n)
+        else:
+            # First Conv1D to capture local temporal patterns
+            n = layers.Conv1D(filters=32, 
+                                kernel_size=5,
+                                activation='relu',
+                                padding='same',  # To maintain temporal dimension
+                                name="conv1d_1")(n)
+
+            #  another Conv1D layer to capture higher-level patterns
+            n = layers.Conv1D(filters=32,
+                                kernel_size=3,
+                                activation='relu',
+                                padding='same',
+                                name="conv1d_2")(n)
+            2 
+            # Global pooling to reduce temporal dimension
+            n = layers.GlobalAveragePooling1D(name="global_pool")(n)
+        
         n = layers.Dense(32, dtype='float32', activation='relu', name="dense-post")(n)
         n = layers.Dense(16, dtype='float32', activation='relu', name="final")(n)
         outputs = layers.Dense(SceneType.count(), dtype='float32', activation='softmax', name="output")(n)

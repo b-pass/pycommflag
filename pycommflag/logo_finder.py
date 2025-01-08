@@ -11,37 +11,22 @@ _LOGO_EDGE_THRESHOLD = 85 # how strong an edge is strong enough?
 def search(player:Player, search_beginning:bool=False, opts:Any=None) -> tuple|None:
     global _LOGO_EDGE_THRESHOLD
 
-    skip = opts.logo_skip
-    
-    if opts.logo_search_all:
-        search_seconds = player.duration
-        player.seek(0)
-    else:
-        search_seconds = 900
-        if not search_beginning and player.duration >= search_seconds*2:
-            player.seek(player.duration/2 - search_seconds/2)
-        else:
-            player.seek(0)
-    
-    if (fo:=int(player.frame_rate / 24)) > 1:
-        skip *= fo
+    player.disable_audio()
+    player.seek(0)
+
+    skip = round(float(player.frame_rate / opts.logo_samples))
+    if skip < 1: skip = 1
+    ftotal = int(player.duration * player.frame_rate / skip)
     
     fcount = 0
-    ftotal = int(search_seconds * player.frame_rate)
-    logo_sum = np.zeros(player.shape, np.uint32)
-    percent = ftotal/skip/100.0
-    report = math.ceil(ftotal/250) if not opts.quiet else ftotal * 10
     p = 0
-    i = 0
+    logo_sum = np.zeros(player.shape, np.uint32)
+    percent = ftotal/100.0
+    report = math.ceil(percent/4) if not opts.quiet else ftotal * 2
     if not opts.quiet: print("Searching          ", end='\r')
-    for frame in player.frames():
-        i += 1
-        if i > ftotal:
-            break
+    for frame in player.frames_stride(skip):
         p += 1
-        if p%skip != 0:
-            continue
-        elif p >= report:
+        if p >= report:
             p = 0
             print("Logo Searching, %3.1f%%    " % (min(fcount/percent,100.0)), end='\r')
         data = _gray(frame)
@@ -85,7 +70,7 @@ def search(player:Player, search_beginning:bool=False, opts:Any=None) -> tuple|N
         best = np.max(logo_sum)
         log.debug(f'New best = {best*100/fcount}% of {fcount}')
 
-    log.debug(f"Logo detected {best} ({round(best*100/fcount)}%)")
+    log.debug(f"Logo detection result: {best} ({round(best*100/fcount)}%)")
 
     if best <= fcount*.6:
         log.info(f"No logo found (insufficient edge strength, best={best*100/fcount}%)")
