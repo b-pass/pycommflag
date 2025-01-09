@@ -32,7 +32,8 @@ EPOCHS = 40
 BATCH_SIZE = 256
 TEST_PERC = 0.25
 
-SceneType_one_hot = {SceneType.DO_NOT_USE:None,SceneType.DO_NOT_USE.value:None}
+SceneType_one_hot = {SceneType.DO_NOT_USE: [0] * SceneType.count(),
+                     SceneType.DO_NOT_USE.value: [0] * SceneType.count()}
 for i in range(0, SceneType.count()):
     import numpy as np
     x = [0] * SceneType.count()
@@ -150,41 +151,36 @@ def condense(frames: np.ndarray, step: int) -> np.ndarray:
 
     # audio features are spread across time anyway so we dont need to sumarize them unless the condense step is more than 0.5s
     
-    # Calculate number of frames after condensing
     n_frames = len(frames)
-    
-    if n_frames <= step:
-        # Special case: all frames condense to one
-        result = frames[0].copy()  # Keep all features from first frame
-        result[1] = np.mean(frames[:, 1])  # Average logo
-        result[2] = np.mean(frames[:, 2])  # Average blank
-        result[3] = np.count_nonzero(frames[:, 3] > 15) / len(frames)  # Proportion of significant diffs
-        return result.reshape(1, -1)
-    
-    # Reshape the array to group frames by step size
-    # Use proper slicing to handle cases where n_frames is not divisible by step
-    valid_frames = frames[:(n_frames // step) * step].reshape(-1, step, frames.shape[1])
-    
-    # Initialize condensed array with first frame of each group
-    # This preserves all features that don't need averaging
-    condensed = valid_frames[:, 0].copy()
-    
-    # Update only the features that need condensing
-    condensed[:, 1] = np.mean(valid_frames[:, :, 1], axis=1)  # Average logo
-    condensed[:, 2] = np.mean(valid_frames[:, :, 2], axis=1)  # Average blank
-    condensed[:, 3] = np.count_nonzero(valid_frames[:, :, 3] > 15, axis=1) / step  # Diff ratio
-    
-    # Handle remaining frames if any
     remaining = n_frames % step
+    if n_frames >= step:
+        # Reshape the array to group frames by step size
+        valid_frames = frames[:(n_frames // step) * step].reshape(-1, step, frames.shape[1])
+        
+        # Initialize condensed array with first frame of each group
+        # This preserves all features that don't need averaging
+        condensed = valid_frames[:, 0].copy()
+        
+        # Update only the features that need condensing
+        condensed[:, 1] = np.mean(valid_frames[:, :, 1], axis=1, dtype='float32')  # Average logo
+        condensed[:, 2] = np.mean(valid_frames[:, :, 2], axis=1, dtype='float32')  # Average blank
+        condensed[:, 3] = np.count_nonzero(valid_frames[:, :, 3] > 15, axis=1) / step  # Diff ratio
+    else:
+        condensed = None
+    
     if remaining:
+        # Do the final, partial condensing
         last_frames = frames[-remaining:]
         last_condensed = last_frames[0].copy()  # Keep all features from first remaining frame
-        last_condensed[1] = np.mean(last_frames[:, 1])  # Average logo
-        last_condensed[2] = np.mean(last_frames[:, 2])  # Average blank
+        last_condensed[1] = np.mean(last_frames[:, 1], dtype='float32')  # Average logo
+        last_condensed[2] = np.mean(last_frames[:, 2], dtype='float32')  # Average blank
         last_condensed[3] = np.count_nonzero(last_frames[:, 3] > 15) / remaining  # Diff ratio
-        condensed = np.vstack([condensed, last_condensed])
-    
-    return condensed
+        if condensed is not None:
+            return np.vstack((condensed, last_condensed))
+        else:
+            return last_condensed
+    else:
+        return condensed
 
 def flog_to_vecs(flog:dict, fitlerForTraining=False, clean=True)->tuple[list[float], list[list[float]], list[float], list[float]]:
     version = flog.get('file_version', 10)
@@ -221,18 +217,21 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False, clean=True)->tuple[list[flo
                 i += 1
     
     frames = flog['frames']
-    if frames[0] is None: 
-        frames = flog['frames'][1:]
+    if frames and frames[0] is None: 
+        frames = frames[1:]
     
-    if len(tags) > 1 and tags[-1][0] in (SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value) and tags[-1][1][1]+1 >= endtime and endtime > 1:
+    if len(frames) < frame_rate:
+        return None
+    
+    if len(tags) > 1 and tags[-1][0] in (SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value) and tags[-1][1][1]+10 >= endtime:
         flog['duration'] = endtime = min(endtime, tags[-1][1][0])
         e = len(frames) - 1
-        while frames[e][0] >= endtime:
+        while frames[e][0] >= endtime and e > 0:
             e -= 1
         if e > 0:
             del frames[e+1:]
     
-    if len(tags) > 1 and tags[0][0] in (SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value) and tags[0][1][0] < 5:
+    if len(tags) > 1 and tags[0][0] in (SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value) and tags[0][1][0] <= 5:
         b = 0
         while frames[b][0] < tags[0][1][1]:
             b += 1
@@ -315,7 +314,6 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False, clean=True)->tuple[list[flo
         i += 1
 
     # convert tags to a one-hot per-frame
-    noneFilt = False
     answers = []
     prev = SceneType.DO_NOT_USE.value
     weights = [1.0] * len(timestamps)
@@ -335,9 +333,6 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False, clean=True)->tuple[list[flo
         if type(tt) is not int: tt = tt.value
         
         if tt == SceneType.DO_NOT_USE.value:
-            noneFilt = True
-            timestamps[i] = None
-            data[i] = None
             weights[i] = 0
         elif prev != tt and prev != SceneType.DO_NOT_USE.value:
             #for x in range(max(0,i-round(WINDOW_BEFORE*RATE)), min(i+1+round(WINDOW_AFTER*RATE),len(weights))):
@@ -349,12 +344,6 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False, clean=True)->tuple[list[flo
         
         prev = tt
         answers.append(SceneType_one_hot[tt])
-
-    if noneFilt:
-        timestamps = [x for x in timestamps if x is not None]
-        data = [x for x in data if x is not None]
-        answers = [x for x in answers if x is not None]
-        weights = [x for x in weights if x > 0]
     
     assert(len(timestamps) == len(data))
     assert(len(data) == len(answers))
