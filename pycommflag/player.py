@@ -45,7 +45,7 @@ class Player:
                 self.interlaced = False
         else:
             self.interlaced = False
-        log.debug(f"Video {filename} is {self.shape} at {float(self.frame_rate)} fps")
+        log.debug(f"Video {filename} is {self.shape} at {float(self.frame_rate)} fps for {self.duration} seconds totalling {int(self.duration * self.frame_rate)} frames)")
     
     def seek(self, seconds:float):
         if seconds > self.duration:
@@ -176,7 +176,8 @@ class Player:
         self.container.streams.audio[0].thread_type = "AUTO"
         self.container.streams.audio[0].thread_count = 2
         if pts is not None:
-            self.container.seek(pts, stream=self.container.streams.video[0], any_frame=True, backward=False)
+            vs = self.container.streams.video[self.streams.get('video', 0)]
+            self.container.seek(pts, stream=vs, any_frame=True)
 
     def move_audio(self)->list[tuple[np.ndarray,float,list[float]]]:
         x = self.aq
@@ -185,9 +186,12 @@ class Player:
         return x
 
     def frames(self) -> iter:
+        good = 0
         fail = 0
         ovtp = self.vpts
         iter = self.container.decode(**self.streams)
+        fix_audio = False
+        audio_stream = None
         while True:
             try:
                 frame = next(iter)
@@ -200,20 +204,32 @@ class Player:
                 self.vpts += math.ceil( (1.0/self.frame_rate)/vs.time_base )
                 if fail%100 == 0:
                     log.debug(f"InvalidDataError during decode -- seeking ahead #{fail}, from {ovtp} to {self.vpts}")
-                    if fail >= 1000:
-                        log.critical(f"Repeated InvalidDataError, skipped {fail} frames but found nothing good")
-                        import os
-                        os._exit(134)
-                        raise
-                    if fail >= 500:
+                    if fail >= 500 and not fix_audio:
                         self.trouble = True
+                        fix_audio = True
+                        audio_stream = self.streams.get('audio', None)
+                        del self.streams['audio']
+                    if fail >= 2000:
+                        log.critical(f"Repeated InvalidDataError, skipped {fail} frames but found nothing good")
+                        if good >= self.frame_rate * 600:
+                            return
+                        else:
+                            import os
+                            os._exit(134)
+                        raise
                     self._resync(self.vpts)
                 else:
-                    self.container.seek(self.vpts, stream=vs, any_frame=True, backward=False)
+                    self.container.seek(self.vpts, stream=vs, any_frame=True, backward=(fail%2 == 0))
                 iter = self.container.decode(**self.streams)
                 continue
             
             if fail:
+                if fix_audio:
+                    fix_audio = False
+                    if audio_stream is not None:
+                        self.streams['audio'] = audio_stream
+                        audio_stream = None
+                        iter = self.container.decode(**self.streams)
                 if self.graph:
                     self._create_graph()
                 log.info(f"Resync'd to {float(self.vpts*vs.time_base)} after {fail} skipped/dropped/corrupt/whatever frames")
@@ -231,6 +247,7 @@ class Player:
                             raise
                         continue
                 self.vpts = frame.pts
+                good += 1
                 yield frame
         
         return #raise StopIteration()
@@ -272,17 +289,13 @@ class Player:
                 vs = self.container.streams.video[self.streams.get('video', 0)]
                 self.vpts += math.ceil( (1.0/self.frame_rate)/vs.time_base )
                 if fail%100 == 0:
-                    log.debug(f"InvalidDataError during decode -- seeking ahead #{fail}, from {ovtp} to {self.vpts}")
-                    if fail >= 1000:
-                        log.critical(f"Repeated InvalidDataError, skipped {fail} frames but found nothing good")
-                        import os
-                        os._exit(134)
-                        raise
+                    #log.debug(f"InvalidDataError during decode -- seeking ahead #{fail}, from {ovtp} to {self.vpts}")
                     if fail >= 500:
-                        self.trouble = True
+                        log.critical(f"Repeated InvalidDataError, skipped {fail} frames but found nothing good")
+                        return
                     self._resync(self.vpts)
                 else:
-                    self.container.seek(self.vpts, stream=vs, any_frame=True, backward=False)
+                    self.container.seek(self.vpts, stream=vs, any_frame=True, backward=(fail%2 == 0))
                 iter = self.container.demux(**self.streams)
                 continue
             
