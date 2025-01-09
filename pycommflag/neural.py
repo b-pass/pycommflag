@@ -25,7 +25,7 @@ SUMMARY_RATE = 2
 RATE = 29.97
 
 # training params
-RNN = 'c1d'
+RNN = 'lstm'
 UNITS = 32
 DROPOUT = 0.4
 EPOCHS = 40
@@ -575,22 +575,17 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
             n = layers.Bidirectional(layers.LSTM(UNITS, dropout=DROPOUT, dtype='float32'), name="rnn")(n)
             #n = layers.TimeDistributed(layers.Dense(UNITS, dtype='float32', activation='tanh'), name="dense-mid")(n)
             #n = layers.Bidirectional(layers.LSTM(UNITS, dropout=DROPOUT, dtype='float32'), name="MORE-rnn")(n)
-        else:
-            # First Conv1D to capture local temporal patterns
+        elif RNN.lower() == "c1d":
             n = layers.Conv1D(filters=32, 
                                 kernel_size=5,
                                 activation='relu',
-                                padding='same',  # To maintain temporal dimension
+                                padding='same',
                                 name="conv1d_1")(n)
-
-            #  another Conv1D layer to capture higher-level patterns
             n = layers.Conv1D(filters=32,
                                 kernel_size=3,
                                 activation='relu',
                                 padding='same',
                                 name="conv1d_2")(n)
-            2 
-            # Global pooling to reduce temporal dimension
             n = layers.GlobalAveragePooling1D(name="global_pool")(n)
         
         n = layers.Dense(32, dtype='float32', activation='relu', name="dense-post")(n)
