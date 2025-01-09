@@ -14,24 +14,27 @@ def search(player:Player, search_beginning:bool=False, opts:Any=None) -> tuple|N
     player.disable_audio()
     player.seek(0)
 
+    logo_sum = np.zeros(player.shape, np.uint32)
+
     skip = round(float(player.frame_rate / opts.logo_samples))
     if skip < 1: skip = 1
-    ftotal = int(player.duration * player.frame_rate / skip)
-    
-    fcount = 0
-    p = 0
-    logo_sum = np.zeros(player.shape, np.uint32)
+    ftotal = int(min(3600, player.duration) * player.frame_rate / skip)
     percent = ftotal/100.0
     report = math.ceil(percent/4) if not opts.quiet else ftotal * 2
-    if not opts.quiet: print("Searching          ", end='\r')
+    
+    fcount = 0
+    r = 0
+    if not opts.quiet: print("Logo Searching          ", end='\r')
     for frame in player.frames_stride(skip):
-        p += 1
-        if p >= report:
-            p = 0
+        r += 1
+        if r >= report:
+            r = 0
             print("Logo Searching, %3.1f%%    " % (min(fcount/percent,100.0)), end='\r')
         data = _gray(frame)
         logo_sum += scipy.ndimage.sobel(data) > _LOGO_EDGE_THRESHOLD
         fcount += 1
+        if fcount >= ftotal: 
+            break
     
     if not opts.quiet: print("Logo Searching is complete.\n")
 
