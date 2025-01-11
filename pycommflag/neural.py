@@ -11,12 +11,12 @@ import resource
 import sys
 import tempfile
 import time
-from typing import Any,TextIO,BinaryIO,List,Tuple
+from typing import Any, Iterator,TextIO,BinaryIO,List,Tuple
 
 import numpy as np
 
-from .feature_span import *
-from . import processor
+from pycommflag.feature_span import *
+from pycommflag import processor
 
 # data params, both for train and for inference
 WINDOW_BEFORE = 30
@@ -25,7 +25,7 @@ SUMMARY_RATE = 2
 RATE = 29.97
 
 # training params
-RNN = 'c1d'
+RNN = 'lstm'
 UNITS = 32
 DROPOUT = 0.4
 EPOCHS = 40
@@ -59,6 +59,7 @@ def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]],
     Returns:
         Adjusted tags list with updated boundaries
     """
+
     def find_highest_diff_boundary(target_time: float, 
                                  search_window: float, 
                                  diffs: List[Tuple[float, Tuple[float, float]]]) -> float:
@@ -118,11 +119,11 @@ def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]],
         new_end = find_nearest_blank(end_time, blanks, max_distance)
         
         # If still at original positions, try aligning with diff boundaries
-        #if new_start == start_time:
-        #    new_start = find_highest_diff_boundary(start_time, 1.0, diffs)
-        #if new_end == end_time:
-        #    new_end = find_highest_diff_boundary(end_time, 1.0, diffs)
-           
+        if new_start == start_time:
+            new_start = find_highest_diff_boundary(start_time, 1.0, diffs)
+        if new_end == end_time:
+            new_end = find_highest_diff_boundary(end_time, 1.0, diffs)
+        
         # Only keep valid tags
         if new_start < new_end:
             filtered_tags.append((tag_type, (new_start, new_end)))
@@ -182,41 +183,23 @@ def condense(frames: np.ndarray, step: int) -> np.ndarray:
     else:
         return condensed
 
-def flog_to_vecs(flog:dict, fitlerForTraining=False, clean=True)->tuple[list[float], list[list[float]], list[float], list[float]]:
-    version = flog.get('file_version', 10)
-    frame_rate = flog.get('frame_rate', 29.97)
-    endtime = flog.get('duration', 0)
-    have_logo = not not flog.get('logo', None)
+def rle1d(arr):
+    """
+    Run Length encoding for a 1D numpy array.
+    """
+    changes = np.ediff1d(arr, to_begin=1) != 0
+    pos = np.argwhere(changes).ravel()
+    length = np.diff(np.append(pos, len(arr)), dtype='uint32')
+    run = arr[pos]
+    return np.vstack((run, length))
 
-    tags = flog.get('tags', []) if clean else []
-    
-    frames_header = flog['frames_header']
-    assert('time' in frames_header[0])
-    assert('diff' in frames_header[3])
+def rle_decode(rle):
+    return np.repeat(rle[0], rle[1])
 
-    if tags and fitlerForTraining:
-        spans = processor.read_feature_spans(flog, 'blank')
-        tags = _adjust_tags(tags, spans.get('blank', []), spans.get('diff', []), endtime)
-        
-        # clean up tiny gaps between identified breaks (including true 0-length gaps)
-        i = 1
-        while i < len(tags):
-            if tags[i][0] == tags[i-1][0] and (tags[i][1][0] - tags[i-1][1][1]) < 20:
-                tags[i-1] = (tags[i][0], (tags[i-1][1][0], tags[i][1][1]))
-                del tags[i]
-            else:
-                i += 1
-        
-        i = 0
-        while i < len(tags):
-            clen = tags[i][1][1] - tags[i][1][0]
-            if clen < 10 and not (tags[i][1][1]+clen+10 >= endtime or tags[i][0] in [SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value]):
-                # delete the tiny segment
-                del tags[i]
-            else:
-                i += 1
-    
-    frames = flog['frames']
+def array2onehot(arr, nclasses, dtype='float32'):
+    return np.eye(nclasses, dtype=dtype)[arr]
+
+def cleanup_frames(frames, tags, frame_rate=RATE):
     if frames and frames[0] is None: 
         frames = frames[1:]
     
@@ -242,7 +225,43 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False, clean=True)->tuple[list[flo
         return None
     
     # ok now we can numpy....
-    frames = np.array(frames, dtype='float32')
+    return np.array(frames, dtype='float32')
+
+def flog_to_vecs(flog:dict, fitlerForTraining=False, clean=True)->tuple[list[float], list[list[float]], list[float], list[float]]:
+    version = flog.get('file_version', 10)
+    frame_rate = flog.get('frame_rate', 29.97)
+    endtime = flog.get('duration', 0)
+    have_logo = not not flog.get('logo', None)
+
+    tags = flog.get('tags', []) if clean else []
+    
+    frames_header = flog['frames_header']
+    assert('time' in frames_header[0])
+    assert('diff' in frames_header[3])
+
+    if tags and fitlerForTraining:
+        spans = processor.read_feature_spans(flog, 'blank')
+        tags = _adjust_tags(tags, spans.get('blank', []), spans.get('diff', []), endtime)
+        
+        # clean up tiny gaps between identified breaks (including true 0-length gaps)
+        i = 1
+        while i < len(tags):
+            if tags[i][0] == tags[i-1][0] and (tags[i][1][0] - tags[i-1][1][1]) < 15:
+                tags[i-1] = (tags[i][0], (tags[i-1][1][0], tags[i][1][1]))
+                del tags[i]
+            else:
+                i += 1
+        
+        i = 0
+        while i < len(tags):
+            clen = tags[i][1][1] - tags[i][1][0]
+            if clen < 10 and not (tags[i][1][1]+clen+10 >= endtime or tags[i][0] in [SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value]):
+                # delete the tiny segment
+                del tags[i]
+            else:
+                i += 1
+    
+    frames = cleanup_frames(flog['frames'], tags, frame_rate)
 
     if not have_logo:
         frames[..., 1] = 0
@@ -256,7 +275,7 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False, clean=True)->tuple[list[flo
     time_perc = None
 
     # copy the real timestamps
-    timestamps = frames[...,0].tolist()
+    timestamps = frames[...,0].copy()
     
     # normalize the timestamps upto 30 minutes
     frames[...,0] = (frames[...,0] % 1800.0) / 1800.0
@@ -269,87 +288,206 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False, clean=True)->tuple[list[flo
     summary = round(RATE/SUMMARY_RATE)
     wbefore = round(WINDOW_BEFORE * SUMMARY_RATE)
     wafter = round(WINDOW_AFTER * SUMMARY_RATE)
-    data = []
 
     # we do not use numpy for these because there is MUCH duplication, so we save memory by using pylists.
     # alternate is np.repeat, which would make new arrays for each iteration below.
-    condensed = condense(frames, summary).tolist()
-    frames = frames.tolist()
+    condensed = condense(frames, summary)
 
-    i = 0
-    while True:
-        ci = i//summary
-        if ci > wbefore: 
-            break
-        data.append(
-            condensed[0:1] * (wbefore - ci) + 
-            condensed[0 : ci] +
-            frames[0:1] * max(0, rate-i) +
-            frames[max(0, i-rate) : i+rate+1] +
-            condensed[ci + 1 : ci + wafter + 1]
-        )
-        #if len(data[-1]) != len(data[0]): raise Exception(f"{i}, {np.array(data[0]).shape} {np.array(data[-1]).shape}")
-        i += 1
-    
-    while i < len(frames) - (WINDOW_AFTER+1)*rate:
-        ci = i//summary
-        data.append(
-            condensed[ci - (wbefore + 1) + 1 : ci] +
-            frames[i-rate : i+rate+1] +
-            condensed[ci+1 : ci + wafter + 1]
-        )
-        #if len(data[-1]) != len(data[0]): raise Exception(f"{i}, {np.array(data[0]).shape} {np.array(data[-1]).shape}")
-        i += 1
-    
-    while i < len(frames):
-        ci = i//summary
-        data.append(
-            condensed[ci - (wbefore + 1) + 1 : ci] +
-            frames[i-rate : i+rate+1] +
-            frames[-1:] * max(0, i + rate + 1 - len(frames)) +
-            condensed[ci + 1 : ci + wafter + 1] +
-            condensed[-1:] * max(0,ci + wafter + 1 - len(condensed))
-        )
-        #if len(data[-1]) != len(data[0]): raise Exception(f"{i}, {np.array(data[0]).shape} {np.array(data[-1]).shape}")
-        i += 1
+    frames = np.concatenate((
+        np.tile(frames[0], (rate,1)),
+        frames,
+        np.tile(frames[-1], (rate,1)),
+    ))
 
-    # convert tags to a one-hot per-frame
-    answers = []
+    condensed = np.concatenate((
+        np.tile(condensed[0], (wbefore,1)),
+        condensed,
+        np.tile(condensed[-1], (wafter,1)),
+    ))
+
+    answers = np.full(len(timestamps), SceneType.DO_NOT_USE.value, dtype='uint8')
+    weights = np.full(len(timestamps), 1, dtype='uint8')
+
     prev = SceneType.DO_NOT_USE.value
-    weights = [1.0] * len(timestamps)
-    tit = iter(tags)
-    tag = next(tit, (SceneType.UNKNOWN, (0, endtime+9999)))
-    for ts in timestamps:
-        i = len(answers)
-        if ts >= endtime:
-            del timestamps[i:]
-            del data[i:]
-            del weights[i:]
-            break
-
-        while ts >= tag[1][1]:
-            tag = next(tit, (SceneType.UNKNOWN, (0, endtime+9999)))
-        tt = tag[0] if ts >= tag[1][0] else SceneType.UNKNOWN
+    for (tt,(st,et)) in tags:
         if type(tt) is not int: tt = tt.value
-        
-        if tt == SceneType.DO_NOT_USE.value:
-            weights[i] = 0
-        elif prev != tt and prev != SceneType.DO_NOT_USE.value:
-            #for x in range(max(0,i-round(WINDOW_BEFORE*RATE)), min(i+1+round(WINDOW_AFTER*RATE),len(weights))):
-            #    if weights[x] > 0:
-            #        weights[x] = 1.5 if tt in [SceneType.COMMERCIAL.value, SceneType.SHOW.value] else 1.2
-            for x in range(max(0,i-round(RATE)), min(i+1+round(RATE),len(weights))):
-                if weights[x] > 0:
-                    weights[x] = 2.0
+
+        si = np.searchsorted(timestamps, st, 'left')
+        ei = np.searchsorted(timestamps, et, 'left') or len(timestamps)
+
+        if si < ei and (si > 0 or st < 1) and (ei < len(timestamps) or ei+1 >= endtime):
+            answers[si:ei] = tt
+            if tt == SceneType.DO_NOT_USE.value:
+                weights[si:ei] = 0 # ignore this data point
+            elif tt != prev and prev != SceneType.DO_NOT_USE.value:
+                # higher weight near the transition
+                ws = max(0,si-rate)
+                we = min(len(weights),si+rate)
+                weights[ws:we] = np.where(weights[ws:we] > 0, 2, 0)
         
         prev = tt
-        answers.append(SceneType_one_hot[tt])
-    
-    assert(len(timestamps) == len(data))
-    assert(len(data) == len(answers))
-    assert(len(answers) == len(weights))
 
-    return (timestamps,data,answers,weights)
+    return (timestamps,frames,condensed,answers,weights)
+
+def load_nonpersistent(flogname:str,with_timestamps=False):
+    return flog_to_vecs(processor.read_feature_log(flogname), True)
+
+def load_persistent(flogname:str,with_timestamps=False):
+    fname = flogname
+    if fname.endswith('.npy'):
+        fname = fname[:-4]
+    if fname.endswith('.gz'):
+        fname = fname[:-3]
+    if fname.endswith('.json'):
+        fname = fname[:-5]
+    
+    timestamps = None
+    if not os.path.exists(fname + ".frames.npy"):
+        (timestamps,frames,condensed,answers,weights) = flog_to_vecs(processor.read_feature_log(flogname), True)
+
+        np.save(fname+'.frames.npy', frames)
+        np.save(fname+'.summary.npy', condensed)
+        np.save(fname+'.answers.npy', rle1d(answers))
+        np.save(fname+'.weights.npy', rle1d(weights))
+    
+    frames = np.load(fname+'.frames.npy', mmap_mode='r')
+    condensed = np.load(fname+'.summary.npy', mmap_mode='r')
+    answers = rle_decode(np.load(fname+'.answers.npy'))
+    weights = rle_decode(np.load(fname+'.weights.npy'))
+
+    if with_timestamps and timestamps is None:
+        flog = processor.read_feature_log(flogname)
+        frames = cleanup_frames(flog['frames'], flog['tags'], flog['frame_rate'])
+        timestamps = frames[...,0].copy()
+    
+    return (timestamps,frames,condensed,answers,weights)
+
+from keras.utils import Sequence
+class WindowStackGenerator(Sequence):
+    def __init__(self, stuff=None):
+        if stuff is None:
+            return
+        
+        from numpy.lib.stride_tricks import sliding_window_view
+
+        # +/- 1s is all frames, plus the WINDOW before/after which is condensed to SUMMARY_RATE 
+        rate = round(RATE)
+        self.summary_rate = round(RATE/SUMMARY_RATE)
+        wbefore = round(WINDOW_BEFORE * SUMMARY_RATE)
+        wafter = round(WINDOW_AFTER * SUMMARY_RATE)
+        
+        (timestamps,frames,condensed,answers,weights) = stuff
+        self.frames = sliding_window_view(frames, (rate+1+rate, frames.shape[1],)).squeeze()
+        self.before = sliding_window_view(condensed, (wbefore, condensed.shape[1],)).squeeze()[:-(wafter+1)]
+        self.after = sliding_window_view(condensed, (wafter, condensed.shape[1],)).squeeze()[wbefore+1:]
+        self.answers = array2onehot(answers, SceneType.count(), dtype='float32')
+        self.weights = weights
+
+        assert(timestamps is None or len(self.frames) == len(timestamps))
+        assert(len(self.frames) == len(self.before))
+        assert(len(self.frames) == len(self.after))
+        assert(len(self.frames) == len(self.answers))
+        assert(len(self.frames) == len(self.weights))
+
+        self.batch_size = BATCH_SIZE
+        self.shape = ( len(self.frames), frames.shape[1] + condensed.shape[1]*2 )
+        self.posmap = np.arange(0, len(self.frames), self.batch_size, dtype='uint32')
+        self.reallen = len(self.posmap)
+        self.len = self.reallen
+    
+    def set_skip(self, skip):
+        self.len = self.reallen - len(skip)
+
+        si = iter(sorted(skip))
+        ns = next(si)
+        pos = 0
+        for i in range(self.posmap):
+            while pos == ns:
+                pos += 1
+                try:
+                    ns = next(si)
+                except StopIteration:
+                    ns = -1
+                    break
+            self.posmap[i] = pos * self.batch_size
+            pos += 1
+        
+    def __len__(self):
+        return self.len
+    
+    def __getitem__(self, where):
+        start = self.posmap[where]
+        end = start + self.batch_size
+
+        cstart = start // self.summary_rate
+        cend = cstart + self.batch_size
+
+        data = np.stack((
+            self.before[cstart:cend],
+            self.frames[start:end],
+            self.after[cstart:cend]
+        ), axis=1)
+        
+        return (data, self.answers[start:end], self.weights[start:end])
+    
+def split_generator(ingen, split=0.25):
+    if len(ingen.skip) != 0:
+        raise Exception("That was already split, can't split it again")
+    
+    import random
+    skip = set()
+    num = int(len(ingen) * split)
+    while len(skip) < num:
+        skip.add(random.randint(0, len(ingen)-1))
+    
+    other = WindowStackGenerator()
+    for (k,v) in ingen.__dict__:
+        setattr(other, k, v)
+    
+    ingen.set_skip(skip)
+
+    oskip = []
+    for x in range(len(other)):
+        if x not in skip:
+            oskip.append(x)
+    other.set_skip(oskip)
+
+    return (ingen, other)
+
+class MultiGenerator(Sequence):
+    def __init__(self, elements:list[WindowStackGenerator]):
+        self.elements = elements
+        self.num_elements = len(self.elements)
+        self.lengths = []
+        self.offsets = []
+        self.len = 0
+        for e in self.elements:
+            if self.shape is None:
+                self.shape = e.shape
+            else:
+                assert(e.shape == self.shape)
+            
+            x = len(e)
+            self.lengths.append(x)
+            self.offsets.append(self.len)
+            self.len += x
+        
+        self.offsets = np.array(self.offsets, dtype='uint32')
+        
+    def __len__(self):
+        return self.len
+    
+    def __getitem__(self, index):
+        ei = np.searchsorted(self.offsets, index)
+        index -= self.lengths[ei]
+        return self.elements[ei][index]
+    
+f = "./data/ghosts.json.gz"
+print("Loading",f)
+if flog := processor.read_feature_log(f):
+    (_,a,b,c) = flog_to_vecs(flog,True)
+
+sys.exit(99)
 
 def load_data(opts, do_not_test=False)->tuple[list,list,list,list,list]:
     data = opts.ml_data
@@ -433,32 +571,6 @@ def load_data(opts, do_not_test=False)->tuple[list,list,list,list,list]:
     gc.collect()
 
     return (x,y,w,xt,yt)
-
-from keras.utils import Sequence
-class DataGenerator(Sequence):
-    def __init__(self, data, answers=None, weights=None):
-        self.data = data
-        self.answers = answers
-        self.weights = weights
-        self.len = ceil(len(self.data) / BATCH_SIZE)
-        self.shape = (len(data[0]), len(data[0][0]))
-    
-    def __len__(self):
-        return self.len
-    
-    def __getitem__(self, index):
-        #gc.collect()
-        index *= BATCH_SIZE
-        d = np.array(self.data[index:index+BATCH_SIZE], dtype='float32')
-        if self.answers:
-            a = np.array(self.answers[index:index+BATCH_SIZE], dtype='float32')
-            if self.weights:
-                w = np.array(self.weights[index:index+BATCH_SIZE], dtype='float32')
-                return d,a,w
-            else:
-                return d,a
-        else:
-            return d
 
 def train(opts:Any=None):
     # yield CPU time to useful tasks, this is a background thing...
@@ -575,22 +687,17 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
             n = layers.Bidirectional(layers.LSTM(UNITS, dropout=DROPOUT, dtype='float32'), name="rnn")(n)
             #n = layers.TimeDistributed(layers.Dense(UNITS, dtype='float32', activation='tanh'), name="dense-mid")(n)
             #n = layers.Bidirectional(layers.LSTM(UNITS, dropout=DROPOUT, dtype='float32'), name="MORE-rnn")(n)
-        else:
-            # First Conv1D to capture local temporal patterns
+        elif RNN.lower() == "c1d":
             n = layers.Conv1D(filters=32, 
                                 kernel_size=5,
                                 activation='relu',
-                                padding='same',  # To maintain temporal dimension
+                                padding='same',
                                 name="conv1d_1")(n)
-
-            #  another Conv1D layer to capture higher-level patterns
             n = layers.Conv1D(filters=32,
                                 kernel_size=3,
                                 activation='relu',
                                 padding='same',
                                 name="conv1d_2")(n)
-            2 
-            # Global pooling to reduce temporal dimension
             n = layers.GlobalAveragePooling1D(name="global_pool")(n)
         
         n = layers.Dense(32, dtype='float32', activation='relu', name="dense-post")(n)
