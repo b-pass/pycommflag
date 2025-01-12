@@ -158,11 +158,11 @@ def condense(frames: np.ndarray, step: int) -> np.ndarray:
     remaining = n_frames % step
     if n_frames >= step:
         # Reshape the array to group frames by step size
-        valid_frames = frames[:(n_frames // step) * step].reshape(-1, step, frames.shape[1])
+        valid_frames = frames[:(n_frames//step)*step].reshape(-1, step, frames.shape[1])
         
-        # Initialize condensed array with first frame of each group
+        # Initialize condensed array with middle frame of each group
         # This preserves all features that don't need averaging
-        condensed = valid_frames[:, 0].copy()
+        condensed = valid_frames[:, step//2].copy()
         
         # Update only the features that need condensing
         condensed[:, 1] = np.mean(valid_frames[:, :, 1], axis=1, dtype='float32')  # Average logo
@@ -174,7 +174,7 @@ def condense(frames: np.ndarray, step: int) -> np.ndarray:
     if remaining:
         # Do the final, partial condensing
         last_frames = frames[-remaining:]
-        last_condensed = last_frames[0].copy()  # Keep all features from first remaining frame
+        last_condensed = last_frames[len(last_frames)//2].copy()  # Keep all features from middle remaining frame
         last_condensed[1] = np.mean(last_frames[:, 1], dtype='float32')  # Average logo
         last_condensed[2] = np.mean(last_frames[:, 2], dtype='float32')  # Average blank
         last_condensed[3] = np.count_nonzero(last_frames[:, 3] > 15) / remaining  # Diff ratio
@@ -229,7 +229,7 @@ def cleanup_frames(frames, tags, frame_rate=RATE):
     # ok now we can numpy....
     return np.array(frames, dtype='float32')
 
-def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple:
+def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[np.ndarray,np.ndarray]:
     version = flog.get('file_version', 10)
     frame_rate = flog.get('frame_rate', 29.97)
     endtime = flog.get('duration', 0)
@@ -272,18 +272,19 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple:
     frames = condense(frames, round(frame_rate/RATE))
 
     # add a column for time percentage
-    time_perc = frames[...,0]/endtime
-    frames = np.append(frames, time_perc[:,np.newaxis], axis=1)
-    time_perc = None
+    frames = np.append(frames, (frames[...,0]/endtime)[:,np.newaxis], axis=1)
 
-    # copy the real timestamps
-    timestamps = frames[...,0].copy()
-    
-    # normalize the timestamps upto 30 minutes
+    # add a column for with the real timestamps
+    frames = np.append(frames, frames[...,0], axis=1)
+
+    # change the first column to be normalized timestamps (30 minute segments)
     frames[...,0] = (frames[...,0] % 1800.0) / 1800.0
 
     # normalize frame diffs to ~30
     frames[...,3] = np.clip(frames[...,3] / 30, 0, 1.0)
+
+    # add a column for answers and a column for weights
+    frames = np.insert(frames, frames.shape[1], [[0], [1]], axis=1)
 
     # +/- 1s is all frames, plus the WINDOW before/after which is condensed to SUMMARY_RATE 
     rate = round(RATE)
@@ -291,22 +292,9 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple:
     wbefore = round(WINDOW_BEFORE * SUMMARY_RATE)
     wafter = round(WINDOW_AFTER * SUMMARY_RATE)
 
-    condensed = condense(frames, summary)
-
-    frames = np.concatenate((
-        np.tile(frames[0], (rate,1)),
-        frames,
-        np.tile(frames[-1], (rate,1)),
-    ))
-
-    condensed = np.concatenate((
-        np.tile(condensed[0], (wbefore,1)),
-        condensed,
-        np.tile(condensed[-1], (wafter,1)),
-    ))
-
-    answers = np.full(len(timestamps), 0, dtype='uint8')
-    weights = np.full(len(timestamps), 1, dtype='uint8')
+    timestamps = frames[:, -3]
+    answers = frames[:, -2]
+    weights = frames[:, -1]
 
     prev = SceneType.DO_NOT_USE.value
     for (tt,(st,et)) in tags:
@@ -332,9 +320,24 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple:
         
         prev = tt
 
-    return (timestamps,frames,condensed,answers,weights)
+    # dont condense timestamps, answers, weights
+    condensed = condense(frames[...,:-3], summary)
 
-def load_persistent(flogname:str,with_timestamps=False):
+    frames = np.concatenate((
+        np.tile(frames[0], (rate,1)),
+        frames,
+        np.tile(frames[-1], (rate,1)),
+    ))
+
+    condensed = np.concatenate((
+        np.tile(condensed[0], (wbefore,1)),
+        condensed,
+        np.tile(condensed[-1], (wafter,1)),
+    ))
+
+    return (frames,condensed)
+
+def load_persistent(flogname:str,for_training=True):
     fname = flogname
     if fname.endswith('.npy'):
         fname = fname[:-4]
@@ -343,31 +346,22 @@ def load_persistent(flogname:str,with_timestamps=False):
     if fname.endswith('.json'):
         fname = fname[:-5]
     
-    timestamps = None
-    if not os.path.exists(fname + ".frames.npy"):
-        (timestamps,frames,condensed,answers,weights) = flog_to_vecs(processor.read_feature_log(flogname), True)
-
+    if not os.path.exists(fname + ".frames.npy") or not os.path.exists(fname + '.summary.npy'):
+        frames,condensed = flog_to_vecs(processor.read_feature_log(flogname), for_training)
         np.save(fname+'.frames.npy', frames)
         np.save(fname+'.summary.npy', condensed)
-        np.save(fname+'.answers.npy', rle1d(answers))
-        np.save(fname+'.weights.npy', rle1d(weights))
     
     frames = np.load(fname+'.frames.npy', mmap_mode='r')
     condensed = np.load(fname+'.summary.npy', mmap_mode='r')
-    answers = rle_decode(np.load(fname+'.answers.npy', mmap_mode='r'))
-    weights = rle_decode(np.load(fname+'.weights.npy', mmap_mode='r'))
 
-    if with_timestamps and timestamps is None:
-        flog = processor.read_feature_log(flogname)
-        temp = cleanup_frames(flog['frames'], flog['tags'], flog['frame_rate'])
-        timestamps = temp[...,0].copy()
-    
-    return (timestamps,frames,condensed,answers,weights)
+    return (frames,condensed)
 
+def load_nonpersistent(flog:dict,for_training=False):
+    return flog_to_vecs(flog, for_training)
 
 from keras.utils import Sequence
 class WindowStackGenerator(Sequence):
-    def __init__(self, stuff=None):
+    def __init__(self, stuff=None, ordered=True):
         if stuff is None:
             return
         
@@ -385,88 +379,88 @@ class WindowStackGenerator(Sequence):
         wbefore = round(WINDOW_BEFORE * SUMMARY_RATE)
         wafter = round(WINDOW_AFTER * SUMMARY_RATE)
         self.batch_size = BATCH_SIZE
+
+        (frames,condensed) = stuff
+
+        # frames has been tile with rate on each side and has timestamps,answers,weights concatted...
+        # unpack all that
+        self.timestamps = frames[rate:-rate,-3]
+        self.answers = array2onehot(frames[rate:-rate:,-2], SceneType.count(), dtype='float32')
+        self.weights = frames[rate:-rate:,-1]
+        frames = frames[:, :-3]
         
-        (timestamps,frames,condensed,answers,weights) = stuff
         self.frames = sliding_window_view(frames, (rate+1+rate, frames.shape[1],)).squeeze()
-        self.before = repeat_view_axis0(sliding_window_view(condensed, (wbefore, condensed.shape[1],)).squeeze()[:-wafter-1], summary)
+        self.before = repeat_view_axis0(sliding_window_view(condensed, (wbefore, condensed.shape[1],)).squeeze(), summary)
         self.after = repeat_view_axis0(sliding_window_view(condensed, (wafter, condensed.shape[1],)).squeeze()[wbefore+1:], summary)
-        self.answers = array2onehot(answers, SceneType.count(), dtype='float32')
-        self.weights = weights
 
-        print(len(self.frames), len(self.weights), len(self.before), len(self.after))
-
-        assert(timestamps is None or len(self.frames) == len(timestamps))
+        assert(len(self.frames) == len(self.timestamps))
         assert(len(self.frames) == len(self.answers))
         assert(len(self.frames) == len(self.weights))
 
-        # its off by one but does anyone care?
-        #assert(len(self.frames) == len(self.before))
-        #assert(len(self.frames) == len(self.after))
+        # truncate these if they are a little over-size from being repeated
+        self.before = self.before[:len(self.frames)]
+        self.after = self.after[:len(self.frames)]
 
-        self.shape = ( len(self.frames),  self.before.shape[1] + self.frames.shape[1] + self.after.shape[1] )
-        self.posmap = np.arange(0, len(self.frames), self.batch_size, dtype='uint32')
-        self.reallen = len(self.posmap)
-        self.len = self.reallen
-    
-    def _set_skip(self, skip=None):
-        self.posmap = np.arange(0, len(self.frames), self.batch_size, dtype='uint32')
-        if not skip:
-            return
-        si = iter(sorted(skip))
-        ns = next(si)
-        pos = 0
-        for i in range(self.reallen):
-            while pos == ns:
-                pos += 1
-                try: ns = next(si)
-                except StopIteration: ns = -1
-            self.posmap[i] = pos * self.batch_size
-            pos += 1
-        self.len = self.reallen - len(skip)
-            
-    def split(self, split=0.25):
-        from random import randrange
+        self.stride = len(self.frames) // self.batch_size # we want every N to add up to about the Batch Size
+        self.len = ceil(len(self.frames) / self.batch_size)
+        self.shape = ( self.len, self.batch_size, self.before.shape[1] + self.frames.shape[1] + self.after.shape[1], self.frames.shape[2] )
+        self.offset = 0
 
-        num = int(self.reallen * split)
-        if num == 0:
-            return None
-        
-        skip = set()
-        while len(skip) < num:
-            skip.add(randrange(self.reallen))
-        
-        other = WindowStackGenerator()
+        self.set_ordered(ordered)
+
+    def split(self, split=0.75):
+        a = WindowStackGenerator()
+        b = WindowStackGenerator()
         for (k,v) in self.__dict__:
-            setattr(other, k, v)
+            setattr(a, k, v)
+            setattr(b, k, v)
         
-        other._set_skip(set(range(self.reallen)) - skip)
-        self._set_skip(skip)
+        a.offset = 0
+        a.len = (len(self.frames) * split) // self.batch_size
+        a.shape = (a.len,) + a.shape[1:]
 
-        return other
+        b.offset = a.len
+        b.len = self.len - a.len
+        b.shape = (b.len,) + b.shape[1:]
+        
+        return (a,b)
     
     def __len__(self):
         return self.len
     
-    def __getitem__(self, where):
-        start = self.posmap[where]
-        end = start + self.batch_size
-
+    def set_ordered(self, ordered=True):
+        self.__getitem__ = self.get_ordered if self.ordered else self.get_unordered
+    
+    def get_ordered(self, index):
+        index = (index + self.offset) * self.batch_size
+        endex = index + self.batch_size
         data = np.concatenate((
-            self.before[start:end],
-            self.frames[start:end],
-            self.after[start:end]
+            self.before[index:endex],
+            self.frames[index:endex],
+            self.after[index:endex]
         ), axis=1)
-        
-        return (data, self.answers[start:end], self.weights[start:end])
-
+        return (data, self.answers[index:endex], self.weights[index:endex])
+    
+    def get_unordered(self, index):
+        index += self.offset
+        data = np.concatenate((
+            self.before[index::self.stride],
+            self.frames[index::self.stride],
+            self.after[index::self.stride]
+        ), axis=1)
+        return (data, self.answers[index::self.stride], self.weights[index::self.stride])
+    
 class MultiGenerator(Sequence):
     def __init__(self, elements:list[WindowStackGenerator]):
         self.elements = elements
         self.num_elements = len(self.elements)
-        self.shape = None
+        self._recalc()
+    
+    def _recalc(self):
         self.lengths = []
         self.offsets = []
         self.len = 0
+        self.shape = None
         for e in self.elements:
             if self.shape is None:
                 self.shape = e.shape
@@ -477,8 +471,14 @@ class MultiGenerator(Sequence):
             self.lengths.append(x)
             self.offsets.append(self.len)
             self.len += x
-        
         self.offsets = np.array(self.offsets, dtype='uint32')
+        
+    def shuffle(self):
+        from random import shuffle
+        shuffle(self.elements)
+        for e in self.elements:
+            e.set_ordered(False)
+        self._recalc()
         
     def __len__(self):
         return self.len
@@ -518,30 +518,32 @@ def load_data(opts, do_not_test=False) -> tuple[MultiGenerator,MultiGenerator]:
         if os.path.isdir(f):
             continue
         print("Loading",f)
-        if stuff := load_persistent(f):
-            data.append( WindowStackGenerator(stuff) )
+        if stuff := load_persistent(f, True):
+            data.append( WindowStackGenerator(stuff, ordered=False) )
             dlen += len(data[-1])
-        gc.collect()
     
     for f in test:
         if os.path.isdir(f):
             continue
         print("Loading test",f)
-        if stuff := load_persistent(f):
-            test.append( WindowStackGenerator(stuff) )
+        if stuff := load_persistent(f, True):
+            test.append( WindowStackGenerator(stuff, ordered=False) )
             tlen += len(test[-1])
     
     need = int(dlen*TEST_PERC+1) - tlen
     if need >= dlen/100 and not do_not_test:
         print(f'Need to move {need} of {dlen} batches to the test/eval set')
-        need = need/dlen
-        for d in data:
-            if t := d.split(need):
-                tlen += len(t)
-                test.append(t)
-
-    gc.collect()
-
+        datakeep = 1 - need/dlen
+        orig = data
+        data = []
+        dlen = 0
+        for o in orig:
+            (d,t) = o.split(datakeep)
+            dlen += len(d)
+            tlen += len(t)
+            data.append(d)
+            test.append(t)
+    
     return (MultiGenerator(data), MultiGenerator(test))
 
 def train(opts:Any=None):
@@ -561,9 +563,7 @@ def train(opts:Any=None):
     #weights = (np.sum(sums)-sums)/np.sum(sums)
     #print("Loss Weights",weights)
     
-    nsteps = len(data[0][0])
-    nfeat = len(data[0][0][0])
-    print(f"Data batches (x):{len(data)}; Test batches (y):{len(test)}; BatchSize={len(data[0])}; Samples={nsteps}; Features={nfeat}")
+    print(f"Data batches (x):{data.shape} - Test batches (y):{test.shape}")
     
     tfile = tempfile.NamedTemporaryFile(prefix='train-', suffix='.pycf.model.h5', )
     model_path = tfile.name
@@ -622,16 +622,18 @@ def train(opts:Any=None):
 def _train_proc(model_path, train_dataset, test_dataset, epoch, queue):
     queue.put( _train_some(model_path, train_dataset, test_dataset, epoch) )
 
-def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,bool]:
+def _train_some(model_path, train_dataset:MultiGenerator, test_dataset:MultiGenerator, epoch=0) -> tuple[int,bool]:
     import signal
     import keras
     from keras import layers, callbacks
+
+    train_dataset.shuffle()
 
     model:keras.models.Model = None
     if epoch > 0:
         model = keras.models.load_model(model_path)
     else:
-        inputs = keras.Input(shape=train_dataset.shape, dtype='float32', name="input")
+        inputs = keras.Input(shape=train_dataset.shape[2:], dtype='float32', name="input")
         n = inputs
         n = layers.TimeDistributed(layers.Dense(32, dtype='float32', activation='tanh'), name="dense-pre")(n)
         #skip = n
@@ -723,10 +725,6 @@ def predict(feature_log:str|TextIO|dict, opts:Any, write_log=None)->list:
     
     assert(flog['frames'][-1][0] > frame_rate)
 
-    stuff = flog_to_vecs(flog, False)
-    times = stuff[0]
-    assert(len(times)>1)
-
     mf = opts.model_file
     if not mf and opts:
         mf = f'{opts.models_dir or "."}{os.sep}model.h5'
@@ -734,7 +732,10 @@ def predict(feature_log:str|TextIO|dict, opts:Any, write_log=None)->list:
         raise Exception(f"Model file '{mf}' does not exist")
     model:keras.models.Model = keras.models.load_model(mf)
 
-    prediction = model.predict(WindowStackGenerator(stuff), verbose=True)
+    gen = WindowStackGenerator(load_nonpersistent(flog, False),ordered=True)
+    times = gen.timestamps
+
+    prediction = model.predict(gen, verbose=True)
 
     result = np.argmax(prediction, axis=1)
     results = [(0,(0,0))]
@@ -836,13 +837,12 @@ def eval_many(opts:Any):
         if os.path.isdir(f):
             continue
         
-        dataset = []
+        dataset = None
         gc.collect()
 
         try:
             if flog := processor.read_feature_log(f):
-                (_,a,b,_) = flog_to_vecs(flog,True)
-                dataset = DataGenerator(a,b)
+                dataset = WindowStackGenerator(load_nonpersistent(flog))
             else:
                 print('Load failed')
                 continue
@@ -878,12 +878,11 @@ def eval(opts:Any):
     for f in opts.ml_data:
         if os.path.isdir(f):
             continue
-        gc.collect()
+        
         print(f)
         try:
             if flog := processor.read_feature_log(f):
-                (_,a,b,_) = flog_to_vecs(flog,True)
-                print(model.evaluate(DataGenerator(a,b), verbose=0))
+                print(model.evaluate(WindowStackGenerator(load_nonpersistent(flog)), verbose=0))
             else:
                 print('Load failed')
         except Exception as e:
