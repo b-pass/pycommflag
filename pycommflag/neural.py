@@ -16,9 +16,9 @@ from typing import Any, Iterator,TextIO,BinaryIO,List,Tuple
 
 import numpy as np
 
-from pycommflag.feature_span import *
-from pycommflag import processor
-from pycommflag import neural
+from .feature_span import *
+from . import processor
+from . import neural
 
 # data params, both for train and for inference
 WINDOW_BEFORE = 30
@@ -229,7 +229,7 @@ def cleanup_frames(frames, tags, frame_rate=RATE):
     # ok now we can numpy....
     return np.array(frames, dtype='float32')
 
-def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[list[float], list[list[float]], list[float], list[float]]:
+def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple:
     version = flog.get('file_version', 10)
     frame_rate = flog.get('frame_rate', 29.97)
     endtime = flog.get('duration', 0)
@@ -334,9 +334,6 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[list[float], list[li
 
     return (timestamps,frames,condensed,answers,weights)
 
-def load_nonpersistent(flogname:str,with_timestamps=False,filter_for_training=False):
-    return flog_to_vecs(processor.read_feature_log(flogname), filter_for_training)
-
 def load_persistent(flogname:str,with_timestamps=False):
     fname = flogname
     if fname.endswith('.npy'):
@@ -376,11 +373,11 @@ class WindowStackGenerator(Sequence):
         
         from numpy.lib.stride_tricks import sliding_window_view, as_strided
         def repeat_view_axis0(x, n):
-            repeated_view = as_strided(x,
-                                    shape=(x.shape[0], n, *x.shape[1:]),
-                                    strides=(x.strides[0], 0, *x.strides[1:]),
-                                    writeable=False)
-            return repeated_view.reshape(-1, *x.shape[1:])
+            v = as_strided(x,
+                           shape=(x.shape[0], n, *x.shape[1:]),
+                           strides=(x.strides[0], 0, *x.strides[1:]),
+                           writeable=False)
+            return v.reshape(-1, *x.shape[1:])
 
         # +/- 1s is all frames, plus the WINDOW before/after which is condensed to SUMMARY_RATE 
         rate = round(RATE)
@@ -391,7 +388,7 @@ class WindowStackGenerator(Sequence):
         
         (timestamps,frames,condensed,answers,weights) = stuff
         self.frames = sliding_window_view(frames, (rate+1+rate, frames.shape[1],)).squeeze()
-        self.before = repeat_view_axis0(sliding_window_view(condensed, (wbefore, condensed.shape[1],)).squeeze()[:-(wafter+1)], summary)
+        self.before = repeat_view_axis0(sliding_window_view(condensed, (wbefore, condensed.shape[1],)).squeeze()[:-wafter-1], summary)
         self.after = repeat_view_axis0(sliding_window_view(condensed, (wafter, condensed.shape[1],)).squeeze()[wbefore+1:], summary)
         self.answers = array2onehot(answers, SceneType.count(), dtype='float32')
         self.weights = weights
@@ -466,6 +463,7 @@ class MultiGenerator(Sequence):
     def __init__(self, elements:list[WindowStackGenerator]):
         self.elements = elements
         self.num_elements = len(self.elements)
+        self.shape = None
         self.lengths = []
         self.offsets = []
         self.len = 0
@@ -488,43 +486,6 @@ class MultiGenerator(Sequence):
     def __getitem__(self, index):
         ei = np.searchsorted(self.offsets, index)
         return self.elements[ei][index - self.offsets[ei]]
-    
-f = "./data/ghosts.json.gz"
-print("Loading",f)
-flog = processor.read_feature_log(f)
-(_,a,b,c) = neural.flog_to_vecs(flog,True)
-
-a = np.array(a, dtype='float32')
-
-new = WindowStackGenerator(load_persistent(f))
-
-#print(len(new))
-
-#print(new[0][0].shape)
-
-for batch in range(len(a)//256):
-    b = new[batch][0]
-
-    for i in range(256):
-        x = a[batch * 256 + i]
-        y = b[i]
-
-        if not np.array_equal(x, y):
-            print("FAIL AT ", batch, i)
-            sys.exit(99)
-
-        #with open("/tmp/test/a."+str(i), 'w') as f:
-        #    for e in a[i]:
-        #        f.write(str(e.tolist()) + '\n')
-        #with open("/tmp/test/b."+str(i), 'w') as f:
-        #    for e in b[i]:
-        #        f.write(str(e.tolist()) + '\n')
-            
-        #print(np.count_nonzero(x == y), np.count_nonzero(a[i-1].ravel() == y) if i > 0 else 0)
-
-        #
-print("success")
-sys.exit(99)
 
 def load_data(opts, do_not_test=False) -> tuple[MultiGenerator,MultiGenerator]:
     data = opts.ml_data
@@ -588,7 +549,7 @@ def train(opts:Any=None):
     try: os.nice(19)
     except: pass
 
-    (data,answers,sample_weights,test_data,test_answers) = load_data(opts)
+    (data,test) = load_data(opts)
     gc.collect()
     
     #print('Calculating loss weights')
@@ -600,23 +561,10 @@ def train(opts:Any=None):
     #weights = (np.sum(sums)-sums)/np.sum(sums)
     #print("Loss Weights",weights)
     
-    nsteps = len(data[0])
-    nfeat = len(data[0][0])
-    print("Data batches (x):",len(data)," Test batches (y):", len(test_data), "; Samples=",nsteps,"; Features=",nfeat)
-
-    #train_dataset = tf.data.Dataset.from_tensor_slices((data, answers)).batch(BATCH_SIZE)
-    train_dataset = DataGenerator(data, answers, sample_weights)
-    data = None
-    answers = None
-    gc.collect()
-
-    #test_dataset = tf.data.Dataset.from_tensor_slices((test_data, test_answers)).batch(BATCH_SIZE)
-    test_dataset = DataGenerator(test_data, test_answers)
-    have_test = test_answers is not None and len(test_answers) > 0
-    test_data = None
-    test_answers = None
-    gc.collect()
-
+    nsteps = len(data[0][0])
+    nfeat = len(data[0][0][0])
+    print(f"Data batches (x):{len(data)}; Test batches (y):{len(test)}; BatchSize={len(data[0])}; Samples={nsteps}; Features={nfeat}")
+    
     tfile = tempfile.NamedTemporaryFile(prefix='train-', suffix='.pycf.model.h5', )
     model_path = tfile.name
     
@@ -627,11 +575,11 @@ def train(opts:Any=None):
     #epoch = 19
 
     if True:
-        _train_some(model_path, train_dataset, test_dataset, epoch)
+        _train_some(model_path, data, test, epoch)
     else:
       while not stop:
         queue = Queue(1)
-        sub = Process(target=_train_proc, args=(model_path, train_dataset, test_dataset, epoch, queue))
+        sub = Process(target=_train_proc, args=(model_path, data, test, epoch, queue))
         sub.start()
 
         while sub.is_alive():
@@ -651,8 +599,8 @@ def train(opts:Any=None):
     print('Final Evaluation...')
 
     import keras
-    #dmetrics = model.evaluate(train_dataset, verbose=0)
-    tmetrics = keras.models.load_model(model_path).evaluate(test_dataset, verbose=1)
+    #dmetrics = model.evaluate(data, verbose=0)
+    tmetrics = keras.models.load_model(model_path).evaluate(test, verbose=1)
     print()
     #print(dmetrics)
     print(tmetrics)
@@ -757,8 +705,7 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
     oldsint = signal.signal(signal.SIGINT, handler)
     oldterm = signal.signal(signal.SIGTERM, handler)
 
-    if not model.stop_training:
-        model.fit(train_dataset, validation_data=test_dataset, epochs=EPOCHS, initial_epoch=epoch, callbacks=cb)
+    model.fit(train_dataset, validation_data=test_dataset, epochs=EPOCHS, initial_epoch=epoch, callbacks=cb)
 
     #model.save(model_path) the checkpoint already saved the vest version
     return (ecp.last_epoch+1, model.stop_training or ecp.last_epoch+1 >= EPOCHS)
@@ -776,8 +723,9 @@ def predict(feature_log:str|TextIO|dict, opts:Any, write_log=None)->list:
     
     assert(flog['frames'][-1][0] > frame_rate)
 
-    (times,data,answers,_) = flog_to_vecs(flog, clean=False)
-    assert(len(times) == len(data))
+    stuff = flog_to_vecs(flog, False)
+    times = stuff[0]
+    assert(len(times)>1)
 
     mf = opts.model_file
     if not mf and opts:
@@ -786,7 +734,7 @@ def predict(feature_log:str|TextIO|dict, opts:Any, write_log=None)->list:
         raise Exception(f"Model file '{mf}' does not exist")
     model:keras.models.Model = keras.models.load_model(mf)
 
-    prediction = model.predict(np.array(data, dtype='float32'), verbose=True, batch_size=BATCH_SIZE)
+    prediction = model.predict(WindowStackGenerator(stuff), verbose=True)
 
     result = np.argmax(prediction, axis=1)
     results = [(0,(0,0))]
