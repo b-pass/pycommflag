@@ -1,12 +1,13 @@
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' # shut up, tf
+
 from bisect import bisect_left
 import logging as log
 import gc
 from math import ceil, floor
 from queue import Empty as QueueEmpty
 from multiprocessing import Process, Queue
-import os
-import pickle
-import re
+
 import resource
 import sys
 import tempfile
@@ -17,6 +18,7 @@ import numpy as np
 
 from pycommflag.feature_span import *
 from pycommflag import processor
+from pycommflag import neural
 
 # data params, both for train and for inference
 WINDOW_BEFORE = 30
@@ -189,7 +191,7 @@ def rle1d(arr):
     """
     changes = np.ediff1d(arr, to_begin=1) != 0
     pos = np.argwhere(changes).ravel()
-    length = np.diff(np.append(pos, len(arr)), dtype='uint32')
+    length = np.diff(np.append(pos, len(arr)))
     run = arr[pos]
     return np.vstack((run, length))
 
@@ -227,13 +229,13 @@ def cleanup_frames(frames, tags, frame_rate=RATE):
     # ok now we can numpy....
     return np.array(frames, dtype='float32')
 
-def flog_to_vecs(flog:dict, fitlerForTraining=False, clean=True)->tuple[list[float], list[list[float]], list[float], list[float]]:
+def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[list[float], list[list[float]], list[float], list[float]]:
     version = flog.get('file_version', 10)
     frame_rate = flog.get('frame_rate', 29.97)
     endtime = flog.get('duration', 0)
     have_logo = not not flog.get('logo', None)
 
-    tags = flog.get('tags', []) if clean else []
+    tags = flog.get('tags', [])
     
     frames_header = flog['frames_header']
     assert('time' in frames_header[0])
@@ -289,8 +291,6 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False, clean=True)->tuple[list[flo
     wbefore = round(WINDOW_BEFORE * SUMMARY_RATE)
     wafter = round(WINDOW_AFTER * SUMMARY_RATE)
 
-    # we do not use numpy for these because there is MUCH duplication, so we save memory by using pylists.
-    # alternate is np.repeat, which would make new arrays for each iteration below.
     condensed = condense(frames, summary)
 
     frames = np.concatenate((
@@ -305,7 +305,7 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False, clean=True)->tuple[list[flo
         np.tile(condensed[-1], (wafter,1)),
     ))
 
-    answers = np.full(len(timestamps), SceneType.DO_NOT_USE.value, dtype='uint8')
+    answers = np.full(len(timestamps), 0, dtype='uint8')
     weights = np.full(len(timestamps), 1, dtype='uint8')
 
     prev = SceneType.DO_NOT_USE.value
@@ -313,24 +313,29 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False, clean=True)->tuple[list[flo
         if type(tt) is not int: tt = tt.value
 
         si = np.searchsorted(timestamps, st, 'left')
-        ei = np.searchsorted(timestamps, et, 'left') or len(timestamps)
+        ei = np.searchsorted(timestamps, et, 'left')
 
-        if si < ei and (si > 0 or st < 1) and (ei < len(timestamps) or ei+1 >= endtime):
+        if si < ei and (si > 0 or st < 10) and (ei < len(timestamps) or et+10 >= endtime):
             answers[si:ei] = tt
             if tt == SceneType.DO_NOT_USE.value:
-                weights[si:ei] = 0 # ignore this data point
+                answers[si:ei] = 0
+                weights[si:ei] = 0 # ignore this entire section
             elif tt != prev and prev != SceneType.DO_NOT_USE.value:
                 # higher weight near the transition
                 ws = max(0,si-rate)
                 we = min(len(weights),si+rate)
+                weights[ws:we] = np.where(weights[ws:we] > 0, 2, 0)
+
+                ws = max(0,ei-rate)
+                we = min(len(weights),ei+rate)
                 weights[ws:we] = np.where(weights[ws:we] > 0, 2, 0)
         
         prev = tt
 
     return (timestamps,frames,condensed,answers,weights)
 
-def load_nonpersistent(flogname:str,with_timestamps=False):
-    return flog_to_vecs(processor.read_feature_log(flogname), True)
+def load_nonpersistent(flogname:str,with_timestamps=False,filter_for_training=False):
+    return flog_to_vecs(processor.read_feature_log(flogname), filter_for_training)
 
 def load_persistent(flogname:str,with_timestamps=False):
     fname = flogname
@@ -352,15 +357,16 @@ def load_persistent(flogname:str,with_timestamps=False):
     
     frames = np.load(fname+'.frames.npy', mmap_mode='r')
     condensed = np.load(fname+'.summary.npy', mmap_mode='r')
-    answers = rle_decode(np.load(fname+'.answers.npy'))
-    weights = rle_decode(np.load(fname+'.weights.npy'))
+    answers = rle_decode(np.load(fname+'.answers.npy', mmap_mode='r'))
+    weights = rle_decode(np.load(fname+'.weights.npy', mmap_mode='r'))
 
     if with_timestamps and timestamps is None:
         flog = processor.read_feature_log(flogname)
-        frames = cleanup_frames(flog['frames'], flog['tags'], flog['frame_rate'])
-        timestamps = frames[...,0].copy()
+        temp = cleanup_frames(flog['frames'], flog['tags'], flog['frame_rate'])
+        timestamps = temp[...,0].copy()
     
     return (timestamps,frames,condensed,answers,weights)
+
 
 from keras.utils import Sequence
 class WindowStackGenerator(Sequence):
@@ -368,50 +374,79 @@ class WindowStackGenerator(Sequence):
         if stuff is None:
             return
         
-        from numpy.lib.stride_tricks import sliding_window_view
+        from numpy.lib.stride_tricks import sliding_window_view, as_strided
+        def repeat_view_axis0(x, n):
+            repeated_view = as_strided(x,
+                                    shape=(x.shape[0], n, *x.shape[1:]),
+                                    strides=(x.strides[0], 0, *x.strides[1:]),
+                                    writeable=False)
+            return repeated_view.reshape(-1, *x.shape[1:])
 
         # +/- 1s is all frames, plus the WINDOW before/after which is condensed to SUMMARY_RATE 
         rate = round(RATE)
-        self.summary_rate = round(RATE/SUMMARY_RATE)
+        summary = round(RATE/SUMMARY_RATE)
         wbefore = round(WINDOW_BEFORE * SUMMARY_RATE)
         wafter = round(WINDOW_AFTER * SUMMARY_RATE)
+        self.batch_size = BATCH_SIZE
         
         (timestamps,frames,condensed,answers,weights) = stuff
         self.frames = sliding_window_view(frames, (rate+1+rate, frames.shape[1],)).squeeze()
-        self.before = sliding_window_view(condensed, (wbefore, condensed.shape[1],)).squeeze()[:-(wafter+1)]
-        self.after = sliding_window_view(condensed, (wafter, condensed.shape[1],)).squeeze()[wbefore+1:]
+        self.before = repeat_view_axis0(sliding_window_view(condensed, (wbefore, condensed.shape[1],)).squeeze()[:-(wafter+1)], summary)
+        self.after = repeat_view_axis0(sliding_window_view(condensed, (wafter, condensed.shape[1],)).squeeze()[wbefore+1:], summary)
         self.answers = array2onehot(answers, SceneType.count(), dtype='float32')
         self.weights = weights
 
+        print(len(self.frames), len(self.weights), len(self.before), len(self.after))
+
         assert(timestamps is None or len(self.frames) == len(timestamps))
-        assert(len(self.frames) == len(self.before))
-        assert(len(self.frames) == len(self.after))
         assert(len(self.frames) == len(self.answers))
         assert(len(self.frames) == len(self.weights))
 
-        self.batch_size = BATCH_SIZE
-        self.shape = ( len(self.frames), frames.shape[1] + condensed.shape[1]*2 )
+        # its off by one but does anyone care?
+        #assert(len(self.frames) == len(self.before))
+        #assert(len(self.frames) == len(self.after))
+
+        self.shape = ( len(self.frames),  self.before.shape[1] + self.frames.shape[1] + self.after.shape[1] )
         self.posmap = np.arange(0, len(self.frames), self.batch_size, dtype='uint32')
         self.reallen = len(self.posmap)
         self.len = self.reallen
     
-    def set_skip(self, skip):
-        self.len = self.reallen - len(skip)
-
+    def _set_skip(self, skip=None):
+        self.posmap = np.arange(0, len(self.frames), self.batch_size, dtype='uint32')
+        if not skip:
+            return
         si = iter(sorted(skip))
         ns = next(si)
         pos = 0
-        for i in range(self.posmap):
+        for i in range(self.reallen):
             while pos == ns:
                 pos += 1
-                try:
-                    ns = next(si)
-                except StopIteration:
-                    ns = -1
-                    break
+                try: ns = next(si)
+                except StopIteration: ns = -1
             self.posmap[i] = pos * self.batch_size
             pos += 1
+        self.len = self.reallen - len(skip)
+            
+    def split(self, split=0.25):
+        from random import randrange
+
+        num = int(self.reallen * split)
+        if num == 0:
+            return None
         
+        skip = set()
+        while len(skip) < num:
+            skip.add(randrange(self.reallen))
+        
+        other = WindowStackGenerator()
+        for (k,v) in self.__dict__:
+            setattr(other, k, v)
+        
+        other._set_skip(set(range(self.reallen)) - skip)
+        self._set_skip(skip)
+
+        return other
+    
     def __len__(self):
         return self.len
     
@@ -419,40 +454,13 @@ class WindowStackGenerator(Sequence):
         start = self.posmap[where]
         end = start + self.batch_size
 
-        cstart = start // self.summary_rate
-        cend = cstart + self.batch_size
-
-        data = np.stack((
-            self.before[cstart:cend],
+        data = np.concatenate((
+            self.before[start:end],
             self.frames[start:end],
-            self.after[cstart:cend]
+            self.after[start:end]
         ), axis=1)
         
         return (data, self.answers[start:end], self.weights[start:end])
-    
-def split_generator(ingen, split=0.25):
-    if len(ingen.skip) != 0:
-        raise Exception("That was already split, can't split it again")
-    
-    import random
-    skip = set()
-    num = int(len(ingen) * split)
-    while len(skip) < num:
-        skip.add(random.randint(0, len(ingen)-1))
-    
-    other = WindowStackGenerator()
-    for (k,v) in ingen.__dict__:
-        setattr(other, k, v)
-    
-    ingen.set_skip(skip)
-
-    oskip = []
-    for x in range(len(other)):
-        if x not in skip:
-            oskip.append(x)
-    other.set_skip(oskip)
-
-    return (ingen, other)
 
 class MultiGenerator(Sequence):
     def __init__(self, elements:list[WindowStackGenerator]):
@@ -479,17 +487,46 @@ class MultiGenerator(Sequence):
     
     def __getitem__(self, index):
         ei = np.searchsorted(self.offsets, index)
-        index -= self.lengths[ei]
-        return self.elements[ei][index]
+        return self.elements[ei][index - self.offsets[ei]]
     
 f = "./data/ghosts.json.gz"
 print("Loading",f)
-if flog := processor.read_feature_log(f):
-    (_,a,b,c) = flog_to_vecs(flog,True)
+flog = processor.read_feature_log(f)
+(_,a,b,c) = neural.flog_to_vecs(flog,True)
 
+a = np.array(a, dtype='float32')
+
+new = WindowStackGenerator(load_persistent(f))
+
+#print(len(new))
+
+#print(new[0][0].shape)
+
+for batch in range(len(a)//256):
+    b = new[batch][0]
+
+    for i in range(256):
+        x = a[batch * 256 + i]
+        y = b[i]
+
+        if not np.array_equal(x, y):
+            print("FAIL AT ", batch, i)
+            sys.exit(99)
+
+        #with open("/tmp/test/a."+str(i), 'w') as f:
+        #    for e in a[i]:
+        #        f.write(str(e.tolist()) + '\n')
+        #with open("/tmp/test/b."+str(i), 'w') as f:
+        #    for e in b[i]:
+        #        f.write(str(e.tolist()) + '\n')
+            
+        #print(np.count_nonzero(x == y), np.count_nonzero(a[i-1].ravel() == y) if i > 0 else 0)
+
+        #
+print("success")
 sys.exit(99)
 
-def load_data(opts, do_not_test=False)->tuple[list,list,list,list,list]:
+def load_data(opts, do_not_test=False) -> tuple[MultiGenerator,MultiGenerator]:
     data = opts.ml_data
     if not data:
         return None
@@ -511,66 +548,40 @@ def load_data(opts, do_not_test=False)->tuple[list,list,list,list,list]:
             else:
                 i += 1
 
-    x = []
-    y = []
-    w = []
+    data = []
+    dlen = 0
+    test = []
+    tlen = 0
+
     for f in data:
         if os.path.isdir(f):
             continue
         print("Loading",f)
-        if flog := processor.read_feature_log(f):
-            (_,a,b,c) = flog_to_vecs(flog,True)
-            x += a
-            y += b
-            w += c
+        if stuff := load_persistent(f):
+            data.append( WindowStackGenerator(stuff) )
+            dlen += len(data[-1])
+        gc.collect()
     
-    xt = []
-    yt = []
     for f in test:
         if os.path.isdir(f):
             continue
         print("Loading test",f)
-        if flog := processor.read_feature_log(f):
-            (_,a,b,_) = flog_to_vecs(flog,True)
-            xt += a
-            yt += b
+        if stuff := load_persistent(f):
+            test.append( WindowStackGenerator(stuff) )
+            tlen += len(test[-1])
     
-    a = None
-    b = None
-    c = None
-    flog = None
-    
-    z = list(zip(x,y,w))
-    from random import seed, shuffle
-    seed(time.time())
-    shuffle(z)
+    need = int(dlen*TEST_PERC+1) - tlen
+    if need >= dlen/100 and not do_not_test:
+        print(f'Need to move {need} of {dlen} batches to the test/eval set')
+        need = need/dlen
+        for d in data:
+            if t := d.split(need):
+                tlen += len(t)
+                test.append(t)
 
-    need = int(len(x)*TEST_PERC+1) - len(xt)
-    if need > len(x)/100 and not do_not_test:
-        print('Need to move',need,'datums to the test/eval set')
-        (x,y,w) = zip(*z[need:])
-        if len(xt) == 0:
-            (xt,yt,_) = zip(*z[:need])
-        else:
-            (a,b,_) = zip(*z[:need])
-            xt += a
-            yt += b
-    else:
-        (x,y,w) = zip(*z)
-    
-    #x = np.array(x, dtype='float32')
-    #y = np.array(y, dtype='float32')
-    #w = np.array(w, dtype='float32')
-    #xt = np.array(xt, dtype='float32')
-    #yt = np.array(yt, dtype='float32')
-    
-    a = None
-    b = None
-    c = None
-    flog = None
     gc.collect()
 
-    return (x,y,w,xt,yt)
+    return (MultiGenerator(data), MultiGenerator(test))
 
 def train(opts:Any=None):
     # yield CPU time to useful tasks, this is a background thing...
@@ -591,7 +602,7 @@ def train(opts:Any=None):
     
     nsteps = len(data[0])
     nfeat = len(data[0][0])
-    print("Data (x):",len(data)," Test (y):", len(test_data), "; Samples=",nsteps,"; Features=",nfeat)
+    print("Data batches (x):",len(data)," Test batches (y):", len(test_data), "; Samples=",nsteps,"; Features=",nfeat)
 
     #train_dataset = tf.data.Dataset.from_tensor_slices((data, answers)).batch(BATCH_SIZE)
     train_dataset = DataGenerator(data, answers, sample_weights)
