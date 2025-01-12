@@ -7,7 +7,6 @@ from queue import Queue
 import re
 from threading import Thread
 import time
-import scipy.signal as spsig
 from typing import Any,TextIO, TextIO
 
 from . import logo_finder, mythtv
@@ -327,11 +326,14 @@ class AudioProc(Thread):
         # resample to 16 kHz
         return (
             t, 
-            spsig.resample_poly(main, 16000, sr, padtype='mean'), 
-            spsig.resample_poly(surr, 16000, sr, padtype='mean') if surr is not None else None,
+            self.spsig.resample_poly(main, 16000, sr, padtype='mean'), 
+            self.spsig.resample_poly(surr, 16000, sr, padtype='mean') if surr is not None else None,
         )
 
     def run(self):
+        import scipy.signal as spsig
+        self.spsig = spsig
+        
         main = np.empty(0, 'float32')
         surr = np.empty(0, 'float32')
         cur = 0.0

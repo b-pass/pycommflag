@@ -1,11 +1,12 @@
-from typing import Any, BinaryIO
-import numpy as np
-import scipy.ndimage
-import math
-import logging as log
 from av.video import VideoFrame
+from scipy.ndimage import sobel as scipy_sobel
+import logging as log
+import math
+import numpy as np
+from typing import Any, BinaryIO
 
 from .player import Player
+
 _LOGO_EDGE_THRESHOLD = 85 # how strong an edge is strong enough?
 
 def search(player:Player, search_beginning:bool=False, opts:Any=None) -> tuple|None:
@@ -31,7 +32,7 @@ def search(player:Player, search_beginning:bool=False, opts:Any=None) -> tuple|N
             r = 0
             print("Logo Searching, %3.1f%%    " % (min(fcount/percent,100.0)), end='\r')
         data = _gray(frame)
-        logo_sum += scipy.ndimage.sobel(data) > _LOGO_EDGE_THRESHOLD
+        logo_sum += scipy_sobel(data) > _LOGO_EDGE_THRESHOLD
         fcount += 1
         if fcount >= ftotal: 
             break
@@ -175,7 +176,7 @@ def logo_in_frame(frame :VideoFrame, logo :tuple) -> tuple[int, int]:
     
     ((top,left),(bottom,right),lmask,thresh,*_) = logo
     c = _gray(frame, [top,bottom,left,right])
-    c = scipy.ndimage.sobel(c) > _LOGO_EDGE_THRESHOLD
+    c = scipy_sobel(c) > _LOGO_EDGE_THRESHOLD
     c = np.where(lmask, c, False)
     #print('\n!',np.count_nonzero(c),'of',np.count_nonzero(lmask),'!')
     n = np.count_nonzero(c)
