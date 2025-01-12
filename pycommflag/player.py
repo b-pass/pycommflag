@@ -4,6 +4,7 @@ import errno
 import logging as log
 import av.container
 import numpy as np
+import os
 
 class Player:
     def __init__(self, filename:str, no_deinterlace:bool=False):
@@ -38,12 +39,13 @@ class Player:
         if not no_deinterlace:
             if inter*10 > ninter:
                 self.interlaced = True
-                log.debug(f"{inter} interlaced frames (and {ninter} not), means we will deinterlace.")
+                log.info(f"{inter} interlaced frames (and {ninter} not), means we will deinterlace.")
                 self._create_graph()
             else:
                 log.debug(f"We will NOT deinterlace (had {inter} interlaced frames and {ninter} non-interlaced frames)")
                 self.interlaced = False
         else:
+            log.debug(f"Deinterlace is disabled, so we will NOT deinterlace (had {inter} interlaced frames and {ninter} non-interlaced frames)")
             self.interlaced = False
         log.debug(f"Video {filename} is {self.shape} at {float(self.frame_rate)} fps for {self.duration} seconds totalling {int(self.duration * self.frame_rate)} frames)")
     
@@ -198,6 +200,9 @@ class Player:
                 if frame is None: continue
             except StopIteration:
                 break
+            except av.error.PatchWelcomeError as wtf:
+                log.critical(str(wtf))
+                os._exit(134)
             except (av.error.InvalidDataError,av.error.UndefinedError) as e:
                 fail += 1
                 vs = self.container.streams.video[self.streams.get('video', 0)]
@@ -214,7 +219,6 @@ class Player:
                         if good >= self.frame_rate * 600:
                             return
                         else:
-                            import os
                             os._exit(134)
                         raise
                     self._resync(self.vpts)
@@ -256,9 +260,9 @@ class Player:
         if self.graph or 'audio' in self.streams:
             count = 0
             for frame in self.frames():
-                count += 1
                 if (count%skip) == 0:
                     yield frame
+                count += 1
             return
         
         fail = 0
@@ -284,6 +288,9 @@ class Player:
                 frame = frames[0]
             except StopIteration:
                 break
+            except av.error.PatchWelcomeError as wtf:
+                log.critical(str(wtf))
+                os._exit(134)
             except (av.error.InvalidDataError,av.error.UndefinedError) as e:
                 fail += 1
                 vs = self.container.streams.video[self.streams.get('video', 0)]
