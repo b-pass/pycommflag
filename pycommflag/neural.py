@@ -201,34 +201,6 @@ def rle_decode(rle):
 def array2onehot(arr, nclasses, dtype='float32'):
     return np.eye(nclasses, dtype=dtype)[arr]
 
-def cleanup_frames(frames, tags, frame_rate=RATE):
-    if frames and frames[0] is None: 
-        frames = frames[1:]
-    
-    if len(frames) < frame_rate:
-        return None
-    
-    if len(tags) > 1 and tags[-1][0] in (SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value) and tags[-1][1][1]+10 >= endtime:
-        flog['duration'] = endtime = min(endtime, tags[-1][1][0])
-        e = len(frames) - 1
-        while frames[e][0] >= endtime and e > 0:
-            e -= 1
-        if e > 0:
-            del frames[e+1:]
-    
-    if len(tags) > 1 and tags[0][0] in (SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value) and tags[0][1][0] <= 5:
-        b = 0
-        while frames[b][0] < tags[0][1][1]:
-            b += 1
-        if b:
-            del frames[:b]
-
-    if len(frames) < (WINDOW_BEFORE + WINDOW_AFTER) * 2 * round(RATE):
-        return None
-    
-    # ok now we can numpy....
-    return np.array(frames, dtype='float32')
-
 def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[np.ndarray,np.ndarray]:
     version = flog.get('file_version', 10)
     frame_rate = flog.get('frame_rate', 29.97)
@@ -263,7 +235,34 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[np.ndarray,np.ndarra
             else:
                 i += 1
     
-    frames = cleanup_frames(flog['frames'], tags, frame_rate)
+    frames = flog['frames']
+
+    if frames and frames[0] is None: 
+        frames = frames[1:]
+    
+    if len(frames) < frame_rate:
+        return None
+    
+    if len(tags) > 1 and tags[-1][0] in (SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value) and tags[-1][1][1]+10 >= endtime:
+        flog['duration'] = endtime = min(endtime, tags[-1][1][0])
+        e = len(frames) - 1
+        while frames[e][0] >= endtime and e > 0:
+            e -= 1
+        if e > 0:
+            del frames[e+1:]
+    
+    if len(tags) > 1 and tags[0][0] in (SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value) and tags[0][1][0] <= 5:
+        b = 0
+        while frames[b][0] < tags[0][1][1]:
+            b += 1
+        if b:
+            del frames[:b]
+
+    if len(frames) < (WINDOW_BEFORE + WINDOW_AFTER) * 2 * round(RATE):
+        return None
+    
+    # ok now we can numpy....
+    frames = np.array(frames, dtype='float32')
 
     if not have_logo:
         frames[..., 1] = 0
@@ -275,7 +274,7 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[np.ndarray,np.ndarra
     frames = np.append(frames, (frames[...,0]/endtime)[:,np.newaxis], axis=1)
 
     # add a column for with the real timestamps
-    frames = np.append(frames, frames[...,0], axis=1)
+    frames = np.append(frames, frames[...,0].reshape((-1,1)), axis=1)
 
     # change the first column to be normalized timestamps (30 minute segments)
     frames[...,0] = (frames[...,0] % 1800.0) / 1800.0
@@ -335,6 +334,8 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[np.ndarray,np.ndarra
         np.tile(condensed[-1], (wafter,1)),
     ))
 
+    condensed = np.repeat(condensed, summary, axis=0)
+
     return (frames,condensed)
 
 def load_persistent(flogname:str,for_training=True):
@@ -359,20 +360,19 @@ def load_persistent(flogname:str,for_training=True):
 def load_nonpersistent(flog:dict,for_training=False):
     return flog_to_vecs(flog, for_training)
 
+def sliding_window_skip(arr, window_size, repeat_skip):
+    # Calculate the shape and strides for the sliding window view over an array that had np.repeat previously run on it
+    from numpy.lib.stride_tricks import as_strided
+    new_shape = (arr.shape[0] - (window_size-1)*repeat_skip, window_size, arr.shape[1])
+    new_strides = (arr.strides[0], arr.strides[0] * repeat_skip, arr.strides[1])
+    return as_strided(arr, shape=new_shape, strides=new_strides, writeable=False)
+
 from keras.utils import Sequence
 class WindowStackGenerator(Sequence):
     def __init__(self, stuff=None, ordered=True):
         if stuff is None:
             return
         
-        from numpy.lib.stride_tricks import sliding_window_view, as_strided
-        def repeat_view_axis0(x, n):
-            v = as_strided(x,
-                           shape=(x.shape[0], n, *x.shape[1:]),
-                           strides=(x.strides[0], 0, *x.strides[1:]),
-                           writeable=False)
-            return v.reshape(-1, *x.shape[1:])
-
         # +/- 1s is all frames, plus the WINDOW before/after which is condensed to SUMMARY_RATE 
         rate = round(RATE)
         summary = round(RATE/SUMMARY_RATE)
@@ -385,21 +385,26 @@ class WindowStackGenerator(Sequence):
         # frames has been tile with rate on each side and has timestamps,answers,weights concatted...
         # unpack all that
         self.timestamps = frames[rate:-rate,-3]
-        self.answers = array2onehot(frames[rate:-rate:,-2], SceneType.count(), dtype='float32')
+        self.answers = array2onehot(frames[rate:-rate:,-2].astype('uint32'), SceneType.count(), dtype='float32')
         self.weights = frames[rate:-rate:,-1]
         frames = frames[:, :-3]
         
+        from numpy.lib.stride_tricks import sliding_window_view
         self.frames = sliding_window_view(frames, (rate+1+rate, frames.shape[1],)).squeeze()
-        self.before = repeat_view_axis0(sliding_window_view(condensed, (wbefore, condensed.shape[1],)).squeeze(), summary)
-        self.after = repeat_view_axis0(sliding_window_view(condensed, (wafter, condensed.shape[1],)).squeeze()[wbefore+1:], summary)
+        self.before = sliding_window_skip(condensed[:-(wafter+1)*summary], wbefore, summary)
+        self.after = sliding_window_skip(condensed[(wbefore+1)*summary:], wafter, summary)
 
+        assert(np.shares_memory(frames, self.frames))
         assert(len(self.frames) == len(self.timestamps))
         assert(len(self.frames) == len(self.answers))
         assert(len(self.frames) == len(self.weights))
 
         # truncate these if they are a little over-size from being repeated
+        #print(len(self.before), len(self.frames), len(self.after))
         self.before = self.before[:len(self.frames)]
         self.after = self.after[:len(self.frames)]
+        assert(np.shares_memory(condensed, self.before))
+        assert(np.shares_memory(condensed, self.after))
 
         self.stride = len(self.frames) // self.batch_size # we want every N to add up to about the Batch Size
         self.len = ceil(len(self.frames) / self.batch_size)
@@ -411,12 +416,12 @@ class WindowStackGenerator(Sequence):
     def split(self, split=0.75):
         a = WindowStackGenerator()
         b = WindowStackGenerator()
-        for (k,v) in self.__dict__:
+        for (k,v) in self.__dict__.items():
             setattr(a, k, v)
             setattr(b, k, v)
         
         a.offset = 0
-        a.len = (len(self.frames) * split) // self.batch_size
+        a.len = ceil( (len(self.frames) * split) / self.batch_size )
         a.shape = (a.len,) + a.shape[1:]
 
         b.offset = a.len
@@ -428,8 +433,11 @@ class WindowStackGenerator(Sequence):
     def __len__(self):
         return self.len
     
+    def __getitem__(self, index):
+        return self.getter(index)
+    
     def set_ordered(self, ordered=True):
-        self.__getitem__ = self.get_ordered if self.ordered else self.get_unordered
+        self.getter = self.get_ordered if ordered else self.get_unordered
     
     def get_ordered(self, index):
         index = (index + self.offset) * self.batch_size
@@ -460,17 +468,15 @@ class MultiGenerator(Sequence):
         self.lengths = []
         self.offsets = []
         self.len = 0
-        self.shape = None
+        shape = self.elements[0].shape[1:]
         for e in self.elements:
-            if self.shape is None:
-                self.shape = e.shape
-            else:
-                assert(e.shape == self.shape)
+            assert(e.shape[1:] == shape)
             
             x = len(e)
             self.lengths.append(x)
             self.offsets.append(self.len)
             self.len += x
+        self.shape = (self.len,) + shape
         self.offsets = np.array(self.offsets, dtype='uint32')
         
     def shuffle(self):
@@ -484,46 +490,46 @@ class MultiGenerator(Sequence):
         return self.len
     
     def __getitem__(self, index):
-        ei = np.searchsorted(self.offsets, index)
+        ei = min(np.searchsorted(self.offsets, index), len(self.offsets)-1)
         return self.elements[ei][index - self.offsets[ei]]
 
 def load_data(opts, do_not_test=False) -> tuple[MultiGenerator,MultiGenerator]:
-    data = opts.ml_data
-    if not data:
+    datafiles = opts.ml_data
+    if not datafiles:
         return None
     
-    test = []
+    testfiles = []
 
-    if 'TEST' in data:
-        i = data.index('TEST')
-        test = data[i+1:]
-        data = data[:i]
+    if 'TEST' in datafiles:
+        i = datafiles.index('TEST')
+        testfiles = datafiles[i+1:]
+        datafiles = datafiles[:i]
 
         i = 0
-        while i < len(data):
-            if not os.path.exists(data[i]):
-                print(data[i], "does not exist!!")
-                del data[i]
-            elif data[i] in test or not os.path.isfile(data[i]):
-                del data[i]
+        while i < len(datafiles):
+            if not os.path.exists(datafiles[i]):
+                print(datafiles[i], "does not exist!!")
+                del datafiles[i]
+            elif datafiles[i] in testfiles or not os.path.isfile(datafiles[i]):
+                del datafiles[i]
             else:
                 i += 1
 
-    data = []
     dlen = 0
-    test = []
+    data = []
     tlen = 0
+    test = []
 
-    for f in data:
-        if os.path.isdir(f):
+    for f in datafiles:
+        if os.path.isdir(f) or f.endswith('.npy'):
             continue
         print("Loading",f)
         if stuff := load_persistent(f, True):
             data.append( WindowStackGenerator(stuff, ordered=False) )
             dlen += len(data[-1])
     
-    for f in test:
-        if os.path.isdir(f):
+    for f in testfiles:
+        if os.path.isdir(f) or f.endswith('.npy'):
             continue
         print("Loading test",f)
         if stuff := load_persistent(f, True):
@@ -531,7 +537,7 @@ def load_data(opts, do_not_test=False) -> tuple[MultiGenerator,MultiGenerator]:
             tlen += len(test[-1])
     
     need = int(dlen*TEST_PERC+1) - tlen
-    if need >= dlen/100 and not do_not_test:
+    if need > dlen/100 and not do_not_test:
         print(f'Need to move {need} of {dlen} batches to the test/eval set')
         datakeep = 1 - need/dlen
         orig = data
