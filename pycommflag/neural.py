@@ -34,16 +34,6 @@ EPOCHS = 40
 BATCH_SIZE = 256
 TEST_PERC = 0.25
 
-SceneType_one_hot = {SceneType.DO_NOT_USE: [0] * SceneType.count(),
-                     SceneType.DO_NOT_USE.value: [0] * SceneType.count()}
-for i in range(0, SceneType.count()):
-    import numpy as np
-    x = [0] * SceneType.count()
-    x[i] = 1
-    SceneType_one_hot[i] = np.array(x, dtype='float32')
-    SceneType_one_hot[SceneType(i)] = SceneType_one_hot[i]
-
-
 def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]], 
                 blanks: List[Tuple[bool, Tuple[float, float]]], 
                 diffs: List[Tuple[float, Tuple[float, float]]], 
@@ -167,7 +157,7 @@ def condense(frames: np.ndarray, step: int) -> np.ndarray:
         # Update only the features that need condensing
         condensed[:, 1] = np.mean(valid_frames[:, :, 1], axis=1, dtype='float32')  # Average logo
         condensed[:, 2] = np.mean(valid_frames[:, :, 2], axis=1, dtype='float32')  # Average blank
-        condensed[:, 3] = np.count_nonzero(valid_frames[:, :, 3] > 15, axis=1) / step  # Diff ratio
+        condensed[:, 3] = np.count_nonzero(valid_frames[:, :, 3] >= 0.5, axis=1) / step  # Diff ratio
     else:
         condensed = None
     
@@ -177,7 +167,7 @@ def condense(frames: np.ndarray, step: int) -> np.ndarray:
         last_condensed = last_frames[len(last_frames)//2].copy()  # Keep all features from middle remaining frame
         last_condensed[1] = np.mean(last_frames[:, 1], dtype='float32')  # Average logo
         last_condensed[2] = np.mean(last_frames[:, 2], dtype='float32')  # Average blank
-        last_condensed[3] = np.count_nonzero(last_frames[:, 3] > 15) / remaining  # Diff ratio
+        last_condensed[3] = np.count_nonzero(last_frames[:, 3] >= 0.5) / remaining  # Diff ratio
         if condensed is not None:
             return np.vstack((condensed, last_condensed))
         else:
@@ -896,3 +886,40 @@ def eval(opts:Any):
     
     print()
     print("Done")
+
+def _sanity_check(f):
+    print("Loading",f)
+    flog = processor.read_feature_log(f)
+    (_,a,b,c) = OLDneural.flog_to_vecs(flog,True)
+
+    a = np.array(a, dtype='float32')
+
+    new = WindowStackGenerator(load_persistent(f))
+
+    #print(len(new))
+
+    #print(new[0][0].shape)
+
+    for batch in range(len(a)//256):
+        print(batch,"of",len(a)//256)
+        b = new[batch][0]
+
+        for i in range(256):
+            x = a[batch * 256 + i]
+            y = b[i]
+
+            with open("/tmp/test/a."+str(i), 'w') as f:
+                for e in x:
+                    f.write(str(e.tolist()) + '\n')
+            with open("/tmp/test/b."+str(i), 'w') as f:
+                for e in y:
+                    f.write(str(e.tolist()) + '\n')
+            
+            #print(np.count_nonzero(x == y), np.count_nonzero(x != y))
+
+            if not np.array_equal(x, y):
+                print("FAIL AT ", batch, i)
+                sys.exit(99)
+
+    print("success")
+    sys.exit(99)
