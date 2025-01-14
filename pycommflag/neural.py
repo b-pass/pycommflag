@@ -1,7 +1,6 @@
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' # shut up, tf
 
-from bisect import bisect_left
 import logging as log
 import gc
 from math import ceil, floor
@@ -164,7 +163,7 @@ def condense(frames: np.ndarray, step: int) -> np.ndarray:
     if remaining:
         # Do the final, partial condensing
         last_frames = frames[-remaining:]
-        last_condensed = last_frames[len(last_frames)//2].copy()  # Keep all features from middle remaining frame
+        last_condensed = last_frames[remaining//2].copy()  # Keep all features from middle remaining frame
         last_condensed[1] = np.mean(last_frames[:, 1], dtype='float32')  # Average logo
         last_condensed[2] = np.mean(last_frames[:, 2], dtype='float32')  # Average blank
         last_condensed[3] = np.count_nonzero(last_frames[:, 3] >= 0.5) / remaining  # Diff ratio
@@ -174,19 +173,6 @@ def condense(frames: np.ndarray, step: int) -> np.ndarray:
             return last_condensed
     else:
         return condensed
-
-def rle1d(arr):
-    """
-    Run Length encoding for a 1D numpy array.
-    """
-    changes = np.ediff1d(arr, to_begin=1) != 0
-    pos = np.argwhere(changes).ravel()
-    length = np.diff(np.append(pos, len(arr)))
-    run = arr[pos]
-    return np.vstack((run, length))
-
-def rle_decode(rle):
-    return np.repeat(rle[0], rle[1])
 
 def array2onehot(arr, nclasses, dtype='float32'):
     return np.eye(nclasses, dtype=dtype)[arr]
@@ -233,20 +219,22 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[np.ndarray,np.ndarra
     if len(frames) < frame_rate:
         return None
     
-    if len(tags) > 1 and tags[-1][0] in (SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value) and tags[-1][1][1]+10 >= endtime:
+    if tags and tags[-1][0] in (SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value) and tags[-1][1][1]+10 >= endtime:
         flog['duration'] = endtime = min(endtime, tags[-1][1][0])
         e = len(frames) - 1
         while frames[e][0] >= endtime and e > 0:
             e -= 1
         if e > 0:
             del frames[e+1:]
+        del tags[-1]
     
-    if len(tags) > 1 and tags[0][0] in (SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value) and tags[0][1][0] <= 5:
+    if tags and tags[0][0] in (SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value) and tags[0][1][0] <= 5:
         b = 0
         while frames[b][0] < tags[0][1][1]:
             b += 1
         if b:
             del frames[:b]
+        del tags[0]
 
     if len(frames) < (WINDOW_BEFORE + WINDOW_AFTER) * 2 * round(RATE):
         return None
@@ -263,17 +251,17 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[np.ndarray,np.ndarra
     # add a column for time percentage
     frames = np.append(frames, (frames[...,0]/endtime)[:,np.newaxis], axis=1)
 
-    # add a column for with the real timestamps
+    # add a column for with the real timestamps [-3]
     frames = np.append(frames, frames[...,0].reshape((-1,1)), axis=1)
+
+    # add a column for answers [-2] and a column for weights [-1]
+    frames = np.insert(frames, frames.shape[1], [[SceneType.SHOW.value], [1]], axis=1)
 
     # change the first column to be normalized timestamps (30 minute segments)
     frames[...,0] = (frames[...,0] % 1800.0) / 1800.0
 
     # normalize frame diffs to ~30
     frames[...,3] = np.clip(frames[...,3] / 30, 0, 1.0)
-
-    # add a column for answers and a column for weights
-    frames = np.insert(frames, frames.shape[1], [[0], [1]], axis=1)
 
     # +/- 1s is all frames, plus the WINDOW before/after which is condensed to SUMMARY_RATE 
     rate = round(RATE)
@@ -285,33 +273,32 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[np.ndarray,np.ndarra
     answers = frames[:, -2]
     weights = frames[:, -1]
 
-    prev = SceneType.DO_NOT_USE.value
-    for (tt,(st,et)) in tags:
-        if type(tt) is not int: tt = tt.value
-
-        si = np.searchsorted(timestamps, st, 'left')
-        ei = np.searchsorted(timestamps, et, 'left')
-
-        if si < ei and (si > 0 or st < 10) and (ei < len(timestamps) or et+10 >= endtime):
-            answers[si:ei] = tt
-            if tt == SceneType.DO_NOT_USE.value:
-                answers[si:ei] = 0
-                weights[si:ei] = 0 # ignore this entire section
-            elif tt != prev and prev != SceneType.DO_NOT_USE.value:
-                # higher weight near the transition
-                ws = max(0,si-rate)
-                we = min(len(weights),si+rate)
-                weights[ws:we] = np.where(weights[ws:we] > 0, 2, 0)
-
-                ws = max(0,ei-rate)
-                we = min(len(weights),ei+rate)
-                weights[ws:we] = np.where(weights[ws:we] > 0, 2, 0)
-        
-        prev = tt
-
     # dont condense timestamps, answers, weights
     condensed = condense(frames[...,:-3], summary)
 
+    for (tt,(st,et)) in tags:
+        if type(tt) is not int: tt = tt.value
+
+        si = np.searchsorted(timestamps, st)
+        ei = np.searchsorted(timestamps, et)
+
+        if tt == SceneType.DO_NOT_USE.value:
+            weights[si:ei] = 0 # ignore this entire section
+        else:
+            answers[si:ei] = tt
+            
+            # higher weight near the transition
+            for i in (si,ei):
+                ws = max(0,i-rate)
+                we = min(len(weights),i+rate)
+                if ws > 0 and we < len(weights):
+                    weights[ws:we] = np.where(weights[ws:we] > 0, 2, 0)
+
+    #for w in range(3):
+    #    print(f'{w}) {np.count_nonzero(weights == w)}')
+    #for x in range(SceneType.count()+1):
+    #    print(f'{SceneType(x)}) {np.count_nonzero(answers == x)}')
+    
     frames = np.concatenate((
         np.tile(frames[0], (rate,1)),
         frames,
@@ -375,8 +362,8 @@ class WindowStackGenerator(Sequence):
         # frames has been tile with rate on each side and has timestamps,answers,weights concatted...
         # unpack all that
         self.timestamps = frames[rate:-rate,-3]
-        self.answers = array2onehot(frames[rate:-rate:,-2].astype('uint32'), SceneType.count(), dtype='float32')
-        self.weights = frames[rate:-rate:,-1]
+        self.answers = array2onehot(frames[rate:-rate,-2].astype('uint32'), SceneType.count(), dtype='float32')
+        self.weights = frames[rate:-rate,-1]
         frames = frames[:, :-3]
         
         from numpy.lib.stride_tricks import sliding_window_view
@@ -390,7 +377,8 @@ class WindowStackGenerator(Sequence):
         assert(len(self.frames) == len(self.weights))
 
         # truncate these if they are a little over-size from being repeated
-        #print(len(self.before), len(self.frames), len(self.after))
+        assert(len(self.frames) <= len(self.before))
+        assert(len(self.frames) <= len(self.after))
         self.before = self.before[:len(self.frames)]
         self.after = self.after[:len(self.frames)]
         assert(np.shares_memory(condensed, self.before))
@@ -410,15 +398,26 @@ class WindowStackGenerator(Sequence):
             setattr(a, k, v)
             setattr(b, k, v)
         
+        from random import randrange
+
+        swap = randrange(2) == 0
+        if swap:
+            split = 1 - split
+
+        a.set_ordered(False)
         a.offset = 0
         a.len = ceil( (len(self.frames) * split) / self.batch_size )
         a.shape = (a.len,) + a.shape[1:]
 
+        b.set_ordered(False)
         b.offset = a.len
         b.len = self.len - a.len
         b.shape = (b.len,) + b.shape[1:]
         
-        return (a,b)
+        if swap:
+            return (b,a)
+        else:
+            return (a,b)
     
     def __len__(self):
         return self.len
@@ -435,7 +434,7 @@ class WindowStackGenerator(Sequence):
         data = np.concatenate((
             self.before[index:endex],
             self.frames[index:endex],
-            self.after[index:endex]
+            self.after [index:endex],
         ), axis=1)
         return (data, self.answers[index:endex], self.weights[index:endex])
     
@@ -444,7 +443,7 @@ class WindowStackGenerator(Sequence):
         data = np.concatenate((
             self.before[index::self.stride],
             self.frames[index::self.stride],
-            self.after[index::self.stride]
+            self.after [index::self.stride],
         ), axis=1)
         return (data, self.answers[index::self.stride], self.weights[index::self.stride])
     
@@ -480,7 +479,7 @@ class MultiGenerator(Sequence):
         return self.len
     
     def __getitem__(self, index):
-        ei = min(np.searchsorted(self.offsets, index), len(self.offsets)-1)
+        ei = np.searchsorted(self.offsets, index, 'right')-1
         return self.elements[ei][index - self.offsets[ei]]
 
 def load_data(opts, do_not_test=False) -> tuple[MultiGenerator,MultiGenerator]:
@@ -515,7 +514,7 @@ def load_data(opts, do_not_test=False) -> tuple[MultiGenerator,MultiGenerator]:
             continue
         print("Loading",f)
         if stuff := load_persistent(f, True):
-            data.append( WindowStackGenerator(stuff, ordered=False) )
+            data.append( WindowStackGenerator(stuff) )
             dlen += len(data[-1])
     
     for f in testfiles:
@@ -523,7 +522,7 @@ def load_data(opts, do_not_test=False) -> tuple[MultiGenerator,MultiGenerator]:
             continue
         print("Loading test",f)
         if stuff := load_persistent(f, True):
-            test.append( WindowStackGenerator(stuff, ordered=False) )
+            test.append( WindowStackGenerator(stuff) )
             tlen += len(test[-1])
     
     need = int(dlen*TEST_PERC+1) - tlen
