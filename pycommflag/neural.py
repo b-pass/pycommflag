@@ -666,8 +666,11 @@ def _train_some(model_path, train_dataset:MultiGenerator, test_dataset:MultiGene
 
     cb = []
 
-    cb.append(keras.callbacks.EarlyStopping(monitor='categorical_accuracy', patience=10))
-    cb.append(keras.callbacks.EarlyStopping(monitor='val_categorical_accuracy', patience=10))
+    from keras import callbacks
+
+    cb.append(callbacks.EarlyStopping(monitor='categorical_accuracy', patience=10))
+    cb.append(callbacks.EarlyStopping(monitor='val_categorical_accuracy', patience=10))
+    cb.append(callbacks.ReduceLROnPlateau(patience=7))
     
     class EpochCheckpoint(callbacks.ModelCheckpoint):
         def on_epoch_end(self, epoch, logs=None):
@@ -690,7 +693,6 @@ def _train_some(model_path, train_dataset:MultiGenerator, test_dataset:MultiGene
                 print(f'Now using too much memory ({rss//1024}MB)! {change//1024}MB more than at start which was {self.start_rss//1024}MB')
                 self.model.stop_training = True
                 self.exceeded = True
-
     #cb.append(MemoryChecker())
     
     def handler(signum, frame):
@@ -842,14 +844,14 @@ def eval_many(opts:Any):
                 print('Load failed')
                 continue
         except Exception as e:
-            print(str(e))
+            log.exception(f"Unable to load {f}")
             continue
         
         for mf in opts.eval:
             try:
                 print(f,mf,keras.models.load_model(mf).evaluate(dataset))
             except Exception as e:
-                print(f,mf,str(e))
+                log.exception(f"Unable to load MODEL {mf}")
         print()
     
     print()

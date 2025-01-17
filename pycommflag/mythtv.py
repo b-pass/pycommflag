@@ -195,12 +195,18 @@ def set_breaks(opts, marks, flog=None)->bool:
             (o,m) = c.fetchone()
             fe = int(m) + round((e - o/1000) * rate)
             
+            if fb >= fe: # sanity
+                continue
+            
             if st == SceneType.COMMERCIAL:
                 nbreaks += 1
                 log.debug(f".... {st} {fb} {fe}")
-                c.execute("INSERT INTO recordedmarkup (chanid,starttime,mark,type) "\
-                          "VALUES(%s,%s,%s,4),(%s,%s,%s,5);",
-                          (chanid, starttime, fb, chanid, starttime, fe))
+                try:
+                    c.execute("INSERT INTO recordedmarkup (chanid,starttime,mark,type) "\
+                            "VALUES(%s,%s,%s,4),(%s,%s,%s,5);",
+                            (chanid, starttime, fb, chanid, starttime, fe))
+                except Exception as e:
+                    log.exception("error adding break segment")
             elif st == SceneType.INTRO:
                 intro = (chanid, starttime,fe)
             elif st == SceneType.CREDITS and not cred_done:
