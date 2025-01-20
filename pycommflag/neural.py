@@ -34,9 +34,9 @@ BATCH_SIZE = 256
 TEST_PERC = 0.25
 
 def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]], 
-                blanks: List[Tuple[bool, Tuple[float, float]]], 
-                diffs: List[Tuple[float, Tuple[float, float]]], 
-                duration: float) -> List[Tuple[int, Tuple[float, float]]]:
+                 blanks: List[Tuple[bool, Tuple[float, float]]], 
+                 diffs: List[Tuple[float, Tuple[float, float]]]) \
+        -> List[Tuple[int, Tuple[float, float]]]:
     """
     Adjust tag boundaries to align with scene transitions using blank frames and diff values.
     This is because the training data is supplied by humans, and might be off a bit.
@@ -77,8 +77,10 @@ def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]],
 
     def find_nearest_blank(target_time: float, 
                          blanks: List[Tuple[bool, Tuple[float, float]]], 
-                         max_distance: float) -> float:
-        nearest_time = target_time
+                         max_distance: float,
+                         left=True) -> float:
+
+        nearest_time = None
         min_distance = max_distance
         
         for is_blank, (start, end) in blanks:
@@ -90,13 +92,16 @@ def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]],
 
             if abs(start - target_time) < min_distance:
                 min_distance = abs(start - target_time)
-                nearest_time = start
+                nearest_time = (start,end)
             
             if abs(end - target_time) < min_distance:
                 min_distance = abs(end - target_time)
-                nearest_time = end
+                nearest_time = (start,end)
         
-        return nearest_time if min_distance < max_distance else target_time
+        # we exclude the blanks from the tag, so on the left side we use the end/nearest[1]
+        # and on the right we use the begin/nearest[0]
+
+        return nearest_time[int(left)] if nearest_time is not None else target_time
 
     # Process each tag
     filtered_tags = []
@@ -106,14 +111,14 @@ def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]],
                                         SceneType.COMMERCIAL, SceneType.COMMERCIAL.value} else 2
         
         # First try to align with blank frames
-        new_start = find_nearest_blank(start_time, blanks, max_distance)
-        new_end = find_nearest_blank(end_time, blanks, max_distance)
+        new_start = find_nearest_blank(start_time, blanks, max_distance, left=True)
+        new_end = find_nearest_blank(end_time, blanks, max_distance, left=False)
         
         # If still at original positions, try aligning with diff boundaries
         if new_start == start_time:
-            new_start = find_highest_diff_boundary(start_time, 1.0, diffs)
+            new_start = find_highest_diff_boundary(start_time, 2, diffs)
         if new_end == end_time:
-            new_end = find_highest_diff_boundary(end_time, 1.0, diffs)
+            new_end = find_highest_diff_boundary(end_time, 2, diffs)
         
         # Only keep valid tags
         if new_start < new_end:
@@ -121,7 +126,7 @@ def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]],
     
     return filtered_tags
 
-def condense(frames: np.ndarray, step: int) -> np.ndarray:
+def condense(frames: np.ndarray, step: int, add_features:bool=True) -> np.ndarray:
     """
     Condense video frames by averaging specific features over specified step sizes.
     
@@ -151,7 +156,12 @@ def condense(frames: np.ndarray, step: int) -> np.ndarray:
         
         # Initialize condensed array with middle frame of each group
         # This preserves all features that don't need averaging
-        condensed = valid_frames[:, step//2].copy()
+        condensed = valid_frames[:, step//2]
+        
+        if add_features:
+            condensed = np.append(condensed, np.max(valid_frames[:, :, 3])[:,np.newaxis], axis=1) # max diff
+        else:
+            condensed = condensed.copy()
         
         # Update only the features that need condensing
         condensed[:, 1] = np.mean(valid_frames[:, :, 1], axis=1, dtype='float32')  # Average logo
@@ -164,15 +174,21 @@ def condense(frames: np.ndarray, step: int) -> np.ndarray:
         # Do the final, partial condensing
         last_frames = frames[-remaining:]
         last_condensed = last_frames[remaining//2].copy()  # Keep all features from middle remaining frame
+
+        if add_features:
+            last_condensed = np.append(last_condensed, np.max(last_frames[:, :, 3])[:,np.newaxis], axis=1) # max diff
+        else:
+            last_condensed = last_condensed.copy()
+
         last_condensed[1] = np.mean(last_frames[:, 1], dtype='float32')  # Average logo
         last_condensed[2] = np.mean(last_frames[:, 2], dtype='float32')  # Average blank
         last_condensed[3] = np.count_nonzero(last_frames[:, 3] >= 0.5) / remaining  # Diff ratio
         if condensed is not None:
-            return np.vstack((condensed, last_condensed))
+            condensed = np.vstack((condensed, last_condensed))
         else:
-            return last_condensed
-    else:
-        return condensed
+            condensed = last_condensed
+    
+    return condensed
 
 def array2onehot(arr, nclasses, dtype='float32'):
     return np.eye(nclasses, dtype=dtype)[arr]
@@ -181,6 +197,10 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[np.ndarray,np.ndarra
     version = flog.get('file_version', 10)
     frame_rate = flog.get('frame_rate', 29.97)
     endtime = flog.get('duration', 0)
+
+    if endtime < (WINDOW_BEFORE + 1 + WINDOW_AFTER) * 2:
+        return None
+
     have_logo = not not flog.get('logo', None)
 
     tags = flog.get('tags', [])
@@ -191,7 +211,7 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[np.ndarray,np.ndarra
 
     if tags and fitlerForTraining:
         spans = processor.read_feature_spans(flog, 'blank')
-        tags = _adjust_tags(tags, spans.get('blank', []), spans.get('diff', []), endtime)
+        tags = _adjust_tags(tags, spans.get('blank', []), spans.get('diff', []))
         
         # clean up tiny gaps between identified breaks (including true 0-length gaps)
         i = 1
@@ -643,6 +663,10 @@ def _train_some(model_path, train_dataset:MultiGenerator, test_dataset:MultiGene
             n = layers.Bidirectional(layers.LSTM(UNITS, dropout=DROPOUT, dtype='float32'), name="rnn")(n)
             #n = layers.TimeDistributed(layers.Dense(UNITS, dtype='float32', activation='tanh'), name="dense-mid")(n)
             #n = layers.Bidirectional(layers.LSTM(UNITS, dropout=DROPOUT, dtype='float32'), name="MORE-rnn")(n)
+        elif RNN.lower() == 'attn':
+            n = layers.Bidirectional(layers.LSTM(UNITS//2, dropout=DROPOUT, dtype='float32', return_sequences=True), name="rnn")(n)
+            n = layers.Attention(name="attention")([n, n])
+            n = layers.Bidirectional(layers.LSTM(UNITS//2, dropout=DROPOUT, dtype='float32'), name="rnn2")(n)
         elif RNN.lower() == "c1d":
             n = layers.Conv1D(filters=32, 
                                 kernel_size=5,
@@ -729,7 +753,10 @@ def predict(feature_log:str|TextIO|dict, opts:Any, write_log=None)->list:
         raise Exception(f"Model file '{mf}' does not exist")
     model:keras.models.Model = keras.models.load_model(mf)
 
-    gen = WindowStackGenerator(load_nonpersistent(flog, False),ordered=True)
+    stuff = load_nonpersistent(flog, False)
+    if not stuff:
+        return
+    gen = WindowStackGenerator(stuff,ordered=True)
     times = gen.timestamps
 
     prediction = model.predict(gen, verbose=True)
@@ -737,7 +764,7 @@ def predict(feature_log:str|TextIO|dict, opts:Any, write_log=None)->list:
     result = np.argmax(prediction, axis=1)
     results = [(0,(0,0))]
     for i in range(len(result)):
-        when = times[i]
+        when = float(times[i])
         ans = int(result[i])
         results[-1] = (results[-1][0], (results[-1][1][0], when))
         if ans != results[-1][0]:
@@ -765,7 +792,7 @@ def predict(feature_log:str|TextIO|dict, opts:Any, write_log=None)->list:
 
     spans = processor.read_feature_spans(flog, 'diff', 'blank')
     
-    results = _adjust_tags(results, spans.get('blank', []), spans.get('diff', []), duration)
+    results = _adjust_tags(results, spans.get('blank', []), spans.get('diff', []))
     i = 1
     while i < len(results):
         if results[i][0] == results[i-1][0] and (results[i][1][0] - results[i-1][1][1]) < opts.show_min_len:
