@@ -201,7 +201,7 @@ class Player:
             except StopIteration:
                 break
             except av.error.PatchWelcomeError as wtf:
-                log.critical(str(wtf))
+                log.exception("unrecoverable AV error")
                 os._exit(134)
             except (av.error.InvalidDataError,av.error.UndefinedError) as e:
                 fail += 1
@@ -215,7 +215,7 @@ class Player:
                         audio_stream = self.streams.get('audio', None)
                         del self.streams['audio']
                     if fail >= 2000:
-                        log.critical(f"Repeated InvalidDataError, skipped {fail} frames but found nothing good")
+                        log.exception(f"Repeated InvalidDataError, skipped {fail} frames but found nothing good")
                         if good >= self.frame_rate * 600:
                             return
                         else:
@@ -289,7 +289,7 @@ class Player:
             except StopIteration:
                 break
             except av.error.PatchWelcomeError as wtf:
-                log.critical(str(wtf))
+                log.exception("unrecoverable AV error")
                 os._exit(134)
             except (av.error.InvalidDataError,av.error.UndefinedError) as e:
                 fail += 1
@@ -298,7 +298,7 @@ class Player:
                 if fail%100 == 0:
                     #log.debug(f"InvalidDataError during decode -- seeking ahead #{fail}, from {ovtp} to {self.vpts}")
                     if fail >= 500:
-                        log.critical(f"Repeated InvalidDataError, skipped {fail} frames but found nothing good")
+                        log.exception(f"Repeated InvalidDataError, skipped {fail} frames but found nothing good")
                         return
                     self._resync(self.vpts)
                 else:

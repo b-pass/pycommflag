@@ -28,6 +28,19 @@ def read_feature_log(feature_log_file:str|TextIO|dict) -> dict:
     return json.load(feature_log_file)
 
 def write_feature_log(flog:dict, log_file:str|TextIO):
+
+    class FancyEncoder(json.JSONEncoder):
+        def default(self, obj):
+            if isinstance(obj, SceneType):
+                return obj.value
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            if isinstance(obj, np.floating):
+                return float(obj)
+            if isinstance(obj, np.integer):
+                return int(obj)
+            return json.JSONEncoder.default(self, obj)
+        
     if type(log_file) is str:
         if log_file.endswith('.gz'):
             import gzip
@@ -47,7 +60,7 @@ def write_feature_log(flog:dict, log_file:str|TextIO):
             first = False
         else:
             log_file.write(',\n')
-        log_file.write(f'"{k}" : {json.dumps(v)}')
+        log_file.write(f'"{k}" : {json.dumps(v, cls=FancyEncoder)}')
     log_file.write("\n}\n")
     log_file.close()
 
