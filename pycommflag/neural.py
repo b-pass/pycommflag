@@ -126,7 +126,7 @@ def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]],
     
     return filtered_tags
 
-def condense(frames: np.ndarray, step: int, add_features:bool=True) -> np.ndarray:
+def condense(frames: np.ndarray, step: int) -> np.ndarray:
     """
     Condense video frames by averaging specific features over specified step sizes.
     
@@ -156,33 +156,26 @@ def condense(frames: np.ndarray, step: int, add_features:bool=True) -> np.ndarra
         
         # Initialize condensed array with middle frame of each group
         # This preserves all features that don't need averaging
-        condensed = valid_frames[:, step//2]
-        
-        if add_features:
-            condensed = np.append(condensed, np.max(valid_frames[:, :, 3])[:,np.newaxis], axis=1) # max diff
-        else:
-            condensed = condensed.copy()
-        
+        condensed = valid_frames[:, step//2].copy()
+
         # Update only the features that need condensing
         condensed[:, 1] = np.mean(valid_frames[:, :, 1], axis=1, dtype='float32')  # Average logo
         condensed[:, 2] = np.mean(valid_frames[:, :, 2], axis=1, dtype='float32')  # Average blank
         condensed[:, 3] = np.count_nonzero(valid_frames[:, :, 3] >= 0.5, axis=1) / step  # Diff ratio
+        condensed[:, 4] = np.max(valid_frames[:, :, 3], axis=1)  # Diff max
     else:
         condensed = None
     
     if remaining:
         # Do the final, partial condensing
         last_frames = frames[-remaining:]
-        last_condensed = last_frames[remaining//2].copy()  # Keep all features from middle remaining frame
 
-        if add_features:
-            last_condensed = np.append(last_condensed, np.max(last_frames[:, :, 3])[:,np.newaxis], axis=1) # max diff
-        else:
-            last_condensed = last_condensed.copy()
+        last_condensed = last_frames[remaining//2].copy()  # Keep all features from middle frame
 
         last_condensed[1] = np.mean(last_frames[:, 1], dtype='float32')  # Average logo
         last_condensed[2] = np.mean(last_frames[:, 2], dtype='float32')  # Average blank
         last_condensed[3] = np.count_nonzero(last_frames[:, 3] >= 0.5) / remaining  # Diff ratio
+        last_condensed[4] = np.max(last_frames[:, 4])  # Diff max
         if condensed is not None:
             condensed = np.vstack((condensed, last_condensed))
         else:
@@ -264,9 +257,12 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[np.ndarray,np.ndarra
 
     if not have_logo:
         frames[..., 1] = 0
-    
-    # normalize frame rate
-    frames = condense(frames, round(frame_rate/RATE))
+
+    # change the diff column to be normalized [0,30] -> [0,1]
+    frames[...,3] = np.clip(frames[...,3] / 30, 0, 1.0)
+
+    # add a column for max diff (important in condensed versions) at index [4]
+    frames = np.insert(frames, 4, frames[..., 3], axis=1)
 
     # add a column for time percentage
     frames = np.append(frames, (frames[...,0]/endtime)[:,np.newaxis], axis=1)
@@ -274,14 +270,15 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[np.ndarray,np.ndarra
     # add a column for with the real timestamps [-3]
     frames = np.append(frames, frames[...,0].reshape((-1,1)), axis=1)
 
-    # add a column for answers [-2] and a column for weights [-1]
+    # add a column for answers [-2]
+    # and a column for weights [-1]
     frames = np.insert(frames, frames.shape[1], [[SceneType.SHOW.value], [1]], axis=1)
 
     # change the first column to be normalized timestamps (30 minute segments)
     frames[...,0] = (frames[...,0] % 1800.0) / 1800.0
 
-    # normalize frame diffs to ~30
-    frames[...,3] = np.clip(frames[...,3] / 30, 0, 1.0)
+    # normalize frame rate
+    frames = condense(frames, round(frame_rate/RATE))
 
     # +/- 1s is all frames, plus the WINDOW before/after which is condensed to SUMMARY_RATE 
     rate = round(RATE)
