@@ -126,7 +126,7 @@ def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]],
     
     return filtered_tags
 
-def condense(frames: np.ndarray, step: int) -> np.ndarray:
+def condense(frames: np.ndarray, step: int, summarize=True) -> np.ndarray:
     """
     Condense video frames by averaging specific features over specified step sizes.
     
@@ -138,6 +138,9 @@ def condense(frames: np.ndarray, step: int) -> np.ndarray:
                Are summarized.
                All other features are preserved from the first frame of each group.
         step: number of frames to combine into one
+        summarize: 
+                True: summarize and aggregate feature values
+                False: try to pick the most important value instead.
     
     Returns:
         Condensed numpy array with averaged features for logo, blank, diff
@@ -159,23 +162,32 @@ def condense(frames: np.ndarray, step: int) -> np.ndarray:
         condensed = valid_frames[:, step//2].copy()
 
         # Update only the features that need condensing
-        condensed[:, 1] = np.mean(valid_frames[:, :, 1], axis=1, dtype='float32')  # Average logo
-        condensed[:, 2] = np.mean(valid_frames[:, :, 2], axis=1, dtype='float32')  # Average blank
-        condensed[:, 3] = np.count_nonzero(valid_frames[:, :, 3] >= 0.5, axis=1) / step  # Diff ratio
-        condensed[:, 4] = np.max(valid_frames[:, :, 3], axis=1)  # Diff max
+        if summarize:
+            condensed[:, 1] = np.mean(valid_frames[:, :, 1], axis=1, dtype='float32')  # Average logo
+            condensed[:, 2] = np.mean(valid_frames[:, :, 2], axis=1, dtype='float32')  # Average blank
+            condensed[:, 3] = np.count_nonzero(valid_frames[:, :, 3] >= 0.5, axis=1) / step  # Diff ratio
+        else:
+            condensed[:, 1] = np.mean(valid_frames[:, :, 1], axis=1, dtype='float32')  # Logo percentage
+            condensed[:, 2] = np.max(valid_frames[:, :, 2], axis=1)  # Blank present
+            condensed[:, 3] = np.max(valid_frames[:, :, 3], axis=1)  # Diff max
     else:
         condensed = None
     
-    if remaining:
+    if remaining > 0:
         # Do the final, partial condensing
         last_frames = frames[-remaining:]
 
         last_condensed = last_frames[remaining//2].copy()  # Keep all features from middle frame
 
-        last_condensed[1] = np.mean(last_frames[:, 1], dtype='float32')  # Average logo
-        last_condensed[2] = np.mean(last_frames[:, 2], dtype='float32')  # Average blank
-        last_condensed[3] = np.count_nonzero(last_frames[:, 3] >= 0.5) / remaining  # Diff ratio
-        last_condensed[4] = np.max(last_frames[:, 4])  # Diff max
+        if summarize:
+            last_condensed[1] = np.mean(last_frames[:, 1], dtype='float32')  # Average logo
+            last_condensed[2] = np.mean(last_frames[:, 2], dtype='float32')  # Average blank
+            last_condensed[3] = np.count_nonzero(last_frames[:, 3] >= 0.5) / remaining  # Diff ratio
+        else:
+            last_condensed[1] = np.mean(last_frames[:, 1], dtype='float32')  # Logo percentage
+            last_condensed[2] = np.max(last_frames[:, 2])  # Blank present
+            last_condensed[3] = np.max(last_frames[:, 3])  # Diff max
+        
         if condensed is not None:
             condensed = np.vstack((condensed, last_condensed))
         else:
@@ -261,9 +273,6 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[np.ndarray,np.ndarra
     # change the diff column to be normalized [0,30] -> [0,1]
     frames[...,3] = np.clip(frames[...,3] / 30, 0, 1.0)
 
-    # add a column for max diff (important in condensed versions) at index [4]
-    frames = np.insert(frames, 4, frames[..., 3], axis=1)
-
     # add a column for time percentage
     frames = np.append(frames, (frames[...,0]/endtime)[:,np.newaxis], axis=1)
 
@@ -278,7 +287,7 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[np.ndarray,np.ndarra
     frames[...,0] = (frames[...,0] % 1800.0) / 1800.0
 
     # normalize frame rate
-    frames = condense(frames, round(frame_rate/RATE))
+    frames = condense(frames, round(frame_rate/RATE), summarize=False)
 
     # +/- 1s is all frames, plus the WINDOW before/after which is condensed to SUMMARY_RATE 
     rate = round(RATE)
@@ -291,7 +300,7 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[np.ndarray,np.ndarra
     weights = frames[:, -1]
 
     # dont condense timestamps, answers, weights
-    condensed = condense(frames[...,:-3], summary)
+    condensed = condense(frames[...,:-3], summary, summarize=True)
 
     for (tt,(st,et)) in tags:
         if type(tt) is not int: tt = tt.value
@@ -691,7 +700,7 @@ def _train_some(model_path, train_dataset:MultiGenerator, test_dataset:MultiGene
 
     cb.append(callbacks.EarlyStopping(monitor='categorical_accuracy', patience=10))
     cb.append(callbacks.EarlyStopping(monitor='val_categorical_accuracy', patience=10))
-    cb.append(callbacks.ReduceLROnPlateau(patience=7))
+    cb.append(callbacks.ReduceLROnPlateau(patience=6))
     
     class EpochCheckpoint(callbacks.ModelCheckpoint):
         def on_epoch_end(self, epoch, logs=None):
