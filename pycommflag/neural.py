@@ -372,7 +372,8 @@ def sliding_window_skip(arr, window_size, repeat_skip):
 
 from keras.utils import Sequence
 class WindowStackGenerator(Sequence):
-    def __init__(self, stuff=None, ordered=True):
+    def __init__(self, stuff=None, ordered=True, **kwargs):
+        super().__init__(**kwargs)
         if stuff is None:
             return
         
@@ -474,7 +475,8 @@ class WindowStackGenerator(Sequence):
         return (data, self.answers[index::self.stride], self.weights[index::self.stride])
     
 class MultiGenerator(Sequence):
-    def __init__(self, elements:list[WindowStackGenerator]):
+    def __init__(self, elements:list[WindowStackGenerator], **kwargs):
+        super().__init__(**kwargs)
         self.elements = elements
         self.num_elements = len(self.elements)
         self._recalc()
@@ -486,6 +488,8 @@ class MultiGenerator(Sequence):
         shape = self.elements[0].shape[1:]
         for e in self.elements:
             assert(e.shape[1:] == shape)
+            #if e.shape[1:] != shape:
+            #    print(e.shape[1:], "incompatible with", shape,"--",e.frames.shape, "vs", self.elements[0].frames.shape)
             
             x = len(e)
             self.lengths.append(x)
@@ -586,7 +590,7 @@ def train(opts:Any=None):
     
     print(f"Data batches (x):{data.shape} - Test batches (y):{test.shape}")
     
-    tfile = tempfile.NamedTemporaryFile(prefix='train-', suffix='.pycf.model.h5', )
+    tfile = tempfile.NamedTemporaryFile(prefix='train-', suffix='.pycf.model.keras', )
     model_path = tfile.name
     
     stop = False
