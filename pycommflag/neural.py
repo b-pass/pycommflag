@@ -758,9 +758,13 @@ def predict(feature_log:str|TextIO|dict, opts:Any, write_log=None)->list:
 
     mf = opts.model_file
     if not mf and opts:
-        mf = f'{opts.models_dir or "."}{os.sep}model.h5'
+        mf = f'{opts.models_dir or "."}{os.sep}model.keras'
     if not os.path.exists(mf):
-        raise Exception(f"Model file '{mf}' does not exist")
+        blah = mf
+        mf = f'{opts.models_dir or "."}{os.sep}model.md'
+        if not os.path.exists(mf):
+            raise Exception(f"Model files '{blah}' or '{mf}' do not exist")
+    
     model:keras.models.Model = keras.models.load_model(mf)
 
     stuff = load_nonpersistent(flog, False)
