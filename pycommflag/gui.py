@@ -9,7 +9,7 @@ from . import processor
 from .feature_span import *
 
 class Window(tk.Tk):
-    def __init__(self, video, spans:dict={}, logo:tuple=None, tags:FeatureSpan=None):
+    def __init__(self, video, spans:dict={}, logo:tuple=None, tags:FeatureSpan|list=None):
         tk.Tk.__init__(self)
         self.title("pycommflag editor")
         self.player = Player(video, no_deinterlace=True)

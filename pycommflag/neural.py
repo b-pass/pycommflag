@@ -761,7 +761,7 @@ def predict(feature_log:str|TextIO|dict, opts:Any, write_log=None)->list:
         mf = f'{opts.models_dir or "."}{os.sep}model.keras'
     if not os.path.exists(mf):
         blah = mf
-        mf = f'{opts.models_dir or "."}{os.sep}model.md'
+        mf = f'{opts.models_dir or "."}{os.sep}model.h5'
         if not os.path.exists(mf):
             raise Exception(f"Model files '{blah}' or '{mf}' do not exist")
     
