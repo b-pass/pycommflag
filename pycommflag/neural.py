@@ -319,6 +319,9 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[np.ndarray,np.ndarra
                 we = min(len(weights),i+rate)
                 if ws > 0 and we < len(weights):
                     weights[ws:we] = np.where(weights[ws:we] > 0, 2, 0)
+                    #dist = np.abs(np.arange(ws, we) - i)
+                    #new_weights = 0.5 + 1.5 * np.exp(-dist/(rate/2))
+                    #weights[ws:we] = np.where(weights[ws:we] > 0, new_weights, 0)
 
     #for w in range(3):
     #    print(f'{w}) {np.count_nonzero(weights == w)}')
@@ -372,8 +375,8 @@ def sliding_window_skip(arr, window_size, repeat_skip):
 
 from keras.utils import Sequence
 class WindowStackGenerator(Sequence):
-    def __init__(self, stuff=None, ordered=True, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(self, stuff=None, ordered=True, categorical=True):
+        super().__init__()
         if stuff is None:
             return
         
@@ -389,7 +392,10 @@ class WindowStackGenerator(Sequence):
         # frames has been tile with rate on each side and has timestamps,answers,weights concatted...
         # unpack all that
         self.timestamps = frames[rate:-rate,-3]
-        self.answers = array2onehot(frames[rate:-rate,-2].astype('uint32'), SceneType.count(), dtype='float32')
+        if categorical:
+            self.answers = array2onehot(frames[rate:-rate,-2].astype('uint32'), SceneType.count(), dtype='float32')
+        else:
+            self.answers = np.where(frames[rate:-rate,-2].astype('uint32') == SceneType.COMMERCIAL.value, 1.0, 0.0)
         self.weights = frames[rate:-rate,-1]
         frames = frames[:, :-3]
         
@@ -544,7 +550,7 @@ def load_data(opts, do_not_test=False) -> tuple[MultiGenerator,MultiGenerator]:
             continue
         print("Loading",f)
         if stuff := load_persistent(f, True):
-            data.append( WindowStackGenerator(stuff) )
+            data.append( WindowStackGenerator(stuff, categorical=False) )
             dlen += len(data[-1])
     
     for f in testfiles:
@@ -552,7 +558,7 @@ def load_data(opts, do_not_test=False) -> tuple[MultiGenerator,MultiGenerator]:
             continue
         print("Loading test",f)
         if stuff := load_persistent(f, True):
-            test.append( WindowStackGenerator(stuff) )
+            test.append( WindowStackGenerator(stuff, categorical=False) )
             tlen += len(test[-1])
     
     need = int(dlen*TEST_PERC+1) - tlen
@@ -631,7 +637,7 @@ def train(opts:Any=None):
     print(tmetrics)
 
     if tmetrics[1] >= 0.80:
-        name = f'{opts.models_dir if opts and opts.models_dir else "."}{os.sep}pycf-{tmetrics[1]:.04f}-{RNN}{UNITS}-d{DROPOUT}-w{WINDOW_BEFORE}x{WINDOW_AFTER}x{SUMMARY_RATE}-{int(time.time())}.h5'
+        name = f'{opts.models_dir if opts and opts.models_dir else "."}{os.sep}pycf-{tmetrics[1]:.04f}-{RNN}{UNITS}bin-d{DROPOUT}-w{WINDOW_BEFORE}x{WINDOW_AFTER}x{SUMMARY_RATE}-{int(time.time())}.keras'
         print()
         print('Saving as ' + name)
 
@@ -692,26 +698,26 @@ def _train_some(model_path, train_dataset:MultiGenerator, test_dataset:MultiGene
         
         n = layers.Dense(32, dtype='float32', activation='relu', name="dense-post")(n)
         n = layers.Dense(16, dtype='float32', activation='relu', name="final")(n)
-        outputs = layers.Dense(SceneType.count(), dtype='float32', activation='softmax', name="output")(n)
+        outputs = layers.Dense(1, dtype='float32', activation='sigmoid', name="output")(n)
         model = keras.Model(inputs, outputs)
         model.summary()
-        model.compile(optimizer="adam", loss="categorical_crossentropy", metrics=['categorical_accuracy', 'categorical_crossentropy'])
+        model.compile(optimizer="adam", loss="binary_crossentropy", metrics=['accuracy', 'AUC'])
         model.save(model_path)
 
     cb = []
 
     from keras import callbacks
 
-    cb.append(callbacks.EarlyStopping(monitor='categorical_accuracy', patience=10))
-    cb.append(callbacks.EarlyStopping(monitor='val_categorical_accuracy', patience=10))
-    cb.append(callbacks.ReduceLROnPlateau(patience=6))
+    cb.append(callbacks.EarlyStopping(monitor='accuracy', patience=3))
+    cb.append(callbacks.EarlyStopping(monitor='val_accuracy', patience=3))
+    cb.append(callbacks.ReduceLROnPlateau(patience=2))
     
     class EpochCheckpoint(callbacks.ModelCheckpoint):
         def on_epoch_end(self, epoch, logs=None):
             self.last_epoch = epoch
             return super().on_epoch_end(epoch, logs)
 
-    ecp = EpochCheckpoint(model_path, verbose=1, monitor='val_categorical_accuracy', mode='auto', save_best_only=True)
+    ecp = EpochCheckpoint(model_path, verbose=1, monitor='val_accuracy', mode='auto', save_best_only=True)
     cb.append(ecp)
 
     class MemoryChecker(callbacks.Callback):
@@ -751,7 +757,6 @@ def predict(feature_log:str|TextIO|dict, opts:Any, write_log=None)->list:
     import keras
 
     flog = processor.read_feature_log(feature_log)
-    duration = flog.get('duration', 0)
     frame_rate = flog.get('frame_rate', 29.97)
     
     assert(flog['frames'][-1][0] > frame_rate)
@@ -767,19 +772,43 @@ def predict(feature_log:str|TextIO|dict, opts:Any, write_log=None)->list:
     
     model:keras.models.Model = keras.models.load_model(mf)
 
+    results = do_predict(flog, model, opts)
+
+    if orig_tags := flog.get('tags', []):
+        log.debug(f'OLD tags n={len(orig_tags)} -> {str(orig_tags)}')
+        log.debug(f'NEW tags n={len(results)} -> {str(results)}')
+    else:
+        log.debug(f'Final tags n={len(results)}: {str(results)}')
+
+    flog['tags'] = results
+
+    if write_log is not None:
+        processor.write_feature_log(flog, write_log)
+    
+    return results
+
+def do_predict(flog:dict, model, opts:Any):
     stuff = load_nonpersistent(flog, False)
     if not stuff:
-        return
-    gen = WindowStackGenerator(stuff,ordered=True)
+        return None
+    
+    duration = flog.get('duration', 0)
+    categorical = model.output_shape[-1] > 1
+
+    gen = WindowStackGenerator(stuff, ordered=True, categorical=categorical)
     times = gen.timestamps
 
     prediction = model.predict(gen, verbose=True)
 
-    result = np.argmax(prediction, axis=1)
+    result = np.argmax(prediction, axis=1) if categorical else None
     results = [(0,(0,0))]
-    for i in range(len(result)):
+    for i in range(len(prediction)):
         when = float(times[i])
-        ans = int(result[i])
+        if categorical:
+            ans = int(result[i])
+        else:
+            ans = SceneType.COMMERCIAL.value if prediction[i] >= 0.5 else SceneType.SHOW.value
+        
         results[-1] = (results[-1][0], (results[-1][1][0], when))
         if ans != results[-1][0]:
             results.append((ans, (when, when)))
@@ -792,7 +821,7 @@ def predict(feature_log:str|TextIO|dict, opts:Any, write_log=None)->list:
         else:
             i += 1
 
-    log.debug(f'Raw result n={len(results)}')
+    #log.debug(f'Raw result n={len(results)}')
 
     # clean up tiny gaps between identified breaks (including true 0-length gaps)
     # show must be at least 30 seconds long (opts.show_min_len), or we just combine it into the commercial break its in the middle of
@@ -815,7 +844,7 @@ def predict(feature_log:str|TextIO|dict, opts:Any, write_log=None)->list:
         else:
             i += 1
 
-    log.debug(f'Merge/Adjust n={len(results)}: {str(results)}')
+    #log.debug(f'Merge/Adjust n={len(results)}: {str(results)}')
 
     # commercials must be at least 60 (opts.comm_min_len) seconds long, if it's less, it is deleted
     # commercials must be less than 360 seconds long (opts.comm_max_len), if it's more then it is just show after that
@@ -852,116 +881,120 @@ def predict(feature_log:str|TextIO|dict, opts:Any, write_log=None)->list:
     
     #log.debug(f'Post n={len(results)}: {str(results)}')
 
-    if orig_tags := flog.get('tags', []):
-        log.debug(f'OLD tags n={len(orig_tags)} -> {str(orig_tags)}')
-        log.debug(f'NEW tags n={len(results)} -> {str(results)}')
-    else:
-        log.debug(f'Final tags n={len(results)}: {str(results)}')
-
-    flog['tags'] = results
-
-    if write_log is not None:
-        processor.write_feature_log(flog, write_log)
-
     return results
 
-def eval_many(opts:Any):
-    print("EVALUATE many", len(opts.eval))
+def eval(opts:Any):
+    # yield CPU time to useful tasks, this is a background thing...
+    try: os.nice(19)
+    except: pass
+
+    print("EVALUATE", len(opts.eval), "on", len(opts.ml_data))
+
+    # we create a list of tag pairs where they always exactly line up with boundaries in another list
+    # this means we don't have to handle overlaps or tags spanning multiple other tags
+    def split_upon(inlist, splitlist):
+        sres = []
+        for it,(ib,ie) in inlist:
+            if it not in [SceneType.COMMERCIAL, SceneType.COMMERCIAL.value]:
+                continue
+            for st,(sb,se) in splitlist:
+                if st not in [SceneType.COMMERCIAL, SceneType.COMMERCIAL.value,SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value]:
+                    continue
+                if ib < sb and sb < ie:
+                    sres.append( (ib,sb) )
+                    ib = sb
+                if se > ib and se <= ie:
+                    sres.append( (ib, se) )
+                    ib = se
+                if ib+1/30 > ie:
+                    break
+            if ib + 1/30 <= ie:
+                sres.append( (ib, ie) )
+        
+        for st,(sb,se) in splitlist:
+            if st in [SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value]:
+                for i in range(len(sres)):
+                    rb,re = sres[i]
+                    if rb < se and re > sb:
+                        del sres[i]
+                        break
+
+        print("SPLIT", inlist, "into", sres)
+        return sres
 
     import tensorflow as tf
     import keras
+
+    models = {}
+    dscat = False
+    dsbin = False
+    for mf in opts.eval:
+        try:
+            models[mf] = keras.models.load_model(mf)
+            if models[mf].output_shape[-1] > 1:
+                dscat = True
+            else:
+                dsbin = True
+        except Exception as e:
+            log.exception(f"Unable to load MODEL {mf}")
 
     for f in opts.ml_data:
         if os.path.isdir(f):
             continue
         
-        dataset = None
-        gc.collect()
-
         try:
-            if flog := processor.read_feature_log(f):
-                dataset = WindowStackGenerator(load_nonpersistent(flog))
-            else:
+            flog = processor.read_feature_log(f)
+            if not flog:
                 print('Load failed')
                 continue
+
+            spans = processor.read_feature_spans(flog, 'diff', 'blank')
+            realtags = flog.get('tags', []) #realtags = _adjust_tags(flog.get('tags', []), spans.get('blank', []), spans.get('diff', []))
+            duration = flog.get('duration',0.00001)
         except Exception as e:
             log.exception(f"Unable to load {f}")
             continue
         
-        for mf in opts.eval:
+        for (mf, model) in models.items():
             try:
-                print(f,mf,keras.models.load_model(mf).evaluate(dataset))
+                result = do_predict(flog, model, opts)
+
+                orig = split_upon(realtags, result)
+                result = split_upon(result, realtags)
+
+                missing = 0
+                extra = 0
+
+                # now we have no overlaps, so all entries are one of: missing, extra, same
+                ri = 0
+                for ob,oe in orig:
+                    while ri < len(result):
+                        rb,re = result[ri]
+                        if ob < re:
+                            break
+                        else:
+                            extra += re - rb
+                            print(f"->extra {rb},{re} = {re-rb}")
+                        ri += 1
+                    if ri >= len(result) or oe <= rb:
+                        print(f"->missing {ob},{oe} = {oe-ob}")
+                        missing += oe - ob
+                    else:
+                        print(f"->matched {ob},{oe} = {rb},{re}")
+                        assert(rb == ob and re == oe)
+                        ri += 1
+                while ri < len(result):
+                    rb,re = result[ri]
+                    extra += re - rb
+                    print(f"->extra (trailing) {rb},{re} = {re-rb}")
+                    ri += 1
+                
+                acc = 100 - 100*(missing+extra)/duration
+                print(f'{f} @ {mf} -> Acc {round(acc,4)}% <- FN:{round(missing,3)} + FP:{round(extra,3)} = {round(missing+extra,3)} seconds WRONG')
+                #print(f,mf,model.evaluate(dataset_cat if model.output_shape[-1] > 1 else dataset_bin))
             except Exception as e:
                 log.exception(f"Unable to load MODEL {mf}")
         print()
     
     print()
     print("Done")
-
-def eval(opts:Any):
-    # yield CPU time to useful tasks, this is a background thing...
-    try: os.nice(19)
-    except: pass
-    
-    if len(opts.eval) > 1:
-        return eval_many(opts)
-    
-    print("EVALUATE single")
-    
-    import tensorflow as tf
-    import keras
-
-    model:keras.models.Model = keras.models.load_model(opts.eval[0])
-    
-    for f in opts.ml_data:
-        if os.path.isdir(f):
-            continue
-        
-        print(f)
-        try:
-            if flog := processor.read_feature_log(f):
-                print(model.evaluate(WindowStackGenerator(load_nonpersistent(flog)), verbose=0))
-            else:
-                print('Load failed')
-        except Exception as e:
-            print(str(e))
-    
-    print()
-    print("Done")
-
-def _sanity_check(f):
-    print("Loading",f)
-    flog = processor.read_feature_log(f)
-    (_,a,b,c) = OLDneural.flog_to_vecs(flog,True)
-
-    a = np.array(a, dtype='float32')
-
-    new = WindowStackGenerator(load_persistent(f))
-
-    #print(len(new))
-
-    #print(new[0][0].shape)
-
-    for batch in range(len(a)//256):
-        print(batch,"of",len(a)//256)
-        b = new[batch][0]
-
-        for i in range(256):
-            x = a[batch * 256 + i]
-            y = b[i]
-
-            with open("/tmp/test/a."+str(i), 'w') as f:
-                for e in x:
-                    f.write(str(e.tolist()) + '\n')
-            with open("/tmp/test/b."+str(i), 'w') as f:
-                for e in y:
-                    f.write(str(e.tolist()) + '\n')
-            
-            #print(np.count_nonzero(x == y), np.count_nonzero(x != y))
-
-            if not np.array_equal(x, y):
-                print("FAIL AT ", batch, i)
-                sys.exit(99)
-
-    print("success")
-    sys.exit(99)
