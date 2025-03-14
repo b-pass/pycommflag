@@ -87,6 +87,7 @@ def run(opts) -> None|int:
             from .neural import predict
             try:
                 result = predict(flog, opts, fl)
+                print(f'{vf}: {len(result)} breaks')
                 output(opts, result, flog)
             except Exception as e:
                 import traceback

@@ -315,8 +315,8 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[np.ndarray,np.ndarra
             
             # higher weight near the transition
             for i in (si,ei):
-                ws = max(0,i-rate)
-                we = min(len(weights),i+rate)
+                ws = max(0,i-rate*2)
+                we = min(len(weights),i+rate*2)
                 if ws > 0 and we < len(weights):
                     weights[ws:we] = np.where(weights[ws:we] > 0, 2, 0)
                     #dist = np.abs(np.arange(ws, we) - i)
@@ -883,13 +883,7 @@ def do_predict(flog:dict, model, opts:Any):
 
     return results
 
-def eval(opts:Any):
-    # yield CPU time to useful tasks, this is a background thing...
-    try: os.nice(19)
-    except: pass
-
-    print("EVALUATE", len(opts.eval), "on", len(opts.ml_data))
-
+def diff_tags(realtags, result) -> tuple[float,float,list]:
     # we create a list of tag pairs where they always exactly line up with boundaries in another list
     # this means we don't have to handle overlaps or tags spanning multiple other tags
     def split_upon(inlist, splitlist):
@@ -919,22 +913,62 @@ def eval(opts:Any):
                         del sres[i]
                         break
 
-        print("SPLIT", inlist, "into", sres)
+        #print("SPLIT", inlist, "into", sres)
         return sres
+
+    orig = split_upon(realtags, result)
+    result = split_upon(result, realtags)
+
+    missing = 0
+    extra = 0
+    res = []
+
+    # now we have no overlaps, so all entries are one of: missing, extra, same
+    ri = 0
+    for ob,oe in orig:
+        while ri < len(result):
+            rb,re = result[ri]
+            if ob < re:
+                break
+            else:
+                extra += re - rb
+                res.append( (1,rb,re) )
+            ri += 1
+        if ri >= len(result) or oe <= rb:
+            missing += oe - ob
+            res.append( (-1,ob,oe) )
+        else:
+            res.append( (0,ob,re) )
+            assert(rb == ob and re == oe)
+            ri += 1
+    while ri < len(result):
+        rb,re = result[ri]
+        extra += re - rb
+        res.append( (1,rb,re) )
+        ri += 1
+    
+    return missing, extra, res
+
+
+def eval(opts:Any):
+    # yield CPU time to useful tasks, this is a background thing...
+    try: os.nice(19)
+    except: pass
+
+    print("EVALUATE", len(opts.eval), "on", len(opts.ml_data))
+
 
     import tensorflow as tf
     import keras
 
     models = {}
-    dscat = False
-    dsbin = False
+    all_missing = {}
+    all_extra = {}
     for mf in opts.eval:
         try:
             models[mf] = keras.models.load_model(mf)
-            if models[mf].output_shape[-1] > 1:
-                dscat = True
-            else:
-                dsbin = True
+            all_missing[mf] = 0
+            all_extra[mf] = 0
         except Exception as e:
             log.exception(f"Unable to load MODEL {mf}")
 
@@ -949,7 +983,7 @@ def eval(opts:Any):
                 continue
 
             spans = processor.read_feature_spans(flog, 'diff', 'blank')
-            realtags = flog.get('tags', []) #realtags = _adjust_tags(flog.get('tags', []), spans.get('blank', []), spans.get('diff', []))
+            realtags = _adjust_tags(flog.get('tags', []), spans.get('blank', []), spans.get('diff', []))
             duration = flog.get('duration',0.00001)
         except Exception as e:
             log.exception(f"Unable to load {f}")
@@ -959,42 +993,22 @@ def eval(opts:Any):
             try:
                 result = do_predict(flog, model, opts)
 
-                orig = split_upon(realtags, result)
-                result = split_upon(result, realtags)
+                (missing,extra,_) = diff_tags(realtags, result)
 
-                missing = 0
-                extra = 0
-
-                # now we have no overlaps, so all entries are one of: missing, extra, same
-                ri = 0
-                for ob,oe in orig:
-                    while ri < len(result):
-                        rb,re = result[ri]
-                        if ob < re:
-                            break
-                        else:
-                            extra += re - rb
-                            print(f"->extra {rb},{re} = {re-rb}")
-                        ri += 1
-                    if ri >= len(result) or oe <= rb:
-                        print(f"->missing {ob},{oe} = {oe-ob}")
-                        missing += oe - ob
-                    else:
-                        print(f"->matched {ob},{oe} = {rb},{re}")
-                        assert(rb == ob and re == oe)
-                        ri += 1
-                while ri < len(result):
-                    rb,re = result[ri]
-                    extra += re - rb
-                    print(f"->extra (trailing) {rb},{re} = {re-rb}")
-                    ri += 1
-                
                 acc = 100 - 100*(missing+extra)/duration
                 print(f'{f} @ {mf} -> Acc {round(acc,4)}% <- FN:{round(missing,3)} + FP:{round(extra,3)} = {round(missing+extra,3)} seconds WRONG')
+                all_missing[mf] += missing
+                all_extra[mf] += extra
                 #print(f,mf,model.evaluate(dataset_cat if model.output_shape[-1] > 1 else dataset_bin))
             except Exception as e:
                 log.exception(f"Unable to load MODEL {mf}")
         print()
     
     print()
-    print("Done")
+    print()
+    print("Results:\nName\t\tMissing\t\tExtra\t\tAbsDiffSum")
+
+    for mf in models.keys():
+        print(f'{mf}: \t-{all_missing[mf]} \t+{all_extra[mf]} \t{all_extra[mf]-all_missing[mf]}')
+    
+    print()
