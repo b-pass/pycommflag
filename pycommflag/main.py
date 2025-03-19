@@ -1,8 +1,11 @@
 import os
 import sys
+import random
 
 def run(opts) -> None|int:
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' # shut up, tf
+
+    random.seed(17)
 
     if opts.rebuild or opts.queue:
         os.execvp("mythcommflag", ["mythcommflag"] + sys.argv[1:])
@@ -47,12 +50,14 @@ def run(opts) -> None|int:
         opts.filename = get_filename(opts)
     
     if opts.reprocess:
+        import gc
         from .processor import reprocess
         i = 0
         for fl in opts.reprocess:
             i += 1
             if not os.path.exists(fl) or not os.path.isfile(fl):
                 continue
+            gc.collect()
             print(f'* Reprocessing {fl} [{i} of {len(opts.reprocess)}]')
             try:
                 flog = reprocess(fl, opts=opts)
@@ -84,10 +89,18 @@ def run(opts) -> None|int:
                     output(opts, [], flog)
                     continue
         
-            from .neural import predict
+            from .neural import predict, diff_tags
             try:
+                old = flog.get('tags', [])
                 result = predict(flog, opts, fl)
-                print(f'{vf}: {len(result)} breaks')
+                (missing,extra,all) = diff_tags(old, result)
+
+                chng = ''
+                for (t,b,e) in all:
+                    if t != 0:
+                        chng += f'{e-b}s {"missing" if t < 0 else "extra"} at {b} to {e}; '
+                print(f'{vf}: {len(result)} breaks - changed {extra-missing} seconds : {chng}')
+
                 output(opts, result, flog)
             except Exception as e:
                 import traceback
