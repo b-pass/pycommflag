@@ -316,7 +316,7 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[np.ndarray,np.ndarra
             # higher weight near the transition
             for i in (si,ei):
                 ws = max(0,i-rate*2)
-                we = min(len(weights),i+rate*2)
+                we = min(len(weights),i+rate+2)
                 if ws > 0 and we < len(weights):
                     weights[ws:we] = np.where(weights[ws:we] > 0, 2, 0)
                     #dist = np.abs(np.arange(ws, we) - i)
@@ -773,12 +773,15 @@ def predict(feature_log:str|TextIO|dict, opts:Any, write_log=None)->list:
     model:keras.models.Model = keras.models.load_model(mf)
 
     results = do_predict(flog, model, opts)
+    if not results:
+        results = []
 
-    if orig_tags := flog.get('tags', []):
-        log.debug(f'OLD tags n={len(orig_tags)} -> {str(orig_tags)}')
-        log.debug(f'NEW tags n={len(results)} -> {str(results)}')
-    else:
-        log.debug(f'Final tags n={len(results)}: {str(results)}')
+    #if orig_tags := flog.get('tags', []):
+    #    log.debug(f'OLD tags n={len(orig_tags)} -> {str(orig_tags)}')
+    #    log.debug(f'NEW tags n={len(results)} -> {str(results)}')
+    #else:
+
+    log.debug(f'Final tags n={len(results)}: {str(results)}')
 
     flog['tags'] = results
 
@@ -921,7 +924,7 @@ def diff_tags(realtags, result) -> tuple[float,float,list]:
 
     missing = 0
     extra = 0
-    res = []
+    rlist = []
 
     # now we have no overlaps, so all entries are one of: missing, extra, same
     ri = 0
@@ -932,22 +935,22 @@ def diff_tags(realtags, result) -> tuple[float,float,list]:
                 break
             else:
                 extra += re - rb
-                res.append( (1,rb,re) )
+                rlist.append( (1,rb,re) )
             ri += 1
         if ri >= len(result) or oe <= rb:
             missing += oe - ob
-            res.append( (-1,ob,oe) )
+            rlist.append( (-1,ob,oe) )
         else:
-            res.append( (0,ob,re) )
+            rlist.append( (0,ob,re) )
             assert(rb == ob and re == oe)
             ri += 1
     while ri < len(result):
         rb,re = result[ri]
         extra += re - rb
-        res.append( (1,rb,re) )
+        rlist.append( (1,rb,re) )
         ri += 1
     
-    return missing, extra, res
+    return missing, extra, rlist
 
 
 def eval(opts:Any):
