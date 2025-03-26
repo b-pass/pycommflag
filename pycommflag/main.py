@@ -5,7 +5,7 @@ import random
 def run(opts) -> None|int:
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' # shut up, tf
 
-    random.seed(17)
+    random.seed(42)
 
     if opts.rebuild or opts.queue:
         os.execvp("mythcommflag", ["mythcommflag"] + sys.argv[1:])
