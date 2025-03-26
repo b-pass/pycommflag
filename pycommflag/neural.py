@@ -315,13 +315,14 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[np.ndarray,np.ndarra
             
             # higher weight near the transition
             for i in (si,ei):
-                ws = max(0,i-rate*2)
-                we = min(len(weights),i+rate+2)
+                ws = max(0,i-rate*3)
+                we = min(len(weights),i+rate*3)
                 if ws > 0 and we < len(weights):
-                    weights[ws:we] = np.where(weights[ws:we] > 0, 2, 0)
-                    #dist = np.abs(np.arange(ws, we) - i)
-                    #new_weights = 0.5 + 1.5 * np.exp(-dist/(rate/2))
-                    #weights[ws:we] = np.where(weights[ws:we] > 0, new_weights, 0)
+                    #weights[ws:we] = np.where(weights[ws:we] > 0, 2, 0)
+                    dist = np.abs(np.arange(ws, we + 1) - i)
+                    new_weights = 2.25 - ((dist / ((we - ws) / 2)) ** 2)  # Scale the distance by (rate * 3)
+                    new_weights = np.clip(new_weights, 1.0, 2.0)  # Ensure weights are between 1.0 and 2.0
+                    weights[ws:we + 1] = np.where(weights[ws:we + 1] > 0, new_weights, 0)
 
     #for w in range(3):
     #    print(f'{w}) {np.count_nonzero(weights == w)}')
@@ -681,8 +682,8 @@ def _train_some(model_path, train_dataset:MultiGenerator, test_dataset:MultiGene
             #n = layers.Bidirectional(layers.LSTM(UNITS, dropout=DROPOUT, dtype='float32'), name="MORE-rnn")(n)
         elif RNN.lower() == 'attn':
             n = layers.Bidirectional(layers.LSTM(UNITS//2, dropout=DROPOUT, dtype='float32', return_sequences=True), name="rnn")(n)
-            n = layers.Attention(name="attention")([n, n])
-            n = layers.Bidirectional(layers.LSTM(UNITS//2, dropout=DROPOUT, dtype='float32'), name="rnn2")(n)
+            n = layers.MultiHeadAttention(num_heads=4, key_dim=UNITS)(n, n)
+            n = layers.GlobalAveragePooling1D()(n)
         elif RNN.lower() == "c1d":
             n = layers.Conv1D(filters=32, 
                                 kernel_size=5,
@@ -950,6 +951,8 @@ def diff_tags(realtags, result) -> tuple[float,float,list]:
         rlist.append( (1,rb,re) )
         ri += 1
     
+    #print("rlist:",rlist)
+    
     return missing, extra, rlist
 
 
@@ -965,6 +968,7 @@ def eval(opts:Any):
     import keras
 
     models = {}
+    total_time = 0
     all_missing = {}
     all_extra = {}
     for mf in opts.eval:
@@ -988,6 +992,17 @@ def eval(opts:Any):
             spans = processor.read_feature_spans(flog, 'diff', 'blank')
             realtags = _adjust_tags(flog.get('tags', []), spans.get('blank', []), spans.get('diff', []))
             duration = flog.get('duration',0.00001)
+            real_dur = duration
+            
+            for (t,(b,e)) in realtags:
+                if t in [SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value]:
+                    if e+10 > real_dur and e < real_dur and b < real_dur:
+                        e = real_dur
+                    if b < 10 and e > 0:
+                        b = 0
+                    duration -= e-b
+            
+            total_time += duration
         except Exception as e:
             log.exception(f"Unable to load {f}")
             continue
@@ -995,7 +1010,6 @@ def eval(opts:Any):
         for (mf, model) in models.items():
             try:
                 result = do_predict(flog, model, opts)
-
                 (missing,extra,_) = diff_tags(realtags, result)
 
                 acc = 100 - 100*(missing+extra)/duration
@@ -1009,9 +1023,11 @@ def eval(opts:Any):
     
     print()
     print()
-    print("Results:\nName\t\tMissing\t\tExtra\t\tAbsDiffSum")
+    print("Results:\nName\t\tMissing\t\tExtra\t\tAbsDiffSum\t\tAcc")
 
     for mf in models.keys():
-        print(f'{mf}: \t-{all_missing[mf]} \t+{all_extra[mf]} \t{all_extra[mf]-all_missing[mf]}')
-    
+        total_wrong = all_extra[mf] + all_missing[mf]
+        acc = '%.5f %%' % ((total_time - total_wrong) * 100.0 / total_time,)
+        print(f'{mf}: \t-{all_missing[mf]} \t+{all_extra[mf]} \t{total_wrong} \t{acc}')
     print()
+
