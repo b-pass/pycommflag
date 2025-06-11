@@ -654,10 +654,51 @@ def train(opts:Any=None):
 def _train_proc(model_path, train_dataset, test_dataset, epoch, queue):
     queue.put( _train_some(model_path, train_dataset, test_dataset, epoch) )
 
+def build_model(input_shape):
+    from keras import layers, Input, Model
+
+    inputs = Input(shape=input_shape[2:], dtype='float32', name="input")
+    n = inputs
+
+    n = layers.TimeDistributed(layers.Dense(32, dtype='float32', activation='tanh'), name="dense-pre")(n)
+
+    n = layers.Conv1D(filters=32, kernel_size=7, padding='same', activation='relu', name="conv_pre_a")(n)
+    n = layers.MaxPooling1D(pool_size=2, name="pool_a")(n)
+    n = layers.Conv1D(filters=32, kernel_size=3, padding='same', activation='relu', name="conv_pre_b")(n)
+    n = layers.MaxPooling1D(pool_size=2, name="pool_b")(n)
+
+    if RNN.lower() == "gru":
+        n = layers.Bidirectional(layers.GRU(UNITS, dropout=DROPOUT), name="rnn")(n)
+    elif RNN.lower() == 'lstm':
+        n = layers.Bidirectional(layers.LSTM(UNITS, dropout=DROPOUT), name="rnn")(n)
+    elif RNN.lower() == 'lstm-attn':
+        n = layers.Bidirectional(layers.LSTM(UNITS, dropout=DROPOUT, return_sequences=True), name="rnn")(n)
+        
+        # MultiHeadAttention with 4 heads
+        n = layers.MultiHeadAttention(
+            num_heads=4,
+            key_dim=n.shape[-1] // 4,  # Split features across heads
+            name="multi_head_attention"
+        )(n, n) 
+        
+        # Global average pooling to reduce temporal dimension
+        n = layers.GlobalAveragePooling1D()(n)  # (batch_size, features)
+
+    # Squeeze-and-Excitation 
+    se = layers.Dense(n.shape[-1] // 8, activation='relu', name="squeeze")(n)
+    se = layers.Dense(n.shape[-1], activation='sigmoid', name="excite")(n)
+    #se = layers.Reshape((n.shape[-1],), name="se_shape")(se)
+    n = layers.Multiply(name="se_apply")([n, se])
+    
+    n = layers.Dense(32, dtype='float32', activation='relu', name="dense-post")(n)
+    #n = layers.Dense(16, dtype='float32', activation='relu', name="final")(n)
+    outputs = layers.Dense(1, dtype='float32', activation='sigmoid', name="output")(n)
+    
+    return Model(inputs, outputs)
+
 def _train_some(model_path, train_dataset:MultiGenerator, test_dataset:MultiGenerator, epoch=0) -> tuple[int,bool]:
     import signal
     import keras
-    from keras import layers, callbacks
 
     train_dataset.shuffle()
 
@@ -665,46 +706,11 @@ def _train_some(model_path, train_dataset:MultiGenerator, test_dataset:MultiGene
     if epoch > 0:
         model = keras.models.load_model(model_path)
     else:
-        inputs = keras.Input(shape=train_dataset.shape[2:], dtype='float32', name="input")
-        n = inputs
-        n = layers.TimeDistributed(layers.Dense(32, dtype='float32', activation='tanh'), name="dense-pre")(n)
-        #skip = n
-        #n = layers.TimeDistributed(layers.Dropout(DROPOUT), name="early-dropout", dtype='float32')(n)
-        #n = layers.TimeDistributed(layers.Dense(32, dtype='float32', activation='relu'), name="dense-pre-2")(n)
-        #n = layers.TimeDistributed(layers.Dropout(DROPOUT), name="early-dropout-maybe", dtype='float32')(n)
-        #n = layers.TimeDistributed(layers.Dense(16, dtype='float32', activation='relu'), name="dense-pre-3")(n)
-        #n = layers.Add()([n,skip])
-        if RNN.lower() == "gru":
-            n = layers.Bidirectional(layers.GRU(UNITS, dropout=DROPOUT, dtype='float32'), name="rnn")(n)
-        elif RNN.lower() == 'lstm':
-            n = layers.Bidirectional(layers.LSTM(UNITS, dropout=DROPOUT, dtype='float32'), name="rnn")(n)
-            #n = layers.TimeDistributed(layers.Dense(UNITS, dtype='float32', activation='tanh'), name="dense-mid")(n)
-            #n = layers.Bidirectional(layers.LSTM(UNITS, dropout=DROPOUT, dtype='float32'), name="MORE-rnn")(n)
-        elif RNN.lower() == 'attn':
-            n = layers.Bidirectional(layers.LSTM(UNITS//2, dropout=DROPOUT, dtype='float32', return_sequences=True), name="rnn")(n)
-            n = layers.MultiHeadAttention(num_heads=4, key_dim=UNITS)(n, n)
-            n = layers.GlobalAveragePooling1D()(n)
-        elif RNN.lower() == "c1d":
-            n = layers.Conv1D(filters=32, 
-                                kernel_size=5,
-                                activation='relu',
-                                padding='same',
-                                name="conv1d_1")(n)
-            n = layers.Conv1D(filters=32,
-                                kernel_size=3,
-                                activation='relu',
-                                padding='same',
-                                name="conv1d_2")(n)
-            n = layers.GlobalAveragePooling1D(name="global_pool")(n)
-        
-        n = layers.Dense(32, dtype='float32', activation='relu', name="dense-post")(n)
-        n = layers.Dense(16, dtype='float32', activation='relu', name="final")(n)
-        outputs = layers.Dense(1, dtype='float32', activation='sigmoid', name="output")(n)
-        model = keras.Model(inputs, outputs)
+        model = build_model(train_dataset.shape)
         model.summary()
         model.compile(optimizer="adam", loss="binary_crossentropy", metrics=['accuracy', 'AUC'])
         model.save(model_path)
-
+    
     cb = []
 
     from keras import callbacks
