@@ -157,19 +157,13 @@ def condense(frames: np.ndarray, step: int, summarize=True) -> np.ndarray:
         # Reshape the array to group frames by step size
         valid_frames = frames[:(n_frames//step)*step].reshape(-1, step, frames.shape[1])
         
-        # Initialize condensed array with middle frame of each group
+        # Initialize condensed array with middle-left frame of each group
         # This preserves all features that don't need averaging
         condensed = valid_frames[:, step//2].copy()
 
-        # Update only the features that need condensing
-        if summarize:
-            condensed[:, 1] = np.mean(valid_frames[:, :, 1], axis=1, dtype='float32')  # Average logo
-            condensed[:, 2] = np.mean(valid_frames[:, :, 2], axis=1, dtype='float32')  # Average blank
-            condensed[:, 3] = np.count_nonzero(valid_frames[:, :, 3] >= 0.5, axis=1) / step  # Diff ratio
-        else:
-            condensed[:, 1] = np.mean(valid_frames[:, :, 1], axis=1, dtype='float32')  # Logo percentage
-            condensed[:, 2] = np.max(valid_frames[:, :, 2], axis=1)  # Blank present
-            condensed[:, 3] = np.max(valid_frames[:, :, 3], axis=1)  # Diff max
+        condensed[:, 1] = np.mean(valid_frames[:, :, 1], axis=1, dtype='float32')  # Logo percentage
+        condensed[:, 2] = np.max(valid_frames[:, :, 2], axis=1)  # Blank present
+        condensed[:, 3] = np.max(valid_frames[:, :, 3], axis=1)  # Diff max
     else:
         condensed = None
     
@@ -177,17 +171,12 @@ def condense(frames: np.ndarray, step: int, summarize=True) -> np.ndarray:
         # Do the final, partial condensing
         last_frames = frames[-remaining:]
 
-        last_condensed = last_frames[remaining//2].copy()  # Keep all features from middle frame
+        last_condensed = last_frames[remaining//2].copy()  # Keep all features from middle-left frame
 
-        if summarize:
-            last_condensed[1] = np.mean(last_frames[:, 1], dtype='float32')  # Average logo
-            last_condensed[2] = np.mean(last_frames[:, 2], dtype='float32')  # Average blank
-            last_condensed[3] = np.count_nonzero(last_frames[:, 3] >= 0.5) / remaining  # Diff ratio
-        else:
-            last_condensed[1] = np.mean(last_frames[:, 1], dtype='float32')  # Logo percentage
-            last_condensed[2] = np.max(last_frames[:, 2])  # Blank present
-            last_condensed[3] = np.max(last_frames[:, 3])  # Diff max
-        
+        last_condensed[1] = np.mean(last_frames[:, 1], dtype='float32')  # Logo percentage
+        last_condensed[2] = np.max(last_frames[:, 2])  # Blank present
+        last_condensed[3] = np.max(last_frames[:, 3])  # Diff max
+    
         if condensed is not None:
             condensed = np.vstack((condensed, last_condensed))
         else:
@@ -287,20 +276,15 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[np.ndarray,np.ndarra
     frames[...,0] = (frames[...,0] % 1800.0) / 1800.0
 
     # normalize frame rate
-    frames = condense(frames, round(frame_rate/RATE), summarize=False)
+    frames = condense(frames, round(frame_rate/RATE))
 
-    # +/- 1s is all frames, plus the WINDOW before/after which is condensed to SUMMARY_RATE 
     rate = round(RATE)
-    summary = round(RATE/SUMMARY_RATE)
-    wbefore = round(WINDOW_BEFORE * SUMMARY_RATE)
-    wafter = round(WINDOW_AFTER * SUMMARY_RATE)
+    wbefore = round(WINDOW_BEFORE * RATE)
+    wafter = round(WINDOW_AFTER * RATE)
 
     timestamps = frames[:, -3]
     answers = frames[:, -2]
     weights = frames[:, -1]
-
-    # dont condense timestamps, answers, weights
-    condensed = condense(frames[...,:-3], summary, summarize=True)
 
     for (tt,(st,et)) in tags:
         if type(tt) is not int: tt = tt.value
@@ -330,20 +314,12 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[np.ndarray,np.ndarra
     #    print(f'{SceneType(x)}) {np.count_nonzero(answers == x)}')
     
     frames = np.concatenate((
-        np.tile(frames[0], (rate,1)),
+        np.tile(frames[0], (wbefore + rate,1)),
         frames,
-        np.tile(frames[-1], (rate,1)),
+        np.tile(frames[-1], (rate + wafter,1)),
     ))
 
-    condensed = np.concatenate((
-        np.tile(condensed[0], (wbefore,1)),
-        condensed,
-        np.tile(condensed[-1], (wafter,1)),
-    ))
-
-    condensed = np.repeat(condensed, summary, axis=0)
-
-    return (frames,condensed)
+    return frames
 
 def load_persistent(flogname:str,for_training=True):
     fname = flogname
@@ -354,135 +330,94 @@ def load_persistent(flogname:str,for_training=True):
     if fname.endswith('.json'):
         fname = fname[:-5]
     
-    if not os.path.exists(fname + ".frames.npy") or not os.path.exists(fname + '.summary.npy'):
-        frames,condensed = flog_to_vecs(processor.read_feature_log(flogname), for_training)
+    if not os.path.exists(fname + ".frames.npy"):
+        frames = flog_to_vecs(processor.read_feature_log(flogname), for_training)
         np.save(fname+'.frames.npy', frames)
-        np.save(fname+'.summary.npy', condensed)
+        frames = None
     
-    frames = np.load(fname+'.frames.npy', mmap_mode='r')
-    condensed = np.load(fname+'.summary.npy', mmap_mode='r')
-
-    return (frames,condensed)
+    return np.load(fname+'.frames.npy', mmap_mode='r')
 
 def load_nonpersistent(flog:dict,for_training=False):
     return flog_to_vecs(flog, for_training)
 
-def sliding_window_skip(arr, window_size, repeat_skip):
-    # Calculate the shape and strides for the sliding window view over an array that had np.repeat previously run on it
-    from numpy.lib.stride_tricks import as_strided
-    new_shape = (arr.shape[0] - (window_size-1)*repeat_skip, window_size, arr.shape[1])
-    new_strides = (arr.strides[0], arr.strides[0] * repeat_skip, arr.strides[1])
-    return as_strided(arr, shape=new_shape, strides=new_strides, writeable=False)
-
 from keras.utils import Sequence
-class WindowStackGenerator(Sequence):
-    def __init__(self, stuff=None, ordered=True, categorical=True):
+class WindowGenerator(Sequence):
+    def __init__(self, frames=None, ordered=True, categorical=True):
         super().__init__()
-        if stuff is None:
+        if frames is None:
             return
         
         # +/- 1s is all frames, plus the WINDOW before/after which is condensed to SUMMARY_RATE 
         rate = round(RATE)
-        summary = round(RATE/SUMMARY_RATE)
-        wbefore = round(WINDOW_BEFORE * SUMMARY_RATE)
-        wafter = round(WINDOW_AFTER * SUMMARY_RATE)
+        wbefore = round(WINDOW_BEFORE * RATE)
+        wafter = round(WINDOW_AFTER * RATE)
         self.batch_size = BATCH_SIZE
 
-        (frames,condensed) = stuff
-
-        # frames has been tile with rate on each side and has timestamps,answers,weights concatted...
+        # frames has been tile'd on each side and has timestamps,answers,weights concatted...
         # unpack all that
-        self.timestamps = frames[rate:-rate,-3]
+        self.timestamps = frames[wbefore+rate:-(rate+wafter),-3]
         if categorical:
-            self.answers = array2onehot(frames[rate:-rate,-2].astype('uint32'), SceneType.count(), dtype='float32')
+            self.answers = array2onehot(frames[wbefore+rate:-(rate+wafter),-2].astype('uint32'), SceneType.count(), dtype='float32')
         else:
-            self.answers = np.where(frames[rate:-rate,-2].astype('uint32') == SceneType.COMMERCIAL.value, 1.0, 0.0)
-        self.weights = frames[rate:-rate,-1]
+            self.answers = np.where(frames[wbefore+rate:-(rate+wafter),-2].astype('uint32') == SceneType.COMMERCIAL.value, 1.0, 0.0)
+        self.weights = frames[wbefore+rate:-(rate+wafter),-1]
         frames = frames[:, :-3]
-        
+
         from numpy.lib.stride_tricks import sliding_window_view
-        self.frames = sliding_window_view(frames, (rate+1+rate, frames.shape[1],)).squeeze()
-        self.before = sliding_window_skip(condensed[:-(wafter+1)*summary], wbefore, summary)
-        self.after = sliding_window_skip(condensed[(wbefore+1)*summary:], wafter, summary)
+        self.frames = sliding_window_view(frames, (wbefore+rate+1+rate+wafter, frames.shape[1],)).squeeze()
+
+        #print(frames.shape, self.timestamps.shape, self.frames.shape)
 
         assert(np.shares_memory(frames, self.frames))
         assert(len(self.frames) == len(self.timestamps))
         assert(len(self.frames) == len(self.answers))
         assert(len(self.frames) == len(self.weights))
 
-        # truncate these if they are a little over-size from being repeated
-        assert(len(self.frames) <= len(self.before))
-        assert(len(self.frames) <= len(self.after))
-        self.before = self.before[:len(self.frames)]
-        self.after = self.after[:len(self.frames)]
-        assert(np.shares_memory(condensed, self.before))
-        assert(np.shares_memory(condensed, self.after))
+        self.len = ceil( len(self.frames) / self.batch_size )
+        self.shape = ( self.len, self.batch_size ) + self.frames.shape[1:]
 
-        self.stride = len(self.frames) // self.batch_size # we want every N to add up to about the Batch Size
-        self.len = ceil(len(self.frames) / self.batch_size)
-        self.shape = ( self.len, self.batch_size, self.before.shape[1] + self.frames.shape[1] + self.after.shape[1], self.frames.shape[2] )
-        self.offset = 0
+        self.ordering = np.arange( self.len )
 
-        self.set_ordered(ordered)
+        if not ordered:
+            from random import shuffle
+            shuffle(self.ordering)
 
     def split(self, split=0.75):
-        a = WindowStackGenerator()
-        b = WindowStackGenerator()
+        from random import shuffle
+        shuffle(self.ordering)
+
+        a = WindowGenerator()
+        b = WindowGenerator()
         for (k,v) in self.__dict__.items():
             setattr(a, k, v)
             setattr(b, k, v)
-        
-        from random import randrange
 
-        swap = randrange(2) == 0
-        if swap:
-            split = 1 - split
-
-        a.set_ordered(False)
-        a.offset = 0
         a.len = ceil( (len(self.frames) * split) / self.batch_size )
-        a.shape = (a.len,) + a.shape[1:]
-
-        b.set_ordered(False)
-        b.offset = a.len
         b.len = self.len - a.len
+        a.shape = (a.len,) + a.shape[1:]
         b.shape = (b.len,) + b.shape[1:]
+        a.ordering = np.copy(self.ordering[:a.len])
+        b.ordering = np.copy(self.ordering[a.len:])
         
-        if swap:
-            return (b,a)
-        else:
-            return (a,b)
+        return (a,b)
     
     def __len__(self):
         return self.len
     
     def __getitem__(self, index):
-        return self.getter(index)
+        index = self.ordering[index] * self.batch_size
+        endex = index + self.batch_size
+        return (self.frames[index:endex], self.answers[index:endex], self.weights[index:endex])
     
     def set_ordered(self, ordered=True):
-        self.getter = self.get_ordered if ordered else self.get_unordered
-    
-    def get_ordered(self, index):
-        index = (index + self.offset) * self.batch_size
-        endex = index + self.batch_size
-        data = np.concatenate((
-            self.before[index:endex],
-            self.frames[index:endex],
-            self.after [index:endex],
-        ), axis=1)
-        return (data, self.answers[index:endex], self.weights[index:endex])
-    
-    def get_unordered(self, index):
-        index += self.offset
-        data = np.concatenate((
-            self.before[index::self.stride],
-            self.frames[index::self.stride],
-            self.after [index::self.stride],
-        ), axis=1)
-        return (data, self.answers[index::self.stride], self.weights[index::self.stride])
-    
+        if ordered:
+            self.ordering = np.sort(self.ordering)
+        else:
+            from random import shuffle
+            shuffle(self.ordering)
+
 class MultiGenerator(Sequence):
-    def __init__(self, elements:list[WindowStackGenerator], **kwargs):
+    def __init__(self, elements:list[WindowGenerator], **kwargs):
         super().__init__(**kwargs)
         self.elements = elements
         self.num_elements = len(self.elements)
@@ -550,16 +485,18 @@ def load_data(opts, do_not_test=False) -> tuple[MultiGenerator,MultiGenerator]:
         if os.path.isdir(f) or f.endswith('.npy'):
             continue
         print("Loading",f)
-        if stuff := load_persistent(f, True):
-            data.append( WindowStackGenerator(stuff, categorical=False) )
+        frames = load_persistent(f, True)
+        if len(frames):
+            data.append( WindowGenerator(frames, categorical=False) )
             dlen += len(data[-1])
     
     for f in testfiles:
         if os.path.isdir(f) or f.endswith('.npy'):
             continue
         print("Loading test",f)
-        if stuff := load_persistent(f, True):
-            test.append( WindowStackGenerator(stuff, categorical=False) )
+        frames = load_persistent(f, True)
+        if len(frames):
+            test.append( WindowGenerator(frames, categorical=False) )
             tlen += len(test[-1])
     
     need = int(dlen*TEST_PERC+1) - tlen
@@ -660,12 +597,32 @@ def build_model(input_shape):
     inputs = Input(shape=input_shape[2:], dtype='float32', name="input")
     n = inputs
 
-    n = layers.TimeDistributed(layers.Dense(32, dtype='float32', activation='tanh'), name="dense-pre")(n)
+    rate = round(RATE)
+    wbefore = round(WINDOW_BEFORE * RATE)
+    wafter = round(WINDOW_AFTER * RATE)
+    coarse_rate = round(RATE/SUMMARY_RATE)
 
-    n = layers.Conv1D(filters=32, kernel_size=7, padding='same', activation='relu', name="conv_pre_a")(n)
-    n = layers.MaxPooling1D(pool_size=2, name="pool_a")(n)
-    n = layers.Conv1D(filters=32, kernel_size=3, padding='same', activation='relu', name="conv_pre_b")(n)
-    n = layers.MaxPooling1D(pool_size=2, name="pool_b")(n)
+    before = layers.Cropping1D( (0, rate + 1 + rate + wafter), name="carve-before" )(n)
+    assert(before.shape[1] == wbefore)
+    before = layers.Conv1D(filters=64, kernel_size=coarse_rate, strides=coarse_rate, padding='same', activation='relu', name="conv-before")(before)
+    before = layers.MaxPooling1D(pool_size=4, strides=4, name="before-pool")(before)
+
+    center = layers.Cropping1D( (wbefore, wafter), name="carve-center"  )(n)
+    assert(center.shape[1] == rate+1+rate)
+    #center = layers.TimeDistributed(layers.Dense(64, dtype='float32', activation='tanh'), name="dense-center")(center)
+    center = layers.Conv1D(filters=64, kernel_size=rate, strides=1, padding='same', activation='relu', name="conv-center")(center)
+
+    after = layers.Cropping1D( (wbefore + rate + 1 + rate, 0), name="carve-after" )(n)
+    assert(after.shape[1] == wafter)
+    after = layers.Conv1D(filters=64, kernel_size=coarse_rate, strides=coarse_rate, padding='same', activation='relu', name="conv-after")(after)
+    after = layers.MaxPooling1D(pool_size=4, strides=4, name="after-pool")(after)
+
+    n = layers.Concatenate(axis=1)([before,center,after])
+
+    #n = layers.Conv1D(filters=32, kernel_size=7, padding='same', activation='relu', name="conv_pre_a")(n)
+    #n = layers.MaxPooling1D(pool_size=2, name="pool_a")(n)
+    #n = layers.Conv1D(filters=32, kernel_size=3, padding='same', activation='relu', name="conv_pre_b")(n)
+    #n = layers.MaxPooling1D(pool_size=2, name="pool_b")(n)
 
     if RNN.lower() == "gru":
         n = layers.Bidirectional(layers.GRU(UNITS, dropout=DROPOUT), name="rnn")(n)
@@ -805,7 +762,7 @@ def do_predict(flog:dict, model, opts:Any):
     duration = flog.get('duration', 0)
     categorical = model.output_shape[-1] > 1
 
-    gen = WindowStackGenerator(stuff, ordered=True, categorical=categorical)
+    gen = WindowGenerator(stuff, ordered=True, categorical=categorical)
     times = gen.timestamps
 
     prediction = model.predict(gen, verbose=True)
