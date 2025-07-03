@@ -26,7 +26,7 @@ SUMMARY_RATE = 2
 RATE = 29.97
 
 # training params
-RNN = 'lstm'
+RNN = 'gru'
 UNITS = 32
 DROPOUT = 0.4
 EPOCHS = 40
@@ -603,8 +603,8 @@ def train(opts:Any=None):
     stop = False
     epoch = 0
 
-    #model_path = '/tmp/blah.h5'
-    #epoch = 19
+    #model_path = '/tmp/train-xyz.pycf.model.keras'
+    #epoch = 10
 
     if True:
         _train_some(model_path, data, test, epoch)
@@ -660,15 +660,29 @@ def build_model(input_shape):
     inputs = Input(shape=input_shape[2:], dtype='float32', name="input")
     n = inputs
 
-    n = layers.TimeDistributed(layers.Dense(32, dtype='float32', activation='tanh'), name="dense-pre")(n)
+    #n = layers.TimeDistributed(layers.Dense(32, dtype='float32', activation='tanh'), name="dense-pre")(n)
+    n = layers.Conv1D(filters=32, kernel_size=5, padding='same', activation='relu', name="conv")(n)
+    #n = layers.MaxPooling1D(pool_size=2, name="pool_a")(n)
+    #n = layers.Conv1D(filters=32, kernel_size=3, padding='same', activation='relu', name="conv_pre_b")(n)
+    #n = layers.MaxPooling1D(pool_size=2, name="pool_b")(n)
 
-    n = layers.Conv1D(filters=32, kernel_size=7, padding='same', activation='relu', name="conv_pre_a")(n)
-    n = layers.MaxPooling1D(pool_size=2, name="pool_a")(n)
-    n = layers.Conv1D(filters=32, kernel_size=3, padding='same', activation='relu', name="conv_pre_b")(n)
-    n = layers.MaxPooling1D(pool_size=2, name="pool_b")(n)
+    #se = layers.GlobalAveragePooling1D(name="summarize")(n)
+    #se = layers.Dense(n.shape[-1] // 8, activation='relu', name='squeeze')(se)
+    #se = layers.Dense(n.shape[-1], activation='sigmoid', name='excite')(se)
+    #n = layers.Multiply(name="se_apply")([n, se[:,None,:]])
 
     if RNN.lower() == "gru":
         n = layers.Bidirectional(layers.GRU(UNITS, dropout=DROPOUT), name="rnn")(n)
+    elif RNN.lower() == "transformer":
+        # Pure transformer approach
+        n = layers.LayerNormalization(epsilon=1e-6)(n)
+        n = layers.MultiHeadAttention(
+            num_heads=8,
+            key_dim=n.shape[-1] // 8,
+            name="transformer_mha"
+        )(n, n)
+        n = layers.LayerNormalization(epsilon=1e-6)(n)
+        n = layers.GlobalAveragePooling1D()(n)
     elif RNN.lower() == 'lstm':
         n = layers.Bidirectional(layers.LSTM(UNITS, dropout=DROPOUT), name="rnn")(n)
     elif RNN.lower() == 'lstm-attn':
