@@ -666,11 +666,12 @@ def build_model(input_shape):
     #n = layers.Conv1D(filters=32, kernel_size=3, padding='same', activation='relu', name="conv_pre_b")(n)
     #n = layers.MaxPooling1D(pool_size=2, name="pool_b")(n)
 
-    #se = layers.GlobalAveragePooling1D(name="summarize")(n)
-    #se = layers.Dense(n.shape[-1] // 8, activation='relu', name='squeeze')(se)
-    #se = layers.Dense(n.shape[-1], activation='sigmoid', name='excite')(se)
-    #n = layers.Multiply(name="se_apply")([n, se[:,None,:]])
-
+    se = layers.GlobalAveragePooling1D(name="squeeze_pre")(n)
+    se = layers.Dense(n.shape[-1] // 4, activation='relu', name='excite1_pre')(se)
+    se = layers.Dense(n.shape[-1], activation='sigmoid', name='excite2_pre')(se)
+    se = layers.Reshape((1,se.shape[-1]))(se)  # match shape for multiply
+    n = layers.Multiply(name="se_apply_pre")([n, se])
+    
     if RNN.lower() == "gru":
         n = layers.Bidirectional(layers.GRU(UNITS, dropout=DROPOUT), name="rnn")(n)
     elif RNN.lower() == "transformer":
@@ -698,14 +699,13 @@ def build_model(input_shape):
         # Global average pooling to reduce temporal dimension
         n = layers.GlobalAveragePooling1D()(n)  # (batch_size, features)
 
-    # Squeeze-and-Excitation 
-    se = layers.Dense(n.shape[-1] // 8, activation='relu', name="squeeze")(n)
-    se = layers.Dense(n.shape[-1], activation='sigmoid', name="excite")(n)
-    #se = layers.Reshape((n.shape[-1],), name="se_shape")(se)
-    n = layers.Multiply(name="se_apply")([n, se])
+    # Squeeze-and-Excitation ... or just excitation, apparently.
+    se = layers.Dense(n.shape[-1] // 4, activation='relu', name="excite1_post")(n)
+    se = layers.Dense(n.shape[-1], activation='sigmoid', name="excite2_post")(se)
+    n = layers.Multiply(name="se_apply_post")([n, se])
     
     n = layers.Dense(32, dtype='float32', activation='relu', name="dense-post")(n)
-    #n = layers.Dense(16, dtype='float32', activation='relu', name="final")(n)
+    n = layers.Dense(16, dtype='float32', activation='relu', name="final")(n)
     outputs = layers.Dense(1, dtype='float32', activation='sigmoid', name="output")(n)
     
     return Model(inputs, outputs)
