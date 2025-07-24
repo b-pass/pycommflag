@@ -563,7 +563,7 @@ def load_data(opts, do_not_test=False) -> tuple[MultiGenerator,MultiGenerator]:
             tlen += len(test[-1])
     
     need = int(dlen*TEST_PERC+1) - tlen
-    if need > dlen/100 and not do_not_test:
+    if need > dlen/100 and not do_not_test and tlen < 10000:
         print(f'Need to move {need} of {dlen} batches to the test/eval set')
         datakeep = 1 - need/dlen
         orig = data
@@ -661,11 +661,21 @@ def build_model(input_shape):
     n = inputs
 
     n = layers.TimeDistributed(layers.Dense(32, dtype='float32', activation='tanh'), name="dense-pre")(n)
+    n = layers.SpatialDropout1D(DROPOUT)(n)
 
     n = layers.Conv1D(filters=32, kernel_size=7, padding='same', activation='relu', name="conv_pre_a")(n)
     n = layers.MaxPooling1D(pool_size=2, name="pool_a")(n)
+    n = layers.SpatialDropout1D(DROPOUT)(n)
     n = layers.Conv1D(filters=32, kernel_size=3, padding='same', activation='relu', name="conv_pre_b")(n)
     n = layers.MaxPooling1D(pool_size=2, name="pool_b")(n)
+    n = layers.SpatialDropout1D(DROPOUT)(n)
+
+    # Squeeze-and-Excitation 
+    se = layers.GlobalAveragePooling1D(name="squeeze")(n)
+    se = layers.Dense(n.shape[-1] // 8, activation='relu', name='excite1')(se)
+    se = layers.Dense(n.shape[-1], activation='sigmoid', name='excite2')(se)
+    se = layers.Reshape((1,se.shape[-1]))(se)  # match shape for multiply
+    n = layers.Multiply(name="se_apply")([n, se])
 
     if RNN.lower() == "gru":
         n = layers.Bidirectional(layers.GRU(UNITS, dropout=DROPOUT), name="rnn")(n)
@@ -683,14 +693,9 @@ def build_model(input_shape):
         
         # Global average pooling to reduce temporal dimension
         n = layers.GlobalAveragePooling1D()(n)  # (batch_size, features)
-
-    # Squeeze-and-Excitation 
-    se = layers.Dense(n.shape[-1] // 8, activation='relu', name="squeeze")(n)
-    se = layers.Dense(n.shape[-1], activation='sigmoid', name="excite")(n)
-    #se = layers.Reshape((n.shape[-1],), name="se_shape")(se)
-    n = layers.Multiply(name="se_apply")([n, se])
     
     n = layers.Dense(32, dtype='float32', activation='relu', name="dense-post")(n)
+    n = layers.Dropout(DROPOUT/2)(n)
     #n = layers.Dense(16, dtype='float32', activation='relu', name="final")(n)
     outputs = layers.Dense(1, dtype='float32', activation='sigmoid', name="output")(n)
     
@@ -986,7 +991,7 @@ def eval(opts:Any):
             log.exception(f"Unable to load MODEL {mf}")
 
     for f in opts.ml_data:
-        if os.path.isdir(f):
+        if os.path.isdir(f) or f.endswith('.npy'):
             continue
         
         try:
