@@ -322,7 +322,7 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[np.ndarray,np.ndarra
                     dist = np.abs(np.arange(ws, we + 1) - i)
                     new_weights = 2.25 - ((dist / ((we - ws) / 2)) ** 2)  # Scale the distance by (rate * 3)
                     new_weights = np.clip(new_weights, 1.0, 2.0)  # Ensure weights are between 1.0 and 2.0
-                    weights[ws:we + 1] = np.where(weights[ws:we + 1] > 0, new_weights, 0)
+                    weights[ws:we + 1] = np.maximum(weights[ws:we + 1], new_weights, where=(weights[ws:we + 1] >= 0.5))
 
     #for w in range(3):
     #    print(f'{w}) {np.count_nonzero(weights == w)}')
@@ -661,11 +661,13 @@ def build_model(input_shape):
     n = inputs
 
     n = layers.TimeDistributed(layers.Dense(32, dtype='float32', activation='tanh'), name="dense-pre")(n)
-    n = layers.SpatialDropout1D(DROPOUT)(n)
+    n = layers.TimeDistributed(layers.Dropout(DROPOUT/2))(n)
+    #n = layers.SpatialDropout1D(DROPOUT)(n)
 
     n = layers.Conv1D(filters=32, kernel_size=7, padding='same', activation='relu', name="conv_pre_a")(n)
-    n = layers.MaxPooling1D(pool_size=2, name="pool_a")(n)
+    #n = layers.MaxPooling1D(pool_size=2, name="pool_a")(n)
     n = layers.SpatialDropout1D(DROPOUT)(n)
+
     n = layers.Conv1D(filters=32, kernel_size=3, padding='same', activation='relu', name="conv_pre_b")(n)
     n = layers.MaxPooling1D(pool_size=2, name="pool_b")(n)
     n = layers.SpatialDropout1D(DROPOUT)(n)
@@ -678,11 +680,11 @@ def build_model(input_shape):
     n = layers.Multiply(name="se_apply")([n, se])
 
     if RNN.lower() == "gru":
-        n = layers.Bidirectional(layers.GRU(UNITS, dropout=DROPOUT), name="rnn")(n)
+        n = layers.GRU(UNITS, dropout=DROPOUT, name="rnn")(n)
     elif RNN.lower() == 'lstm':
-        n = layers.Bidirectional(layers.LSTM(UNITS, dropout=DROPOUT), name="rnn")(n)
+        n = layers.LSTM(UNITS, dropout=0.5, name="rnn")(n)
     elif RNN.lower() == 'lstm-attn':
-        n = layers.Bidirectional(layers.LSTM(UNITS, dropout=DROPOUT, return_sequences=True), name="rnn")(n)
+        n = layers.LSTM(UNITS, dropout=DROPOUT, return_sequences=True, name="rnn")(n)
         
         # MultiHeadAttention with 4 heads
         n = layers.MultiHeadAttention(
@@ -695,7 +697,7 @@ def build_model(input_shape):
         n = layers.GlobalAveragePooling1D()(n)  # (batch_size, features)
     
     n = layers.Dense(32, dtype='float32', activation='relu', name="dense-post")(n)
-    n = layers.Dropout(DROPOUT/2)(n)
+    n = layers.Dropout(0.2)(n)
     #n = layers.Dense(16, dtype='float32', activation='relu', name="final")(n)
     outputs = layers.Dense(1, dtype='float32', activation='sigmoid', name="output")(n)
     
