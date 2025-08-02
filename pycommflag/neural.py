@@ -26,12 +26,13 @@ SUMMARY_RATE = 2
 RATE = 29.97
 
 # training params
-RNN = 'lstm'
+RNN = 'gru'
 UNITS = 32
 DROPOUT = 0.4
 EPOCHS = 40
 BATCH_SIZE = 256
 TEST_PERC = 0.25
+PATIENCE = 3
 
 def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]], 
                  blanks: List[Tuple[bool, Tuple[float, float]]], 
@@ -563,8 +564,8 @@ def load_data(opts, do_not_test=False) -> tuple[MultiGenerator,MultiGenerator]:
             tlen += len(test[-1])
     
     need = int(dlen*TEST_PERC+1) - tlen
-    if need > dlen/100 and not do_not_test and tlen < 10000:
-        print(f'Need to move {need} of {dlen} batches to the test/eval set')
+    if need > dlen/100 and not do_not_test and tlen < 1000:
+        print(f'Need to move {need} of {dlen} batches to the test/eval set (have {tlen} will have {need+tlen})')
         datakeep = 1 - need/dlen
         orig = data
         data = []
@@ -654,51 +655,61 @@ def train(opts:Any=None):
 def _train_proc(model_path, train_dataset, test_dataset, epoch, queue):
     queue.put( _train_some(model_path, train_dataset, test_dataset, epoch) )
 
+def transformer_encoder(inputs, head_size=256, num_heads=4):
+    from keras import layers, Input, Model
+
+    # Attention and Normalization
+    n = layers.MultiHeadAttention(
+        key_dim=head_size, num_heads=num_heads, dropout=DROPOUT
+    )(inputs, inputs)
+    n = layers.Dropout(DROPOUT)(n)
+    n = layers.LayerNormalization(epsilon=1e-6)(n)
+    res = n + inputs
+
+    # Feed Forward Part
+    n = layers.Conv1D(filters=UNITS, kernel_size=1, activation="relu")(res)
+    n = layers.Dropout(DROPOUT)(n)
+    n = layers.Conv1D(filters=inputs.shape[-1], kernel_size=1)(n)
+    n = layers.LayerNormalization(epsilon=1e-6)(n)
+    return n + res
+
 def build_model(input_shape):
     from keras import layers, Input, Model
 
     inputs = Input(shape=input_shape[2:], dtype='float32', name="input")
     n = inputs
 
-    n = layers.TimeDistributed(layers.Dense(32, dtype='float32', activation='tanh'), name="dense-pre")(n)
-    n = layers.TimeDistributed(layers.Dropout(DROPOUT/2))(n)
+    n = layers.TimeDistributed(layers.Dense(UNITS//2, dtype='float32', activation='relu'), name="dense-pre")(n)
+    n = layers.TimeDistributed(layers.Dropout(DROPOUT))(n)
     #n = layers.SpatialDropout1D(DROPOUT)(n)
 
-    n = layers.Conv1D(filters=32, kernel_size=7, padding='same', activation='relu', name="conv_pre_a")(n)
-    #n = layers.MaxPooling1D(pool_size=2, name="pool_a")(n)
+    n = layers.Conv1D(filters=UNITS, kernel_size=7, padding='same', activation='relu', name="conv_pre_a")(n)
+    n = layers.MaxPooling1D(pool_size=2, name="pool_a")(n)
     n = layers.SpatialDropout1D(DROPOUT)(n)
 
-    n = layers.Conv1D(filters=32, kernel_size=3, padding='same', activation='relu', name="conv_pre_b")(n)
+    n = layers.Conv1D(filters=UNITS, kernel_size=3, padding='same', activation='relu', name="conv_pre_b")(n)
     n = layers.MaxPooling1D(pool_size=2, name="pool_b")(n)
     n = layers.SpatialDropout1D(DROPOUT)(n)
 
-    # Squeeze-and-Excitation 
-    se = layers.GlobalAveragePooling1D(name="squeeze")(n)
-    se = layers.Dense(n.shape[-1] // 8, activation='relu', name='excite1')(se)
-    se = layers.Dense(n.shape[-1], activation='sigmoid', name='excite2')(se)
-    se = layers.Reshape((1,se.shape[-1]))(se)  # match shape for multiply
-    n = layers.Multiply(name="se_apply")([n, se])
+    if RNN.lower() == 'transformer':
+        n = transformer_encoder(n, 128, 2)
+        n = layers.GlobalAveragePooling1D()(n)
+    else:
+        # Squeeze-and-Excitation 
+        se = layers.GlobalAveragePooling1D(name="squeeze")(n)
+        se = layers.Dense(n.shape[-1] // 8, activation='relu', name='excite1')(se)
+        se = layers.Dense(n.shape[-1], activation='sigmoid', name='excite2')(se)
+        se = layers.Reshape((1,se.shape[-1]))(se)  # match shape for multiply
+        n = layers.Multiply(name="se_apply")([n, se])
 
-    if RNN.lower() == "gru":
-        n = layers.GRU(UNITS, dropout=DROPOUT, name="rnn")(n)
-    elif RNN.lower() == 'lstm':
-        n = layers.LSTM(UNITS, dropout=0.5, name="rnn")(n)
-    elif RNN.lower() == 'lstm-attn':
-        n = layers.LSTM(UNITS, dropout=DROPOUT, return_sequences=True, name="rnn")(n)
-        
-        # MultiHeadAttention with 4 heads
-        n = layers.MultiHeadAttention(
-            num_heads=4,
-            key_dim=n.shape[-1] // 4,  # Split features across heads
-            name="multi_head_attention"
-        )(n, n) 
-        
-        # Global average pooling to reduce temporal dimension
-        n = layers.GlobalAveragePooling1D()(n)  # (batch_size, features)
+        if RNN.lower() == "gru":
+            n = layers.GRU(UNITS, dropout=DROPOUT, name="rnn")(n)
+        elif RNN.lower() == 'lstm':
+            n = layers.LSTM(UNITS, dropout=0.4, name="rnn")(n)
     
-    n = layers.Dense(32, dtype='float32', activation='relu', name="dense-post")(n)
-    n = layers.Dropout(0.2)(n)
-    #n = layers.Dense(16, dtype='float32', activation='relu', name="final")(n)
+    n = layers.Dense(UNITS, dtype='float32', activation='relu', name="dense-post")(n)
+    n = layers.Dropout(DROPOUT)(n)
+    #n = layers.Dense(UNITS//2, dtype='float32', activation='relu', name="final")(n)
     outputs = layers.Dense(1, dtype='float32', activation='sigmoid', name="output")(n)
     
     return Model(inputs, outputs)
@@ -722,9 +733,9 @@ def _train_some(model_path, train_dataset:MultiGenerator, test_dataset:MultiGene
 
     from keras import callbacks
 
-    cb.append(callbacks.EarlyStopping(monitor='accuracy', patience=3))
-    cb.append(callbacks.EarlyStopping(monitor='val_accuracy', patience=3))
-    cb.append(callbacks.ReduceLROnPlateau(patience=2))
+    cb.append(callbacks.EarlyStopping(monitor='accuracy', patience=PATIENCE+1))
+    cb.append(callbacks.EarlyStopping(monitor='val_accuracy', patience=PATIENCE+1))
+    cb.append(callbacks.ReduceLROnPlateau(patience=PATIENCE))
     
     class EpochCheckpoint(callbacks.ModelCheckpoint):
         def on_epoch_end(self, epoch, logs=None):
