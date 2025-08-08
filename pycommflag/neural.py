@@ -604,8 +604,8 @@ def train(opts:Any=None):
     stop = False
     epoch = 0
 
-    #model_path = '/tmp/blah.h5'
-    #epoch = 19
+    #model_path = '/tmp/train-xyz.pycf.model.keras'
+    #epoch = 10
 
     if True:
         _train_some(model_path, data, test, epoch)
