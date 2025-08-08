@@ -28,7 +28,7 @@ RATE = 29.97
 # training params
 RNN = 'gru'
 UNITS = 32
-DROPOUT = 0.4
+DROPOUT = 0.3
 EPOCHS = 40
 BATCH_SIZE = 256
 TEST_PERC = 0.25
@@ -679,17 +679,22 @@ def build_model(input_shape):
     inputs = Input(shape=input_shape[2:], dtype='float32', name="input")
     n = inputs
 
-    n = layers.TimeDistributed(layers.Dense(UNITS//2, dtype='float32', activation='relu'), name="dense-pre")(n)
-    n = layers.TimeDistributed(layers.Dropout(DROPOUT))(n)
+    n = layers.TimeDistributed(layers.Dense(16, dtype='float32', activation='relu', kernel_regularizer='l1_l2'), name="dense-pre")(n)
+    #n = layers.TimeDistributed(layers.Dropout(DROPOUT))(n)
     #n = layers.SpatialDropout1D(DROPOUT)(n)
+    n = layers.LayerNormalization()(n)
+
+    skip = layers.GlobalAveragePooling1D()(n)
 
     n = layers.Conv1D(filters=UNITS, kernel_size=7, padding='same', activation='relu', name="conv_pre_a")(n)
-    n = layers.MaxPooling1D(pool_size=2, name="pool_a")(n)
+    #n = layers.MaxPooling1D(pool_size=2, name="pool_a")(n)
     n = layers.SpatialDropout1D(DROPOUT)(n)
+    #n = layers.LayerNormalization()(n)
 
     n = layers.Conv1D(filters=UNITS, kernel_size=3, padding='same', activation='relu', name="conv_pre_b")(n)
     n = layers.MaxPooling1D(pool_size=2, name="pool_b")(n)
     n = layers.SpatialDropout1D(DROPOUT)(n)
+    #n = layers.LayerNormalization()(n)
 
     if RNN.lower() == 'transformer':
         n = transformer_encoder(n, 128, 2)
@@ -702,14 +707,27 @@ def build_model(input_shape):
         se = layers.Reshape((1,se.shape[-1]))(se)  # match shape for multiply
         n = layers.Multiply(name="se_apply")([n, se])
 
+        n = layers.LayerNormalization()(n)
         if RNN.lower() == "gru":
             n = layers.GRU(UNITS, dropout=DROPOUT, name="rnn")(n)
         elif RNN.lower() == 'lstm':
-            n = layers.LSTM(UNITS, dropout=0.4, name="rnn")(n)
+            n = layers.LSTM(UNITS, dropout=DROPOUT, name="rnn")(n)
+        n = layers.LayerNormalization()(n)
     
-    n = layers.Dense(UNITS, dtype='float32', activation='relu', name="dense-post")(n)
+    #n = layers.Dense(UNITS, dtype='float32', activation='relu', kernel_regularizer='l1_l2', name="dense-post")(n)
+    #n = layers.LayerNormalization()(n)
+    #n = layers.Dropout(DROPOUT)(n)
+
+    n = layers.Dense(16, dtype='float32', activation='relu', name="final")(n)
+    n = layers.LayerNormalization()(n)
     n = layers.Dropout(DROPOUT)(n)
-    #n = layers.Dense(UNITS//2, dtype='float32', activation='relu', name="final")(n)
+        
+    n = n + skip
+
+    n = layers.Dense(16, dtype='float32', activation='relu')(n)
+    n = layers.LayerNormalization()(n)
+    n = layers.Dropout(DROPOUT)(n)
+    
     outputs = layers.Dense(1, dtype='float32', activation='sigmoid', name="output")(n)
     
     return Model(inputs, outputs)
@@ -742,7 +760,7 @@ def _train_some(model_path, train_dataset:MultiGenerator, test_dataset:MultiGene
             self.last_epoch = epoch
             return super().on_epoch_end(epoch, logs)
 
-    ecp = EpochCheckpoint(model_path, verbose=1, monitor='val_accuracy', mode='auto', save_best_only=True)
+    ecp = EpochCheckpoint(model_path, verbose=1, save_best_only=True)
     cb.append(ecp)
 
     class MemoryChecker(callbacks.Callback):
