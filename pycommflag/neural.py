@@ -679,55 +679,51 @@ def build_model(input_shape):
     inputs = Input(shape=input_shape[2:], dtype='float32', name="input")
     n = inputs
 
-    n = layers.TimeDistributed(layers.Dense(16, dtype='float32', activation='relu', kernel_regularizer='l1_l2'), name="dense-pre")(n)
-    #n = layers.TimeDistributed(layers.Dropout(DROPOUT))(n)
-    #n = layers.SpatialDropout1D(DROPOUT)(n)
-    n = layers.LayerNormalization()(n)
-
-    skip = layers.GlobalAveragePooling1D()(n)
-
-    n = layers.Conv1D(filters=UNITS, kernel_size=7, padding='same', activation='relu', name="conv_pre_a")(n)
+    #n = layers.TimeDistributed(layers.Dense(UNITS, dtype='float32', activation='tanh'), name="dense-pre")(n)
+    n = layers.Conv1D(filters=UNITS, kernel_size=30, padding='same', activation='relu', name="conv")(n)
     #n = layers.MaxPooling1D(pool_size=2, name="pool_a")(n)
-    n = layers.SpatialDropout1D(DROPOUT)(n)
-    #n = layers.LayerNormalization()(n)
+    #n = layers.Conv1D(filters=UNITS, kernel_size=3, padding='same', activation='relu', name="conv_pre_b")(n)
+    #n = layers.MaxPooling1D(pool_size=2, name="pool_b")(n)
 
-    n = layers.Conv1D(filters=UNITS, kernel_size=3, padding='same', activation='relu', name="conv_pre_b")(n)
-    n = layers.MaxPooling1D(pool_size=2, name="pool_b")(n)
-    n = layers.SpatialDropout1D(DROPOUT)(n)
-    #n = layers.LayerNormalization()(n)
-
-    if RNN.lower() == 'transformer':
-        n = transformer_encoder(n, 128, 2)
+    se = layers.GlobalAveragePooling1D(name="squeeze_pre")(n)
+    se = layers.Dense(n.shape[-1] // 4, activation='relu', name='excite1_pre')(se)
+    se = layers.Dense(n.shape[-1], activation='sigmoid', name='excite2_pre')(se)
+    se = layers.Reshape((1,se.shape[-1]))(se)  # match shape for multiply
+    n = layers.Multiply(name="se_apply_pre")([n, se])
+    
+    if RNN.lower() == "gru":
+        n = layers.Bidirectional(layers.GRU(UNITS, dropout=DROPOUT), name="rnn")(n)
+    elif RNN.lower() == "transformer":
+        # Pure transformer approach
+        n = layers.LayerNormalization(epsilon=1e-6)(n)
+        n = layers.MultiHeadAttention(
+            num_heads=8,
+            key_dim=n.shape[-1] // 8
+        )(n, n)
+        n = layers.LayerNormalization(epsilon=1e-6)(n)
         n = layers.GlobalAveragePooling1D()(n)
-    else:
-        # Squeeze-and-Excitation 
-        se = layers.GlobalAveragePooling1D(name="squeeze")(n)
-        se = layers.Dense(n.shape[-1] // 8, activation='relu', name='excite1')(se)
-        se = layers.Dense(n.shape[-1], activation='sigmoid', name='excite2')(se)
-        se = layers.Reshape((1,se.shape[-1]))(se)  # match shape for multiply
-        n = layers.Multiply(name="se_apply")([n, se])
-
-        n = layers.LayerNormalization()(n)
-        if RNN.lower() == "gru":
-            n = layers.GRU(UNITS, dropout=DROPOUT, name="rnn")(n)
-        elif RNN.lower() == 'lstm':
-            n = layers.LSTM(UNITS, dropout=DROPOUT, name="rnn")(n)
-        n = layers.LayerNormalization()(n)
-    
-    #n = layers.Dense(UNITS, dtype='float32', activation='relu', kernel_regularizer='l1_l2', name="dense-post")(n)
-    #n = layers.LayerNormalization()(n)
-    #n = layers.Dropout(DROPOUT)(n)
-
-    n = layers.Dense(16, dtype='float32', activation='relu', name="final")(n)
-    n = layers.LayerNormalization()(n)
-    n = layers.Dropout(DROPOUT)(n)
+    elif RNN.lower() == 'lstm':
+        n = layers.Bidirectional(layers.LSTM(UNITS, dropout=DROPOUT), name="rnn")(n)
+    elif RNN.lower() == 'lstm-attn':
+        n = layers.Bidirectional(layers.LSTM(UNITS, dropout=DROPOUT, return_sequences=True), name="rnn")(n)
         
-    n = n + skip
+        # MultiHeadAttention with 4 heads
+        n = layers.MultiHeadAttention(
+            num_heads=4,
+            key_dim=n.shape[-1] // 4,  # Split features across heads
+            name="multi_head_attention"
+        )(n, n) 
+        
+        # Global average pooling to reduce temporal dimension
+        n = layers.GlobalAveragePooling1D()(n)  # (batch_size, features)
 
-    n = layers.Dense(16, dtype='float32', activation='relu')(n)
-    n = layers.LayerNormalization()(n)
-    n = layers.Dropout(DROPOUT)(n)
+    # Squeeze-and-Excitation ... or just excitation, apparently.
+    se = layers.Dense(n.shape[-1] // 4, activation='relu', name="excite1_post")(n)
+    se = layers.Dense(n.shape[-1], activation='sigmoid', name="excite2_post")(se)
+    n = layers.Multiply(name="se_apply_post")([n, se])
     
+    n = layers.Dense(UNITS, dtype='float32', activation='relu', name="dense-post")(n)
+    n = layers.Dense(UNITS//2, dtype='float32', activation='relu', name="final")(n)
     outputs = layers.Dense(1, dtype='float32', activation='sigmoid', name="output")(n)
     
     return Model(inputs, outputs)
