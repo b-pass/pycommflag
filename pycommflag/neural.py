@@ -679,8 +679,7 @@ def build_model(input_shape):
     inputs = Input(shape=input_shape[2:], dtype='float32', name="input")
     n = inputs
 
-    #n = layers.TimeDistributed(layers.Dense(UNITS, dtype='float32', activation='tanh'), name="dense-pre")(n)
-    n = layers.Conv1D(filters=UNITS, kernel_size=30, padding='same', activation='relu', name="conv")(n)
+    n = layers.Conv1D(filters=UNITS, kernel_size=29, padding='same', activation='relu', name="conv")(n)
     #n = layers.MaxPooling1D(pool_size=2, name="pool_a")(n)
     #n = layers.Conv1D(filters=UNITS, kernel_size=3, padding='same', activation='relu', name="conv_pre_b")(n)
     #n = layers.MaxPooling1D(pool_size=2, name="pool_b")(n)
@@ -722,8 +721,14 @@ def build_model(input_shape):
     se = layers.Dense(n.shape[-1], activation='sigmoid', name="excite2_post")(se)
     n = layers.Multiply(name="se_apply_post")([n, se])
     
-    n = layers.Dense(UNITS, dtype='float32', activation='relu', name="dense-post")(n)
-    n = layers.Dense(UNITS//2, dtype='float32', activation='relu', name="final")(n)
+    n = layers.Dense(UNITS, dtype='float32', activation='relu', kernel_regularizer='l1_l2', name="dense-post")(n)
+    
+    skip = layers.TimeDistributed(layers.Dense(UNITS, dtype='float32', kernel_regularizer='l1_l2', activation='tanh'), name="dense-skip")(inputs)
+    skip = layers.GlobalMaxPool1D(name="skip")(skip)
+
+    n = layers.Add(name="added")([n, skip])
+
+    n = layers.Dense(UNITS//2, dtype='float32', activation='relu', kernel_regularizer='l1_l2', name="final")(n)
     outputs = layers.Dense(1, dtype='float32', activation='sigmoid', name="output")(n)
     
     return Model(inputs, outputs)
@@ -751,12 +756,12 @@ def _train_some(model_path, train_dataset:MultiGenerator, test_dataset:MultiGene
     cb.append(callbacks.EarlyStopping(monitor='val_accuracy', patience=PATIENCE+1))
     cb.append(callbacks.ReduceLROnPlateau(patience=PATIENCE))
     
-    class EpochCheckpoint(callbacks.ModelCheckpoint):
+    class EpochModelCheckpoint(callbacks.ModelCheckpoint):
         def on_epoch_end(self, epoch, logs=None):
             self.last_epoch = epoch
             return super().on_epoch_end(epoch, logs)
 
-    ecp = EpochCheckpoint(model_path, verbose=1, save_best_only=True)
+    ecp = EpochModelCheckpoint(model_path, "val_accuracy", verbose=1, save_best_only=True)
     cb.append(ecp)
 
     class MemoryChecker(callbacks.Callback):
