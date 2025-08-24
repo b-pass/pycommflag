@@ -20,13 +20,13 @@ from . import processor
 from . import neural
 
 # data params, both for train and for inference
-WINDOW_BEFORE = 30
-WINDOW_AFTER = 30
-SUMMARY_RATE = 2
+WINDOW_BEFORE = 59
+WINDOW_AFTER = 59
+SUMMARY_RATE = 1
 RATE = 29.97
 
 # training params
-RNN = 'gru'
+RNN = 'lstm'
 UNITS = 32
 DROPOUT = 0.3
 EPOCHS = 40
@@ -289,19 +289,13 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[np.ndarray,np.ndarra
 
     # normalize frame rate
     frames = condense(frames, round(frame_rate/RATE), summarize=False)
-
-    # +/- 1s is all frames, plus the WINDOW before/after which is condensed to SUMMARY_RATE 
-    rate = round(RATE)
-    summary = round(RATE/SUMMARY_RATE)
+    
     wbefore = round(WINDOW_BEFORE * SUMMARY_RATE)
     wafter = round(WINDOW_AFTER * SUMMARY_RATE)
 
     timestamps = frames[:, -3]
     answers = frames[:, -2]
     weights = frames[:, -1]
-
-    # dont condense timestamps, answers, weights
-    condensed = condense(frames[...,:-3], summary, summarize=True)
 
     for (tt,(st,et)) in tags:
         if type(tt) is not int: tt = tt.value
@@ -316,25 +310,18 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[np.ndarray,np.ndarra
             
             # higher weight near the transition
             for i in (si,ei):
-                ws = max(0,i-rate*3)
-                we = min(len(weights),i+rate*3)
-                if ws > 0 and we < len(weights):
-                    #weights[ws:we] = np.where(weights[ws:we] > 0, 2, 0)
-                    dist = np.abs(np.arange(ws, we + 1) - i)
-                    new_weights = 2.25 - ((dist / ((we - ws) / 2)) ** 2)  # Scale the distance by (rate * 3)
-                    new_weights = np.clip(new_weights, 1.0, 2.0)  # Ensure weights are between 1.0 and 2.0
-                    weights[ws:we + 1] = np.maximum(weights[ws:we + 1], new_weights, where=(weights[ws:we + 1] >= 0.5))
+                ws = max(0,i-round(RATE)*3)
+                we = min(len(weights)-1,i+round(RATE)*3)
+                #weights[ws:we] = np.where(weights[ws:we] > 0, 2, 0)
+                dist = np.abs(np.arange(ws, we + 1) - i)
+                new_weights = 2.25 - ((dist / ((we - ws) / 2)) ** 2)  # Scale the distance by (rate * 3)
+                new_weights = np.clip(new_weights, 1.0, 2.0)  # Ensure weights are between 1.0 and 2.0
+                weights[ws:we + 1] = np.maximum(weights[ws:we + 1], new_weights, where=(weights[ws:we + 1] >= 0.5))
 
-    #for w in range(3):
-    #    print(f'{w}) {np.count_nonzero(weights == w)}')
+    condensed = condense(frames, round(RATE/SUMMARY_RATE), summarize=True)
+    
     #for x in range(SceneType.count()+1):
     #    print(f'{SceneType(x)}) {np.count_nonzero(answers == x)}')
-    
-    frames = np.concatenate((
-        np.tile(frames[0], (rate,1)),
-        frames,
-        np.tile(frames[-1], (rate,1)),
-    ))
 
     condensed = np.concatenate((
         np.tile(condensed[0], (wbefore,1)),
@@ -342,9 +329,11 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[np.ndarray,np.ndarra
         np.tile(condensed[-1], (wafter,1)),
     ))
 
-    condensed = np.repeat(condensed, summary, axis=0)
-
     return (frames,condensed)
+
+def load_nonpersistent(flog:dict,for_training=False):
+    _,condensed = flog_to_vecs(flog, for_training)
+    return condensed
 
 def load_persistent(flogname:str,for_training=True):
     fname = flogname
@@ -355,18 +344,12 @@ def load_persistent(flogname:str,for_training=True):
     if fname.endswith('.json'):
         fname = fname[:-5]
     
-    if not os.path.exists(fname + ".frames.npy") or not os.path.exists(fname + '.summary.npy'):
-        frames,condensed = flog_to_vecs(processor.read_feature_log(flogname), for_training)
-        np.save(fname+'.frames.npy', frames)
-        np.save(fname+'.summary.npy', condensed)
+    if not os.path.exists(fname + '.data.npy'):
+        condensed = load_nonpersistent(processor.read_feature_log(flogname), for_training)
+        np.save(fname+'.data.npy', condensed)
     
-    frames = np.load(fname+'.frames.npy', mmap_mode='r')
-    condensed = np.load(fname+'.summary.npy', mmap_mode='r')
-
-    return (frames,condensed)
-
-def load_nonpersistent(flog:dict,for_training=False):
-    return flog_to_vecs(flog, for_training)
+    condensed = np.load(fname+'.data.npy', mmap_mode='r')
+    return condensed
 
 def sliding_window_skip(arr, window_size, repeat_skip):
     # Calculate the shape and strides for the sliding window view over an array that had np.repeat previously run on it
@@ -377,51 +360,38 @@ def sliding_window_skip(arr, window_size, repeat_skip):
 
 from keras.utils import Sequence
 class WindowStackGenerator(Sequence):
-    def __init__(self, stuff=None, ordered=True, categorical=True):
+    def __init__(self, condensed=None, ordered=True, categorical=True):
         super().__init__()
-        if stuff is None:
+        if condensed is None:
             return
         
-        # +/- 1s is all frames, plus the WINDOW before/after which is condensed to SUMMARY_RATE 
-        rate = round(RATE)
-        summary = round(RATE/SUMMARY_RATE)
         wbefore = round(WINDOW_BEFORE * SUMMARY_RATE)
         wafter = round(WINDOW_AFTER * SUMMARY_RATE)
         self.batch_size = BATCH_SIZE
 
-        (frames,condensed) = stuff
-
-        # frames has been tile with rate on each side and has timestamps,answers,weights concatted...
-        # unpack all that
-        self.timestamps = frames[rate:-rate,-3]
+        self.timestamps = condensed[wbefore:-wafter,-3]
+        self.answers = condensed[wbefore:-wafter,-2]
         if categorical:
-            self.answers = array2onehot(frames[rate:-rate,-2].astype('uint32'), SceneType.count(), dtype='float32')
+            self.answers = array2onehot(self.answers.astype('uint32'), SceneType.count(), dtype='float32')
         else:
-            self.answers = np.where(frames[rate:-rate,-2].astype('uint32') == SceneType.COMMERCIAL.value, 1.0, 0.0)
-        self.weights = frames[rate:-rate,-1]
-        frames = frames[:, :-3]
+            self.answers = np.where(self.answers.astype('uint32') == SceneType.COMMERCIAL.value, 1.0, 0.0)
+        self.weights = condensed[wbefore:-wafter,-1]
+
+        condensed = condensed[:, :-3]
         
         from numpy.lib.stride_tricks import sliding_window_view
-        self.frames = sliding_window_view(frames, (rate+1+rate, frames.shape[1],)).squeeze()
-        self.before = sliding_window_skip(condensed[:-(wafter+1)*summary], wbefore, summary)
-        self.after = sliding_window_skip(condensed[(wbefore+1)*summary:], wafter, summary)
+        self.frames = sliding_window_view(condensed, (wbefore+1+wafter, condensed.shape[1],)).squeeze()
 
-        assert(np.shares_memory(frames, self.frames))
+        #print(len(self.frames), len(self.timestamps))
+
+        assert(np.shares_memory(condensed, self.frames))
         assert(len(self.frames) == len(self.timestamps))
         assert(len(self.frames) == len(self.answers))
         assert(len(self.frames) == len(self.weights))
 
-        # truncate these if they are a little over-size from being repeated
-        assert(len(self.frames) <= len(self.before))
-        assert(len(self.frames) <= len(self.after))
-        self.before = self.before[:len(self.frames)]
-        self.after = self.after[:len(self.frames)]
-        assert(np.shares_memory(condensed, self.before))
-        assert(np.shares_memory(condensed, self.after))
-
         self.stride = len(self.frames) // self.batch_size # we want every N to add up to about the Batch Size
         self.len = ceil(len(self.frames) / self.batch_size)
-        self.shape = ( self.len, self.batch_size, self.before.shape[1] + self.frames.shape[1] + self.after.shape[1], self.frames.shape[2] )
+        self.shape = ( self.len, self.batch_size, self.frames.shape[1], self.frames.shape[2] )
         self.offset = 0
 
         self.set_ordered(ordered)
@@ -466,21 +436,11 @@ class WindowStackGenerator(Sequence):
     def get_ordered(self, index):
         index = (index + self.offset) * self.batch_size
         endex = index + self.batch_size
-        data = np.concatenate((
-            self.before[index:endex],
-            self.frames[index:endex],
-            self.after [index:endex],
-        ), axis=1)
-        return (data, self.answers[index:endex], self.weights[index:endex])
+        return (self.frames[index:endex], self.answers[index:endex], self.weights[index:endex])
     
     def get_unordered(self, index):
         index += self.offset
-        data = np.concatenate((
-            self.before[index::self.stride],
-            self.frames[index::self.stride],
-            self.after [index::self.stride],
-        ), axis=1)
-        return (data, self.answers[index::self.stride], self.weights[index::self.stride])
+        return (self.frames[index::self.stride], self.answers[index::self.stride], self.weights[index::self.stride])
     
 class MultiGenerator(Sequence):
     def __init__(self, elements:list[WindowStackGenerator], **kwargs):
@@ -551,7 +511,8 @@ def load_data(opts, do_not_test=False) -> tuple[MultiGenerator,MultiGenerator]:
         if os.path.isdir(f) or f.endswith('.npy'):
             continue
         print("Loading",f)
-        if stuff := load_persistent(f, True):
+        stuff = load_persistent(f, True)
+        if stuff is not None:
             data.append( WindowStackGenerator(stuff, categorical=False) )
             dlen += len(data[-1])
     
@@ -559,13 +520,14 @@ def load_data(opts, do_not_test=False) -> tuple[MultiGenerator,MultiGenerator]:
         if os.path.isdir(f) or f.endswith('.npy'):
             continue
         print("Loading test",f)
-        if stuff := load_persistent(f, True):
+        stuff = load_persistent(f, True)
+        if stuff is not None:
             test.append( WindowStackGenerator(stuff, categorical=False) )
             tlen += len(test[-1])
     
     need = int(dlen*TEST_PERC+1) - tlen
-    if need > dlen/100 and not do_not_test and tlen < 1000:
-        print(f'Need to move {need} of {dlen} batches to the test/eval set (have {tlen} will have {need+tlen})')
+    if need > dlen/100 and not do_not_test and tlen < 250:
+        print(f'Need to move {need} of {dlen} batches to the test/eval set (have {tlen} will have ~{need+tlen})')
         datakeep = 1 - need/dlen
         orig = data
         data = []
@@ -691,18 +653,13 @@ def build_model(input_shape):
     n = layers.Multiply(name="se_apply_pre")([n, se])
     
     if RNN.lower() == "gru":
-        n = layers.Bidirectional(layers.GRU(UNITS, dropout=DROPOUT), name="rnn")(n)
-    elif RNN.lower() == "transformer":
-        # Pure transformer approach
-        n = layers.LayerNormalization(epsilon=1e-6)(n)
-        n = layers.MultiHeadAttention(
-            num_heads=8,
-            key_dim=n.shape[-1] // 8
-        )(n, n)
-        n = layers.LayerNormalization(epsilon=1e-6)(n)
-        n = layers.GlobalAveragePooling1D()(n)
+        n = layers.GRU(UNITS, dropout=DROPOUT, name="rnn")(n)
     elif RNN.lower() == 'lstm':
-        n = layers.Bidirectional(layers.LSTM(UNITS, dropout=DROPOUT), name="rnn")(n)
+        n = layers.LSTM(UNITS, dropout=DROPOUT, name="rnn")(n)
+    elif RNN.lower() == "transformer":
+        n = transformer_encoder(n)
+        n = transformer_encoder(n)
+        n = layers.GlobalAveragePooling1D()(n)
     elif RNN.lower() == 'lstm-attn':
         n = layers.Bidirectional(layers.LSTM(UNITS, dropout=DROPOUT, return_sequences=True), name="rnn")(n)
         
@@ -752,16 +709,16 @@ def _train_some(model_path, train_dataset:MultiGenerator, test_dataset:MultiGene
 
     from keras import callbacks
 
-    cb.append(callbacks.EarlyStopping(monitor='accuracy', patience=PATIENCE+1))
-    cb.append(callbacks.EarlyStopping(monitor='val_accuracy', patience=PATIENCE+1))
-    cb.append(callbacks.ReduceLROnPlateau(patience=PATIENCE))
+    cb.append(callbacks.EarlyStopping(monitor='loss', patience=PATIENCE+1))
+    cb.append(callbacks.EarlyStopping(monitor='val_accuracy', patience=PATIENCE+2))
+    cb.append(callbacks.ReduceLROnPlateau(monitor='val_accuracy', patience=PATIENCE))
     
     class EpochModelCheckpoint(callbacks.ModelCheckpoint):
         def on_epoch_end(self, epoch, logs=None):
             self.last_epoch = epoch
             return super().on_epoch_end(epoch, logs)
 
-    ecp = EpochModelCheckpoint(model_path, "val_accuracy", verbose=1, save_best_only=True)
+    ecp = EpochModelCheckpoint(model_path, monitor='val_accuracy', verbose=1, save_best_only=True)
     cb.append(ecp)
 
     class MemoryChecker(callbacks.Callback):
@@ -835,13 +792,11 @@ def predict(feature_log:str|TextIO|dict, opts:Any, write_log=None)->list:
     return results
 
 def do_predict(flog:dict, model, opts:Any):
-    stuff = load_nonpersistent(flog, False)
-    if not stuff:
-        return None
-    
     duration = flog.get('duration', 0)
     categorical = model.output_shape[-1] > 1
-
+    stuff = load_nonpersistent(flog, False)
+    if stuff is None:
+        return None
     gen = WindowStackGenerator(stuff, ordered=True, categorical=categorical)
     times = gen.timestamps
 
@@ -1004,8 +959,14 @@ def eval(opts:Any):
     try: os.nice(19)
     except: pass
 
-    print("EVALUATE", len(opts.eval), "on", len(opts.ml_data))
-
+    datafiles = []
+    for f in opts.ml_data:
+        if os.path.isdir(f) or f.endswith('.npy'):
+            continue
+        else:
+            datafiles.append(f)
+    
+    print("EVALUATE", len(opts.eval), "on", len(datafiles))
 
     import tensorflow as tf
     import keras
@@ -1022,10 +983,7 @@ def eval(opts:Any):
         except Exception as e:
             log.exception(f"Unable to load MODEL {mf}")
 
-    for f in opts.ml_data:
-        if os.path.isdir(f) or f.endswith('.npy'):
-            continue
-        
+    for f in datafiles:
         try:
             flog = processor.read_feature_log(f)
             if not flog:
