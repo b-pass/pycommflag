@@ -376,9 +376,9 @@ class DataGenerator(Sequence):
         else:
             return d
         
-def load_data_sliding_window(condensed:np.ndarray, categorical=False)->tuple[list[np.ndarray]]:
+def load_data_sliding_window(condensed:np.ndarray, categorical=False)->tuple[np.ndarray,np.ndarray,np.ndarray,np.ndarray]:
     if condensed is None:
-        return ([],[],[])
+        return ([],[],[],[])
     
     wbefore = round(WINDOW_BEFORE * SUMMARY_RATE)
     wafter = round(WINDOW_AFTER * SUMMARY_RATE)
@@ -403,7 +403,7 @@ def load_data_sliding_window(condensed:np.ndarray, categorical=False)->tuple[lis
     assert(len(frames) == len(answers))
     assert(len(frames) == len(weights))
 
-    return frames, answers, weights
+    return frames, answers, weights, timestamps
 
 def load_data(opts, do_not_test=False) -> tuple[DataGenerator,DataGenerator]:
     datafiles = opts.ml_data
@@ -735,13 +735,11 @@ def predict(feature_log:str|TextIO|dict, opts:Any, write_log=None)->list:
 def do_predict(flog:dict, model, opts:Any):
     duration = flog.get('duration', 0)
     categorical = model.output_shape[-1] > 1
-    stuff = load_nonpersistent(flog, False)
-    if stuff is None:
-        return None
-    gen = WindowStackGenerator(stuff, ordered=True, categorical=categorical)
-    times = gen.timestamps
+    
+    data = load_nonpersistent(flog, False)
+    data,_,_,times = load_data_sliding_window(data, categorical=categorical)
 
-    prediction = model.predict(gen, verbose=True)
+    prediction = model.predict(DataGenerator(data), verbose=True)
 
     result = np.argmax(prediction, axis=1) if categorical else None
     results = [(0,(0,0))]
