@@ -299,7 +299,7 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[np.ndarray,np.ndarra
             weights[si:ei] = 0 # ignore this entire section
         else:
             answers[si:ei] = tt
-            continue
+            continue # weights actually seem a little worse now...?
             
             # higher weight near the transition
             for i in (si,ei):
@@ -352,128 +352,60 @@ def sliding_window_skip(arr, window_size, repeat_skip):
     return as_strided(arr, shape=new_shape, strides=new_strides, writeable=False)
 
 from keras.utils import Sequence
-class WindowStackGenerator(Sequence):
-    def __init__(self, condensed=None, ordered=True, categorical=True):
-        super().__init__()
-        if condensed is None:
-            return
-        
-        wbefore = round(WINDOW_BEFORE * SUMMARY_RATE)
-        wafter = round(WINDOW_AFTER * SUMMARY_RATE)
-        self.batch_size = BATCH_SIZE
-
-        self.timestamps = condensed[wbefore:-wafter,-3]
-        self.answers = condensed[wbefore:-wafter,-2]
-        if categorical:
-            self.answers = array2onehot(self.answers.astype('uint32'), SceneType.count(), dtype='float32')
-        else:
-            self.answers = np.where(self.answers.astype('uint32') == SceneType.COMMERCIAL.value, 1.0, 0.0)
-        self.weights = condensed[wbefore:-wafter,-1]
-
-        condensed = condensed[:, :-3]
-        
-        from numpy.lib.stride_tricks import sliding_window_view
-        self.frames = sliding_window_view(condensed, (wbefore+1+wafter, condensed.shape[1],)).squeeze()
-
-        #print(len(self.frames), len(self.timestamps))
-
-        assert(np.shares_memory(condensed, self.frames))
-        assert(len(self.frames) == len(self.timestamps))
-        assert(len(self.frames) == len(self.answers))
-        assert(len(self.frames) == len(self.weights))
-
-        self.stride = len(self.frames) // self.batch_size # we want every N to add up to about the Batch Size
-        self.len = ceil(len(self.frames) / self.batch_size)
-        self.shape = ( self.len, self.batch_size, self.frames.shape[1], self.frames.shape[2] )
-        self.offset = 0
-
-        self.set_ordered(ordered)
-
-    def split(self, split=0.75):
-        a = WindowStackGenerator()
-        b = WindowStackGenerator()
-        for (k,v) in self.__dict__.items():
-            setattr(a, k, v)
-            setattr(b, k, v)
-        
-        from random import randrange
-
-        swap = randrange(2) == 0
-        if swap:
-            split = 1 - split
-
-        a.set_ordered(False)
-        a.offset = 0
-        a.len = ceil( (len(self.frames) * split) / self.batch_size )
-        a.shape = (a.len,) + a.shape[1:]
-
-        b.set_ordered(False)
-        b.offset = a.len
-        b.len = self.len - a.len
-        b.shape = (b.len,) + b.shape[1:]
-        
-        if swap:
-            return (b,a)
-        else:
-            return (a,b)
+class DataGenerator(Sequence):
+    def __init__(self, data, answers=None, weights=None):
+        self.data = np.array(data, dtype='float32')
+        self.answers = np.array(answers, dtype='float32') if answers else None
+        self.weights = np.array(weights, dtype='float32') if weights else None
+        self.len = ceil(len(self.data) / BATCH_SIZE)
+        self.shape = (BATCH_SIZE, len(data[0]), len(data[0][0]))
     
     def __len__(self):
         return self.len
     
     def __getitem__(self, index):
-        return self.getter(index)
-    
-    def set_ordered(self, ordered=True):
-        self.getter = self.get_ordered if ordered else self.get_unordered
-    
-    def get_ordered(self, index):
-        index = (index + self.offset) * self.batch_size
-        endex = index + self.batch_size
-        return (self.frames[index:endex], self.answers[index:endex], self.weights[index:endex])
-    
-    def get_unordered(self, index):
-        index += self.offset
-        return (self.frames[index::self.stride], self.answers[index::self.stride], self.weights[index::self.stride])
-    
-class MultiGenerator(Sequence):
-    def __init__(self, elements:list[WindowStackGenerator], **kwargs):
-        super().__init__(**kwargs)
-        self.elements = elements
-        self.num_elements = len(self.elements)
-        self._recalc()
-    
-    def _recalc(self):
-        self.lengths = []
-        self.offsets = []
-        self.len = 0
-        shape = self.elements[0].shape[1:]
-        for e in self.elements:
-            assert(e.shape[1:] == shape)
-            #if e.shape[1:] != shape:
-            #    print(e.shape[1:], "incompatible with", shape,"--",e.frames.shape, "vs", self.elements[0].frames.shape)
-            
-            x = len(e)
-            self.lengths.append(x)
-            self.offsets.append(self.len)
-            self.len += x
-        self.shape = (self.len,) + shape
-        self.offsets = np.array(self.offsets, dtype='uint32')
+        index *= BATCH_SIZE
+        d = self.data[index:index+BATCH_SIZE]
+        if self.answers is not None:
+            a = self.answers[index:index+BATCH_SIZE]
+            if self.weights is not None:
+                w = self.weights[index:index+BATCH_SIZE]
+                return d,a,w
+            else:
+                return d,a
+        else:
+            return d
         
-    def shuffle(self):
-        from random import shuffle
-        shuffle(self.elements)
-        for e in self.elements:
-            e.set_ordered(False)
-        self._recalc()
-        
-    def __len__(self):
-        return self.len
+def load_data_sliding_window(condensed:np.ndarray, categorical=False)->tuple[list[np.ndarray]]:
+    if condensed is None:
+        return ([],[],[])
     
-    def __getitem__(self, index):
-        ei = np.searchsorted(self.offsets, index, 'right')-1
-        return self.elements[ei][index - self.offsets[ei]]
+    wbefore = round(WINDOW_BEFORE * SUMMARY_RATE)
+    wafter = round(WINDOW_AFTER * SUMMARY_RATE)
 
-def load_data(opts, do_not_test=False) -> tuple[MultiGenerator,MultiGenerator]:
+    timestamps = condensed[wbefore:-wafter,-3]
+    answers = condensed[wbefore:-wafter,-2]
+    if categorical:
+        answers = array2onehot(answers.astype('uint32'), SceneType.count(), dtype='float32')
+    else:
+        answers = np.where(answers.astype('uint32') == SceneType.COMMERCIAL.value, 1.0, 0.0)
+    weights = condensed[wbefore:-wafter,-1]
+
+    condensed = condensed[:, :-3]
+    
+    from numpy.lib.stride_tricks import sliding_window_view
+    frames = sliding_window_view(condensed, (wbefore+1+wafter, condensed.shape[1],)).squeeze()
+
+    #print(len(self.frames), len(self.timestamps))
+
+    assert(np.shares_memory(condensed, frames))
+    assert(len(frames) == len(timestamps))
+    assert(len(frames) == len(answers))
+    assert(len(frames) == len(weights))
+
+    return frames, answers, weights
+
+def load_data(opts, do_not_test=False) -> tuple[DataGenerator,DataGenerator]:
     datafiles = opts.ml_data
     if not datafiles:
         return None
@@ -496,43 +428,53 @@ def load_data(opts, do_not_test=False) -> tuple[MultiGenerator,MultiGenerator]:
                 i += 1
 
     dlen = 0
-    data = []
+    data = ([],[],[])
     tlen = 0
-    test = []
+    test = ([],[],[])
 
     for f in datafiles:
         if os.path.isdir(f) or f.endswith('.npy'):
             continue
         print("Loading",f)
-        stuff = load_persistent(f, True)
+        stuff = load_data_sliding_window(load_persistent(f))
         if stuff is not None:
-            data.append( WindowStackGenerator(stuff, categorical=False) )
-            dlen += len(data[-1])
+            dlen += len(stuff[0])
+            for x in range(3):
+                for i in range(len(stuff[x])):
+                    data[x].append(stuff[x][i])
     
     for f in testfiles:
         if os.path.isdir(f) or f.endswith('.npy'):
             continue
         print("Loading test",f)
-        stuff = load_persistent(f, True)
+        stuff = load_data_sliding_window(load_persistent(f))
         if stuff is not None:
-            test.append( WindowStackGenerator(stuff, categorical=False) )
-            tlen += len(test[-1])
+            tlen += len(stuff[0])
+            for x in range(3):
+                for i in range(len(stuff[x])):
+                    test[x].append(stuff[x][i])
+    stuff = None
+
+    from random import shuffle
+
+    data = list(zip(*data))
+    shuffle(data)
+
+    if not do_not_test and tlen < 250:
+        need = int(dlen*TEST_PERC+1) - tlen
+        if need > dlen/100:
+            print(f'Need to move {need} of {dlen} elements to the test/eval set (have {tlen} will have ~{need+tlen})')
+            for i in range(need):
+                e = data[i]
+                test[0].append(e[0])
+                test[1].append(e[1])
+                test[2].append(e[2])
+            data = data[need:]
     
-    need = int(dlen*TEST_PERC+1) - tlen
-    if need > dlen/100 and not do_not_test and tlen < 250:
-        print(f'Need to move {need} of {dlen} batches to the test/eval set (have {tlen} will have ~{need+tlen})')
-        datakeep = 1 - need/dlen
-        orig = data
-        data = []
-        dlen = 0
-        for o in orig:
-            (d,t) = o.split(datakeep)
-            dlen += len(d)
-            tlen += len(t)
-            data.append(d)
-            test.append(t)
+    data = DataGenerator(*zip(*data))
+    test = DataGenerator(*test) if test else None
     
-    return (MultiGenerator(data), MultiGenerator(test))
+    return data,test
 
 def train(opts:Any=None):
     # yield CPU time to useful tasks, this is a background thing...
@@ -540,7 +482,6 @@ def train(opts:Any=None):
     except: pass
 
     (data,test) = load_data(opts)
-    gc.collect()
     
     #print('Calculating loss weights')
     #sums = np.sum((np.sum(answers, axis=0), np.sum(test_answers, axis=0)), axis=0)
@@ -551,7 +492,7 @@ def train(opts:Any=None):
     #weights = (np.sum(sums)-sums)/np.sum(sums)
     #print("Loss Weights",weights)
     
-    print(f"Data batches (x):{data.shape} - Test batches (y):{test.shape}")
+    print(f"Data shape (x):{data.shape} - Test shape (y):{test.shape if test is not None else 'None'}")
     
     tfile = tempfile.NamedTemporaryFile(prefix='train-', suffix='.pycf.model.keras', )
     model_path = tfile.name
@@ -631,7 +572,7 @@ def transformer_encoder(inputs, head_size=256, num_heads=4):
 def build_model(input_shape):
     from keras import layers, Input, Model
 
-    inputs = Input(shape=input_shape[2:], dtype='float32', name="input")
+    inputs = Input(shape=input_shape[-2:], dtype='float32', name="input")
     n = inputs
 
     #n = layers.TimeDistributed(layers.Dense(UNITS//2, dtype='float32', kernel_regularizer='l1_l2', activation='relu'))(n)
@@ -690,11 +631,9 @@ def build_model(input_shape):
     
     return Model(inputs, outputs)
 
-def _train_some(model_path, train_dataset:MultiGenerator, test_dataset:MultiGenerator, epoch=0) -> tuple[int,bool]:
+def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,bool]:
     import signal
     import keras
-
-    train_dataset.shuffle()
 
     model:keras.models.Model = None
     if epoch > 0:
@@ -705,6 +644,8 @@ def _train_some(model_path, train_dataset:MultiGenerator, test_dataset:MultiGene
         model.compile(optimizer="adam", loss="binary_crossentropy", metrics=['accuracy', 'AUC'])
         model.save(model_path)
     
+    gc.collect()
+
     cb = []
 
     from keras import callbacks
