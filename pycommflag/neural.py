@@ -20,19 +20,21 @@ from . import processor
 from . import neural
 
 # data params, both for train and for inference
-WINDOW_BEFORE = 59
-WINDOW_AFTER = 59
+WINDOW_BEFORE = 60
+WINDOW_AFTER = 60
 SUMMARY_RATE = 1
 RATE = 29.97
 
 # training params
 RNN = 'lstm'
+F = 32
+K = 11
 UNITS = 32
 DROPOUT = 0.3
 EPOCHS = 40
-BATCH_SIZE = 256
+BATCH_SIZE = 128
 TEST_PERC = 0.25
-PATIENCE = 3
+PATIENCE = 5
 
 def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]], 
                  blanks: List[Tuple[bool, Tuple[float, float]]], 
@@ -157,18 +159,13 @@ def condense(frames: np.ndarray, step: int, summarize=True) -> np.ndarray:
     if n_frames >= step:
         # Reshape the array to group frames by step size
         valid_frames = frames[:(n_frames//step)*step].reshape(-1, step, frames.shape[1])
-        
-        # Initialize condensed array with middle frame of each group
-        # This preserves all features that don't need averaging
-        condensed = valid_frames[:, step//2].copy()
 
-        # Update only the features that need condensing
+        condensed = np.average(valid_frames, axis=1)
+        
+        # Update only the features that need 
         if summarize:
-            condensed[:, 1] = np.mean(valid_frames[:, :, 1], axis=1, dtype='float32')  # Average logo
-            condensed[:, 2] = np.mean(valid_frames[:, :, 2], axis=1, dtype='float32')  # Average blank
             condensed[:, 3] = np.count_nonzero(valid_frames[:, :, 3] >= 0.5, axis=1) / step  # Diff ratio
         else:
-            condensed[:, 1] = np.mean(valid_frames[:, :, 1], axis=1, dtype='float32')  # Logo percentage
             condensed[:, 2] = np.max(valid_frames[:, :, 2], axis=1)  # Blank present
             condensed[:, 3] = np.max(valid_frames[:, :, 3], axis=1)  # Diff max
     else:
@@ -177,15 +174,10 @@ def condense(frames: np.ndarray, step: int, summarize=True) -> np.ndarray:
     if remaining > 0:
         # Do the final, partial condensing
         last_frames = frames[-remaining:]
-
-        last_condensed = last_frames[remaining//2].copy()  # Keep all features from middle frame
-
+        last_condensed = np.average(last_frames, axis=0)
         if summarize:
-            last_condensed[1] = np.mean(last_frames[:, 1], dtype='float32')  # Average logo
-            last_condensed[2] = np.mean(last_frames[:, 2], dtype='float32')  # Average blank
             last_condensed[3] = np.count_nonzero(last_frames[:, 3] >= 0.5) / remaining  # Diff ratio
         else:
-            last_condensed[1] = np.mean(last_frames[:, 1], dtype='float32')  # Logo percentage
             last_condensed[2] = np.max(last_frames[:, 2])  # Blank present
             last_condensed[3] = np.max(last_frames[:, 3])  # Diff max
         
@@ -288,7 +280,7 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[np.ndarray,np.ndarra
     frames[...,0] = (frames[...,0] % 1800.0) / 1800.0
 
     # normalize frame rate
-    frames = condense(frames, round(frame_rate/RATE), summarize=False)
+    #frames = condense(frames, round(frame_rate/RATE), summarize=False)
     
     wbefore = round(WINDOW_BEFORE * SUMMARY_RATE)
     wafter = round(WINDOW_AFTER * SUMMARY_RATE)
@@ -307,18 +299,19 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[np.ndarray,np.ndarra
             weights[si:ei] = 0 # ignore this entire section
         else:
             answers[si:ei] = tt
+            continue
             
             # higher weight near the transition
             for i in (si,ei):
-                ws = max(0,i-round(RATE)*3)
-                we = min(len(weights)-1,i+round(RATE)*3)
+                ws = max(0,i-round(frame_rate)*3)
+                we = min(len(weights)-1,i+round(frame_rate)*3)
                 #weights[ws:we] = np.where(weights[ws:we] > 0, 2, 0)
                 dist = np.abs(np.arange(ws, we + 1) - i)
                 new_weights = 2.25 - ((dist / ((we - ws) / 2)) ** 2)  # Scale the distance by (rate * 3)
                 new_weights = np.clip(new_weights, 1.0, 2.0)  # Ensure weights are between 1.0 and 2.0
                 weights[ws:we + 1] = np.maximum(weights[ws:we + 1], new_weights, where=(weights[ws:we + 1] >= 0.5))
 
-    condensed = condense(frames, round(RATE/SUMMARY_RATE), summarize=True)
+    condensed = condense(frames, round(frame_rate/SUMMARY_RATE), summarize=True)
     
     #for x in range(SceneType.count()+1):
     #    print(f'{SceneType(x)}) {np.count_nonzero(answers == x)}')
@@ -601,7 +594,7 @@ def train(opts:Any=None):
     print(tmetrics)
 
     if tmetrics[1] >= 0.80:
-        name = f'{opts.models_dir if opts and opts.models_dir else "."}{os.sep}pycf-{tmetrics[1]:.04f}-{RNN}{UNITS}bin-d{DROPOUT}-w{WINDOW_BEFORE}x{WINDOW_AFTER}x{SUMMARY_RATE}-{int(time.time())}.keras'
+        name = f'{opts.models_dir if opts and opts.models_dir else "."}{os.sep}pycf-{tmetrics[1]:.04f}-c{F}x{K}-{RNN}{UNITS}-w{WINDOW_BEFORE}x{WINDOW_AFTER}-{int(time.time())}.keras'
         print()
         print('Saving as ' + name)
 
@@ -641,7 +634,10 @@ def build_model(input_shape):
     inputs = Input(shape=input_shape[2:], dtype='float32', name="input")
     n = inputs
 
-    n = layers.Conv1D(filters=UNITS, kernel_size=29, padding='same', activation='relu', name="conv")(n)
+    #n = layers.TimeDistributed(layers.Dense(UNITS//2, dtype='float32', kernel_regularizer='l1_l2', activation='relu'))(n)
+    n = layers.Conv1D(filters=F, kernel_size=K//2, padding='same', activation='relu')(n)
+    n = layers.Conv1D(filters=F, kernel_size=K, padding='same', activation='relu')(n)
+    n = layers.Conv1D(filters=F, kernel_size=K*2+1, padding='same', activation='relu')(n)
     #n = layers.MaxPooling1D(pool_size=2, name="pool_a")(n)
     #n = layers.Conv1D(filters=UNITS, kernel_size=3, padding='same', activation='relu', name="conv_pre_b")(n)
     #n = layers.MaxPooling1D(pool_size=2, name="pool_b")(n)
@@ -654,38 +650,42 @@ def build_model(input_shape):
     
     if RNN.lower() == "gru":
         n = layers.GRU(UNITS, dropout=DROPOUT, name="rnn")(n)
+
+        # Squeeze-and-Excitation ... or just excitation, apparently.
+        se = layers.Dense(n.shape[-1] // 4, activation='relu', name="excite1_post")(n)
+        se = layers.Dense(n.shape[-1], activation='sigmoid', name="excite2_post")(se)
+        n = layers.Multiply(name="se_apply_post")([n, se])
     elif RNN.lower() == 'lstm':
         n = layers.LSTM(UNITS, dropout=DROPOUT, name="rnn")(n)
+
+        # Squeeze-and-Excitation ... or just excitation, apparently.
+        se = layers.Dense(n.shape[-1] // 4, activation='relu', name="excite1_post")(n)
+        se = layers.Dense(n.shape[-1], activation='sigmoid', name="excite2_post")(se)
+        n = layers.Multiply(name="se_apply_post")([n, se])
     elif RNN.lower() == "transformer":
         n = transformer_encoder(n)
         n = transformer_encoder(n)
         n = layers.GlobalAveragePooling1D()(n)
     elif RNN.lower() == 'lstm-attn':
-        n = layers.Bidirectional(layers.LSTM(UNITS, dropout=DROPOUT, return_sequences=True), name="rnn")(n)
+        n = layers.LSTM(UNITS, dropout=DROPOUT, return_sequences=True, name="rnn")(n)
         
         # MultiHeadAttention with 4 heads
         n = layers.MultiHeadAttention(
             num_heads=4,
             key_dim=n.shape[-1] // 4,  # Split features across heads
             name="multi_head_attention"
-        )(n, n) 
+        )(n, n)
         
         # Global average pooling to reduce temporal dimension
         n = layers.GlobalAveragePooling1D()(n)  # (batch_size, features)
-
-    # Squeeze-and-Excitation ... or just excitation, apparently.
-    se = layers.Dense(n.shape[-1] // 4, activation='relu', name="excite1_post")(n)
-    se = layers.Dense(n.shape[-1], activation='sigmoid', name="excite2_post")(se)
-    n = layers.Multiply(name="se_apply_post")([n, se])
     
     n = layers.Dense(UNITS, dtype='float32', activation='relu', kernel_regularizer='l1_l2', name="dense-post")(n)
     
-    skip = layers.TimeDistributed(layers.Dense(UNITS, dtype='float32', kernel_regularizer='l1_l2', activation='tanh'), name="dense-skip")(inputs)
-    skip = layers.GlobalMaxPool1D(name="skip")(skip)
+    #skip = layers.TimeDistributed(layers.Dense(UNITS, dtype='float32', kernel_regularizer='l1_l2', activation='tanh'), name="dense-skip")(inputs)
+    #skip = layers.GlobalMaxPool1D(name="skip")(skip)
+    #n = layers.Add(name="added")([n, skip])
 
-    n = layers.Add(name="added")([n, skip])
-
-    n = layers.Dense(UNITS//2, dtype='float32', activation='relu', kernel_regularizer='l1_l2', name="final")(n)
+    #n = layers.Dense(UNITS//2, dtype='float32', activation='relu', kernel_regularizer='l1_l2', name="final")(n)
     outputs = layers.Dense(1, dtype='float32', activation='sigmoid', name="output")(n)
     
     return Model(inputs, outputs)
@@ -978,6 +978,8 @@ def eval(opts:Any):
     for mf in opts.eval:
         try:
             models[mf] = keras.models.load_model(mf)
+            print(mf)
+            models[mf].summary()
             all_missing[mf] = 0
             all_extra[mf] = 0
         except Exception as e:
