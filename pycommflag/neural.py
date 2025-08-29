@@ -3,7 +3,7 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' # shut up, tf
 
 import logging as log
 import gc
-from math import ceil, floor
+from math import ceil, floor, isqrt
 from queue import Empty as QueueEmpty
 from multiprocessing import Process, Queue
 
@@ -14,6 +14,8 @@ import time
 from typing import Any, Iterator,TextIO,BinaryIO,List,Tuple
 
 import numpy as np
+import signal
+import random
 
 from .feature_span import *
 from . import processor
@@ -48,7 +50,6 @@ def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]],
         tags: List of (tag_type, (start_time, end_time))
         blanks: List of (is_blank, (start_time, end_time))
         diffs: List of (diff_value, (start_time, end_time))
-        duration: Total duration of the video
     
     Returns:
         Adjusted tags list with updated boundaries
@@ -60,68 +61,71 @@ def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]],
         # Find diffs within window
         window_start = target_time - search_window
         window_end = target_time + search_window
+        best = 0
+        when = None
+
+        for (val, (s,e)) in diffs:
+            time = s + (e-s)/2
+            if time < window_start or not val:
+                continue
+            if time > window_end:
+                break
+            if val > best:
+                best = val
+                when = time
         
-        # Filter diffs within window
-        candidates = [
-            (diff_val, (start, end)) for diff_val, (start, end) in diffs 
-            if window_start <= start <= window_end or 
-               window_start <= end <= window_end
-        ]
-        
-        if not candidates:
-            return target_time
-            
-        # Find highest diff value and its corresponding boundary
-        max_diff = max(candidates, key=lambda x: x[0])
-        start, end = max_diff[1]
-        
-        # Return the closest boundary to target_time
-        return start if abs(start - target_time) < abs(end - target_time) else end
+        return when if when is not None else target_time
 
     def find_nearest_blank(target_time: float, 
                          blanks: List[Tuple[bool, Tuple[float, float]]], 
-                         max_distance: float,
-                         left=True) -> float:
+                         max_distance: float) -> float:
 
-        nearest_time = None
-        min_distance = max_distance
+        best = None
+        dist = max_distance
         
         for is_blank, (start, end) in blanks:
             if not is_blank:
                 continue
+
+            when = start + (end - start)/2
             
-            if start > target_time + max_distance:
+            if when > target_time + max_distance:
                 break
 
-            if abs(start - target_time) < min_distance:
-                min_distance = abs(start - target_time)
-                nearest_time = (start,end)
-            
-            if abs(end - target_time) < min_distance:
-                min_distance = abs(end - target_time)
-                nearest_time = (start,end)
+            if abs(when - target_time) < dist:
+                dist = abs(when - target_time)
+                best = when
         
-        # we exclude the blanks from the tag, so on the left side we use the end/nearest[1]
-        # and on the right we use the begin/nearest[0]
-
-        return nearest_time[int(left)] if nearest_time is not None else target_time
+        return best if best is not None else target_time
 
     # Process each tag
     filtered_tags = []
     for tag_type, (start_time, end_time) in tags:
+        if tag_type in (SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value):
+            filtered_tags.append((tag_type, (start_time, end_time)))
+            continue
+
         # Different max distances based on tag type
         max_distance = 10 if tag_type in {SceneType.SHOW, SceneType.SHOW.value, 
                                         SceneType.COMMERCIAL, SceneType.COMMERCIAL.value} else 2
         
         # First try to align with blank frames
-        new_start = find_nearest_blank(start_time, blanks, max_distance, left=True)
-        new_end = find_nearest_blank(end_time, blanks, max_distance, left=False)
+        new_start = find_nearest_blank(start_time, blanks, max_distance)
+        new_end = find_nearest_blank(end_time, blanks, max_distance)
         
         # If still at original positions, try aligning with diff boundaries
         if new_start == start_time:
             new_start = find_highest_diff_boundary(start_time, 2, diffs)
+        #    if new_start != start_time:
+        #        print(f"MOVED tag start {tag_type} from {start_time} {new_start}")
+        #else:
+        #    print(f"ALIGNED tag start {tag_type} from {start_time} {new_start}")
         if new_end == end_time:
             new_end = find_highest_diff_boundary(end_time, 2, diffs)
+        #    if new_end != end_time:
+        #        print(f"MOVED tag end {tag_type} from {end_time} {new_end}")
+        #else:
+        #    print(f"ALIGNED tag end {tag_type} from {end_time} {new_end}")
         
         # Only keep valid tags
         if new_start < new_end:
@@ -129,7 +133,7 @@ def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]],
     
     return filtered_tags
 
-def condense(frames: np.ndarray, step: int, summarize=True) -> np.ndarray:
+def condense(frames: np.ndarray, step: int) -> np.ndarray:
     """
     Condense video frames by averaging specific features over specified step sizes.
     
@@ -162,12 +166,8 @@ def condense(frames: np.ndarray, step: int, summarize=True) -> np.ndarray:
 
         condensed = np.average(valid_frames, axis=1)
         
-        # Update only the features that need 
-        if summarize:
-            condensed[:, 3] = np.count_nonzero(valid_frames[:, :, 3] >= 0.5, axis=1) / step  # Diff ratio
-        else:
-            condensed[:, 2] = np.max(valid_frames[:, :, 2], axis=1)  # Blank present
-            condensed[:, 3] = np.max(valid_frames[:, :, 3], axis=1)  # Diff max
+        condensed[:, 3] = np.count_nonzero(valid_frames[:, :, 3] >= 0.5, axis=1) / step  # Diff ratio
+        condensed[:, -2] = np.where(condensed[:, -2] >= 0.5, 1.0, 0.0)
     else:
         condensed = None
     
@@ -175,11 +175,9 @@ def condense(frames: np.ndarray, step: int, summarize=True) -> np.ndarray:
         # Do the final, partial condensing
         last_frames = frames[-remaining:]
         last_condensed = np.average(last_frames, axis=0)
-        if summarize:
-            last_condensed[3] = np.count_nonzero(last_frames[:, 3] >= 0.5) / remaining  # Diff ratio
-        else:
-            last_condensed[2] = np.max(last_frames[:, 2])  # Blank present
-            last_condensed[3] = np.max(last_frames[:, 3])  # Diff max
+        
+        last_condensed[3] = np.count_nonzero(last_frames[:, 3] >= 0.5) / remaining  # Diff ratio
+        last_condensed[-2] = 1.0 if last_condensed[-2] >= 0.5 else 0.0
         
         if condensed is not None:
             condensed = np.vstack((condensed, last_condensed))
@@ -188,10 +186,7 @@ def condense(frames: np.ndarray, step: int, summarize=True) -> np.ndarray:
     
     return condensed
 
-def array2onehot(arr, nclasses, dtype='float32'):
-    return np.eye(nclasses, dtype=dtype)[arr]
-
-def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[np.ndarray,np.ndarray]:
+def load_nonpersistent(flog:dict, for_training=False)->np.ndarray:
     version = flog.get('file_version', 10)
     frame_rate = flog.get('frame_rate', 29.97)
     endtime = flog.get('duration', 0)
@@ -207,7 +202,7 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[np.ndarray,np.ndarra
     assert('time' in frames_header[0])
     assert('diff' in frames_header[3])
 
-    if tags and fitlerForTraining:
+    if tags and for_training:
         spans = processor.read_feature_spans(flog, 'blank')
         tags = _adjust_tags(tags, spans.get('blank', []), spans.get('diff', []))
         
@@ -266,7 +261,7 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[np.ndarray,np.ndarra
     # change the diff column to be normalized [0,30] -> [0,1]
     frames[...,3] = np.clip(frames[...,3] / 30, 0, 1.0)
 
-    # add a column for time percentage
+    # add a column for time percentage [-4]
     frames = np.append(frames, (frames[...,0]/endtime)[:,np.newaxis], axis=1)
 
     # add a column for with the real timestamps [-3]
@@ -274,14 +269,11 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[np.ndarray,np.ndarra
 
     # add a column for answers [-2]
     # and a column for weights [-1]
-    frames = np.insert(frames, frames.shape[1], [[SceneType.SHOW.value], [1]], axis=1)
+    frames = np.insert(frames, frames.shape[1], [[0.0], [1.0]], axis=1)
 
     # change the first column to be normalized timestamps (30 minute segments)
     frames[...,0] = (frames[...,0] % 1800.0) / 1800.0
 
-    # normalize frame rate
-    #frames = condense(frames, round(frame_rate/RATE), summarize=False)
-    
     wbefore = round(WINDOW_BEFORE * SUMMARY_RATE)
     wafter = round(WINDOW_AFTER * SUMMARY_RATE)
 
@@ -297,24 +289,13 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[np.ndarray,np.ndarra
 
         if tt == SceneType.DO_NOT_USE.value:
             weights[si:ei] = 0 # ignore this entire section
-        else:
-            answers[si:ei] = tt
-            continue # weights actually seem a little worse now...?
-            
-            # higher weight near the transition
-            for i in (si,ei):
-                ws = max(0,i-round(frame_rate)*3)
-                we = min(len(weights)-1,i+round(frame_rate)*3)
-                #weights[ws:we] = np.where(weights[ws:we] > 0, 2, 0)
-                dist = np.abs(np.arange(ws, we + 1) - i)
-                new_weights = 2.25 - ((dist / ((we - ws) / 2)) ** 2)  # Scale the distance by (rate * 3)
-                new_weights = np.clip(new_weights, 1.0, 2.0)  # Ensure weights are between 1.0 and 2.0
-                weights[ws:we + 1] = np.maximum(weights[ws:we + 1], new_weights, where=(weights[ws:we + 1] >= 0.5))
-
-    condensed = condense(frames, round(frame_rate/SUMMARY_RATE), summarize=True)
+        elif tt == SceneType.COMMERCIAL.value:
+            answers[si:ei] = 1.0
     
-    #for x in range(SceneType.count()+1):
-    #    print(f'{SceneType(x)}) {np.count_nonzero(answers == x)}')
+    condensed = condense(frames, round(frame_rate/SUMMARY_RATE))
+    
+    #for x in [0,1]:
+    #    print(f'{x}) {np.count_nonzero(answers == x)}')
 
     condensed = np.concatenate((
         np.tile(condensed[0], (wbefore,1)),
@@ -322,10 +303,6 @@ def flog_to_vecs(flog:dict, fitlerForTraining=False)->tuple[np.ndarray,np.ndarra
         np.tile(condensed[-1], (wafter,1)),
     ))
 
-    return (frames,condensed)
-
-def load_nonpersistent(flog:dict,for_training=False):
-    _,condensed = flog_to_vecs(flog, for_training)
     return condensed
 
 def load_persistent(flogname:str,for_training=True):
@@ -343,13 +320,6 @@ def load_persistent(flogname:str,for_training=True):
     
     condensed = np.load(fname+'.data.npy', mmap_mode='r')
     return condensed
-
-def sliding_window_skip(arr, window_size, repeat_skip):
-    # Calculate the shape and strides for the sliding window view over an array that had np.repeat previously run on it
-    from numpy.lib.stride_tricks import as_strided
-    new_shape = (arr.shape[0] - (window_size-1)*repeat_skip, window_size, arr.shape[1])
-    new_strides = (arr.strides[0], arr.strides[0] * repeat_skip, arr.strides[1])
-    return as_strided(arr, shape=new_shape, strides=new_strides, writeable=False)
 
 from keras.utils import Sequence
 class DataGenerator(Sequence):
@@ -376,7 +346,7 @@ class DataGenerator(Sequence):
         else:
             return d
         
-def load_data_sliding_window(condensed:np.ndarray, categorical=False)->tuple[np.ndarray,np.ndarray,np.ndarray,np.ndarray]:
+def load_data_sliding_window(condensed:np.ndarray)->tuple[np.ndarray,np.ndarray,np.ndarray,np.ndarray]:
     if condensed is None:
         return ([],[],[],[])
     
@@ -385,12 +355,7 @@ def load_data_sliding_window(condensed:np.ndarray, categorical=False)->tuple[np.
 
     timestamps = condensed[wbefore:-wafter,-3]
     answers = condensed[wbefore:-wafter,-2]
-    if categorical:
-        answers = array2onehot(answers.astype('uint32'), SceneType.count(), dtype='float32')
-    else:
-        answers = np.where(answers.astype('uint32') == SceneType.COMMERCIAL.value, 1.0, 0.0)
     weights = condensed[wbefore:-wafter,-1]
-
     condensed = condensed[:, :-3]
     
     from numpy.lib.stride_tricks import sliding_window_view
@@ -455,14 +420,12 @@ def load_data(opts, do_not_test=False) -> tuple[DataGenerator,DataGenerator]:
                     test[x].append(stuff[x][i])
     stuff = None
 
-    from random import shuffle
-
     data = list(zip(*data))
-    shuffle(data)
+    random.shuffle(data)
 
-    if not do_not_test and tlen < 250:
+    if not do_not_test:
         need = int(dlen*TEST_PERC+1) - tlen
-        if need > dlen/100:
+        if need > dlen/100 and tlen/(tlen+dlen) < 0.1:
             print(f'Need to move {need} of {dlen} elements to the test/eval set (have {tlen} will have ~{need+tlen})')
             for i in range(need):
                 e = data[i]
@@ -503,25 +466,8 @@ def train(opts:Any=None):
     #model_path = '/tmp/train-xyz.pycf.model.keras'
     #epoch = 10
 
-    if True:
-        _train_some(model_path, data, test, epoch)
-    else:
-      while not stop:
-        queue = Queue(1)
-        sub = Process(target=_train_proc, args=(model_path, data, test, epoch, queue))
-        sub.start()
-
-        while sub.is_alive():
-            try:
-                epoch,stop = queue.get(timeout=0.1)
-            except QueueEmpty:
-                pass
-            except KeyboardInterrupt:
-                stop = True
-                os.kill(sub.pid, 2)
+    _train_some(model_path, data, test, epoch)
         
-        sub.join()
-    
     print()
     print("Done")
     print()
@@ -548,9 +494,6 @@ def train(opts:Any=None):
 
     return 0
 
-def _train_proc(model_path, train_dataset, test_dataset, epoch, queue):
-    queue.put( _train_some(model_path, train_dataset, test_dataset, epoch) )
-
 def transformer_encoder(inputs, head_size=256, num_heads=4):
     from keras import layers, Input, Model
 
@@ -576,15 +519,25 @@ def build_model(input_shape):
     n = inputs
 
     #n = layers.TimeDistributed(layers.Dense(UNITS//2, dtype='float32', kernel_regularizer='l1_l2', activation='relu'))(n)
-    n = layers.Conv1D(filters=F, kernel_size=K//2, padding='same', activation='relu')(n)
     n = layers.Conv1D(filters=F, kernel_size=K, padding='same', activation='relu')(n)
-    n = layers.Conv1D(filters=F, kernel_size=K*2+1, padding='same', activation='relu')(n)
-    #n = layers.MaxPooling1D(pool_size=2, name="pool_a")(n)
+    n = layers.MaxPooling1D(pool_size=2)(n)
+    n = layers.Dropout(DROPOUT)(n)
+    n = layers.Conv1D(filters=F, kernel_size=K, padding='same', activation='relu')(n)
+    n = layers.MaxPooling1D(pool_size=2)(n)
+    n = layers.Dropout(DROPOUT)(n)
+    n = layers.Conv1D(filters=F, kernel_size=K, padding='same', activation='relu')(n)
+    n = layers.MaxPooling1D(pool_size=2)(n)
+    n = layers.Dropout(DROPOUT)(n)
+    n = layers.Conv1D(filters=F, kernel_size=K, padding='same', activation='relu')(n)
+    #n = layers.MaxPooling1D(pool_size=2)(n)
+    n = layers.Dropout(DROPOUT)(n)
     #n = layers.Conv1D(filters=UNITS, kernel_size=3, padding='same', activation='relu', name="conv_pre_b")(n)
     #n = layers.MaxPooling1D(pool_size=2, name="pool_b")(n)
 
+    skip = n
+
     se = layers.GlobalAveragePooling1D(name="squeeze_pre")(n)
-    se = layers.Dense(n.shape[-1] // 4, activation='relu', name='excite1_pre')(se)
+    se = layers.Dense(isqrt(n.shape[-1]), activation='relu', name='excite1_pre')(se)
     se = layers.Dense(n.shape[-1], activation='sigmoid', name='excite2_pre')(se)
     se = layers.Reshape((1,se.shape[-1]))(se)  # match shape for multiply
     n = layers.Multiply(name="se_apply_pre")([n, se])
@@ -593,14 +546,14 @@ def build_model(input_shape):
         n = layers.GRU(UNITS, dropout=DROPOUT, name="rnn")(n)
 
         # Squeeze-and-Excitation ... or just excitation, apparently.
-        se = layers.Dense(n.shape[-1] // 4, activation='relu', name="excite1_post")(n)
+        se = layers.Dense(isqrt(n.shape[-1]), activation='relu', name="excite1_post")(n)
         se = layers.Dense(n.shape[-1], activation='sigmoid', name="excite2_post")(se)
         n = layers.Multiply(name="se_apply_post")([n, se])
     elif RNN.lower() == 'lstm':
         n = layers.LSTM(UNITS, dropout=DROPOUT, name="rnn")(n)
 
         # Squeeze-and-Excitation ... or just excitation, apparently.
-        se = layers.Dense(n.shape[-1] // 4, activation='relu', name="excite1_post")(n)
+        se = layers.Dense(isqrt(n.shape[-1]), activation='relu', name="excite1_post")(n)
         se = layers.Dense(n.shape[-1], activation='sigmoid', name="excite2_post")(se)
         n = layers.Multiply(name="se_apply_post")([n, se])
     elif RNN.lower() == "transformer":
@@ -613,16 +566,20 @@ def build_model(input_shape):
         # MultiHeadAttention with 4 heads
         n = layers.MultiHeadAttention(
             num_heads=4,
-            key_dim=n.shape[-1] // 4,  # Split features across heads
+            key_dim=isqrt(n.shape[-1]),  # Split features across heads
             name="multi_head_attention"
         )(n, n)
         
         # Global average pooling to reduce temporal dimension
         n = layers.GlobalAveragePooling1D()(n)  # (batch_size, features)
+    else:
+        n = layers.Flatten()(n)
+        n = layers.Dense(UNITS, dtype='float32', activation='relu', kernel_regularizer='l1_l2')(n)
     
     n = layers.Dense(UNITS, dtype='float32', activation='relu', kernel_regularizer='l1_l2', name="dense-post")(n)
     
-    #skip = layers.TimeDistributed(layers.Dense(UNITS, dtype='float32', kernel_regularizer='l1_l2', activation='tanh'), name="dense-skip")(inputs)
+    #skip = layers.TimeDistributed(layers.Dense(UNITS, dtype='float32', kernel_regularizer='l1_l2', activation='tanh'), name="dense-skip")(skip)
+    #skip = layers.Flatten()(skip)
     #skip = layers.GlobalMaxPool1D(name="skip")(skip)
     #n = layers.Add(name="added")([n, skip])
 
@@ -632,7 +589,6 @@ def build_model(input_shape):
     return Model(inputs, outputs)
 
 def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,bool]:
-    import signal
     import keras
 
     model:keras.models.Model = None
@@ -662,21 +618,6 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
     ecp = EpochModelCheckpoint(model_path, monitor='val_accuracy', verbose=1, save_best_only=True)
     cb.append(ecp)
 
-    class MemoryChecker(callbacks.Callback):
-        def __init__(self, *args):
-            super().__init__(*args)
-            self.start_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-            self.exceeded = False
-
-        def on_epoch_end(self, epoch, logs=None):
-            rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-            change = rss - self.start_rss
-            if change > 6000000:
-                print(f'Now using too much memory ({rss//1024}MB)! {change//1024}MB more than at start which was {self.start_rss//1024}MB')
-                self.model.stop_training = True
-                self.exceeded = True
-    #cb.append(MemoryChecker())
-    
     def handler(signum, frame):
         print("\nStopping (gracefully)...\n")
         model.stop_training = True
@@ -734,21 +675,17 @@ def predict(feature_log:str|TextIO|dict, opts:Any, write_log=None)->list:
 
 def do_predict(flog:dict, model, opts:Any):
     duration = flog.get('duration', 0)
-    categorical = model.output_shape[-1] > 1
+    assert(model.output_shape[-1] == 1)
     
     data = load_nonpersistent(flog, False)
-    data,_,_,times = load_data_sliding_window(data, categorical=categorical)
+    data,_,_,times = load_data_sliding_window(data)
 
     prediction = model.predict(DataGenerator(data), verbose=True)
 
-    result = np.argmax(prediction, axis=1) if categorical else None
     results = [(0,(0,0))]
     for i in range(len(prediction)):
         when = float(times[i])
-        if categorical:
-            ans = int(result[i])
-        else:
-            ans = SceneType.COMMERCIAL.value if prediction[i] >= 0.5 else SceneType.SHOW.value
+        ans = SceneType.COMMERCIAL.value if prediction[i] >= 0.5 else SceneType.SHOW.value
         
         results[-1] = (results[-1][0], (results[-1][1][0], when))
         if ans != results[-1][0]:
@@ -860,6 +797,9 @@ def diff_tags(realtags, result) -> tuple[float,float,list]:
     orig = split_upon(realtags, result)
     result = split_upon(result, realtags)
 
+    #print(orig)
+    #print(result)
+
     missing = 0
     extra = 0
     rlist = []
@@ -932,17 +872,22 @@ def eval(opts:Any):
                 continue
 
             spans = processor.read_feature_spans(flog, 'diff', 'blank')
-            realtags = _adjust_tags(flog.get('tags', []), spans.get('blank', []), spans.get('diff', []))
+
             duration = flog.get('duration',0.00001)
             real_dur = duration
-            
-            for (t,(b,e)) in realtags:
+            realtags = []
+
+            for (t,(b,e)) in flog.get('tags', []):
                 if t in [SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value]:
                     if e+10 > real_dur and e < real_dur and b < real_dur:
                         e = real_dur
                     if b < 10 and e > 0:
                         b = 0
                     duration -= e-b
+                elif t in [SceneType.COMMERCIAL, SceneType.COMMERCIAL.value]:
+                    realtags.append( (t,(b,e)) )
+
+            realtags = _adjust_tags(realtags, spans.get('blank', []), spans.get('diff', []))
             
             total_time += duration
         except Exception as e:
