@@ -28,11 +28,12 @@ SUMMARY_RATE = 1
 RATE = 29.97
 
 # training params
-RNN = 'lstm'
+RNN = 'conv'
+DEPTH = 2
 F = 32
 K = 11
 UNITS = 32
-DROPOUT = 0.3
+DROPOUT = 0.4
 EPOCHS = 40
 BATCH_SIZE = 128
 TEST_PERC = 0.25
@@ -321,31 +322,33 @@ def load_persistent(flogname:str,for_training=True):
     condensed = np.load(fname+'.data.npy', mmap_mode='r')
     return condensed
 
-from keras.utils import Sequence
-class DataGenerator(Sequence):
-    def __init__(self, data, answers=None, weights=None):
-        self.data = np.array(data, dtype='float32')
-        self.answers = np.array(answers, dtype='float32') if answers else None
-        self.weights = np.array(weights, dtype='float32') if weights else None
-        self.len = ceil(len(self.data) / BATCH_SIZE)
-        self.shape = (BATCH_SIZE, len(data[0]), len(data[0][0]))
-    
-    def __len__(self):
-        return self.len
-    
-    def __getitem__(self, index):
-        index *= BATCH_SIZE
-        d = self.data[index:index+BATCH_SIZE]
-        if self.answers is not None:
-            a = self.answers[index:index+BATCH_SIZE]
-            if self.weights is not None:
-                w = self.weights[index:index+BATCH_SIZE]
-                return d,a,w
-            else:
-                return d,a
-        else:
-            return d
+def make_data_generator(*args, **kwargs):
+    from keras.utils import Sequence
+    class DataGenerator(Sequence):
+        def __init__(self, data, answers=None, weights=None):
+            self.data = np.array(data, dtype='float32')
+            self.answers = np.array(answers, dtype='float32') if answers else None
+            self.weights = np.array(weights, dtype='float32') if weights else None
+            self.len = ceil(len(self.data) / BATCH_SIZE)
+            self.shape = (self.len, BATCH_SIZE, len(data[0]), len(data[0][0]))
         
+        def __len__(self):
+            return self.len
+        
+        def __getitem__(self, index):
+            index *= BATCH_SIZE
+            d = self.data[index:index+BATCH_SIZE]
+            if self.answers is not None:
+                a = self.answers[index:index+BATCH_SIZE]
+                if self.weights is not None:
+                    w = self.weights[index:index+BATCH_SIZE]
+                    return d,a,w
+                else:
+                    return d,a
+            else:
+                return d
+    return DataGenerator(*args, **kwargs)
+
 def load_data_sliding_window(condensed:np.ndarray)->tuple[np.ndarray,np.ndarray,np.ndarray,np.ndarray]:
     if condensed is None:
         return ([],[],[],[])
@@ -370,7 +373,7 @@ def load_data_sliding_window(condensed:np.ndarray)->tuple[np.ndarray,np.ndarray,
 
     return frames, answers, weights, timestamps
 
-def load_data(opts, do_not_test=False) -> tuple[DataGenerator,DataGenerator]:
+def load_data(opts, do_not_test=False) -> tuple:
     datafiles = opts.ml_data
     if not datafiles:
         return None
@@ -434,8 +437,8 @@ def load_data(opts, do_not_test=False) -> tuple[DataGenerator,DataGenerator]:
                 test[2].append(e[2])
             data = data[need:]
     
-    data = DataGenerator(*zip(*data))
-    test = DataGenerator(*test) if test else None
+    data = make_data_generator(*zip(*data))
+    test = make_data_generator(*test) if test else None
     
     return data,test
 
@@ -481,7 +484,7 @@ def train(opts:Any=None):
     print(tmetrics)
 
     if tmetrics[1] >= 0.80:
-        name = f'{opts.models_dir if opts and opts.models_dir else "."}{os.sep}pycf-{tmetrics[1]:.04f}-c{F}x{K}-{RNN}{UNITS}-w{WINDOW_BEFORE}x{WINDOW_AFTER}-{int(time.time())}.keras'
+        name = f'{opts.models_dir if opts and opts.models_dir else "."}{os.sep}pycf-{tmetrics[1]:.04f}-c{F}x{K}x{DEPTH}-{RNN}{UNITS}-w{WINDOW_BEFORE}x{WINDOW_AFTER}-{int(time.time())}.keras'
         print()
         print('Saving as ' + name)
 
@@ -494,24 +497,6 @@ def train(opts:Any=None):
 
     return 0
 
-def transformer_encoder(inputs, head_size=256, num_heads=4):
-    from keras import layers, Input, Model
-
-    # Attention and Normalization
-    n = layers.MultiHeadAttention(
-        key_dim=head_size, num_heads=num_heads, dropout=DROPOUT
-    )(inputs, inputs)
-    n = layers.Dropout(DROPOUT)(n)
-    n = layers.LayerNormalization(epsilon=1e-6)(n)
-    res = n + inputs
-
-    # Feed Forward Part
-    n = layers.Conv1D(filters=UNITS, kernel_size=1, activation="relu")(res)
-    n = layers.Dropout(DROPOUT)(n)
-    n = layers.Conv1D(filters=inputs.shape[-1], kernel_size=1)(n)
-    n = layers.LayerNormalization(epsilon=1e-6)(n)
-    return n + res
-
 def build_model(input_shape):
     from keras import layers, Input, Model
 
@@ -519,67 +504,44 @@ def build_model(input_shape):
     n = inputs
 
     #n = layers.TimeDistributed(layers.Dense(UNITS//2, dtype='float32', kernel_regularizer='l1_l2', activation='relu'))(n)
-    n = layers.Conv1D(filters=F, kernel_size=K, padding='same', activation='relu')(n)
-    n = layers.MaxPooling1D(pool_size=2)(n)
-    n = layers.Dropout(DROPOUT)(n)
-    n = layers.Conv1D(filters=F, kernel_size=K, padding='same', activation='relu')(n)
-    n = layers.MaxPooling1D(pool_size=2)(n)
-    n = layers.Dropout(DROPOUT)(n)
-    n = layers.Conv1D(filters=F, kernel_size=K, padding='same', activation='relu')(n)
-    n = layers.MaxPooling1D(pool_size=2)(n)
-    n = layers.Dropout(DROPOUT)(n)
-    n = layers.Conv1D(filters=F, kernel_size=K, padding='same', activation='relu')(n)
-    #n = layers.MaxPooling1D(pool_size=2)(n)
-    n = layers.Dropout(DROPOUT)(n)
-    #n = layers.Conv1D(filters=UNITS, kernel_size=3, padding='same', activation='relu', name="conv_pre_b")(n)
-    #n = layers.MaxPooling1D(pool_size=2, name="pool_b")(n)
 
-    skip = n
+    for i in range(DEPTH):
+        n = layers.Conv1D(filters=F, kernel_size=K, padding='same', activation='relu')(n)
+        n = layers.BatchNormalization()(n)
+        if i < DEPTH-1:
+            n = layers.MaxPooling1D(pool_size=2)(n)
+        n = layers.Dropout(DROPOUT)(n)
 
-    se = layers.GlobalAveragePooling1D(name="squeeze_pre")(n)
-    se = layers.Dense(isqrt(n.shape[-1]), activation='relu', name='excite1_pre')(se)
-    se = layers.Dense(n.shape[-1], activation='sigmoid', name='excite2_pre')(se)
-    se = layers.Reshape((1,se.shape[-1]))(se)  # match shape for multiply
-    n = layers.Multiply(name="se_apply_pre")([n, se])
-    
-    if RNN.lower() == "gru":
-        n = layers.GRU(UNITS, dropout=DROPOUT, name="rnn")(n)
+    #for i in range(DEPTH):
+    #    n = layers.Conv1D(filters=F, kernel_size=K, dilation_rate=2**i, padding='same', activation='relu', kernel_regularizer='l1_l2')(n)
+    #    n = layers.BatchNormalization()(n)
+    #    n = layers.Dropout(DROPOUT)(n)
 
-        # Squeeze-and-Excitation ... or just excitation, apparently.
-        se = layers.Dense(isqrt(n.shape[-1]), activation='relu', name="excite1_post")(n)
-        se = layers.Dense(n.shape[-1], activation='sigmoid', name="excite2_post")(se)
-        n = layers.Multiply(name="se_apply_post")([n, se])
-    elif RNN.lower() == 'lstm':
-        n = layers.LSTM(UNITS, dropout=DROPOUT, name="rnn")(n)
+    #se = layers.GlobalAveragePooling1D(name="squeeze")(n)
+    #se = layers.Dense(isqrt(n.shape[-1]), activation='relu', name='excite1')(se)
+    #se = layers.Dense(n.shape[-1], activation='sigmoid', name='excite2')(se)
+    #se = layers.Reshape((1,se.shape[-1]))(se)  # match shape for multiply
+    #n = layers.Multiply(name="se_apply")([n, se])
 
-        # Squeeze-and-Excitation ... or just excitation, apparently.
-        se = layers.Dense(isqrt(n.shape[-1]), activation='relu', name="excite1_post")(n)
-        se = layers.Dense(n.shape[-1], activation='sigmoid', name="excite2_post")(se)
-        n = layers.Multiply(name="se_apply_post")([n, se])
-    elif RNN.lower() == "transformer":
-        n = transformer_encoder(n)
-        n = transformer_encoder(n)
-        n = layers.GlobalAveragePooling1D()(n)
-    elif RNN.lower() == 'lstm-attn':
-        n = layers.LSTM(UNITS, dropout=DROPOUT, return_sequences=True, name="rnn")(n)
-        
-        # MultiHeadAttention with 4 heads
-        n = layers.MultiHeadAttention(
-            num_heads=4,
-            key_dim=isqrt(n.shape[-1]),  # Split features across heads
-            name="multi_head_attention"
-        )(n, n)
-        
-        # Global average pooling to reduce temporal dimension
-        n = layers.GlobalAveragePooling1D()(n)  # (batch_size, features)
-    else:
-        n = layers.Flatten()(n)
-        n = layers.Dense(UNITS, dtype='float32', activation='relu', kernel_regularizer='l1_l2')(n)
-    
-    n = layers.Dense(UNITS, dtype='float32', activation='relu', kernel_regularizer='l1_l2', name="dense-post")(n)
+    # Transformer-style self attention block w/feed-forward
+    n = layers.MultiHeadAttention(num_heads=2, key_dim=F)(n, n)
+    ff = layers.Dense(UNITS*2, activation='relu')(n)
+    ff = layers.Dense(UNITS)(ff)
+    ff = layers.Dropout(DROPOUT)(ff)
+    n = layers.Add([ff, n])
+    n = layers.LayerNormalization(epsilon=1e-6)(n)
+
+    #n = layers.GlobalAveragePooling1D()(n)
+    n = layers.Flatten()(n)
+
+    #n = layers.Dense(UNITS*2, dtype='float32', activation='relu', kernel_regularizer='l1_l2')(n)
+    #n = layers.Dropout(DROPOUT)(n)
+    n = layers.Dense(UNITS, dtype='float32', activation='relu', kernel_regularizer='l1_l2')(n)
+    n = layers.Dropout(DROPOUT)(n)
+    n = layers.Dense(UNITS//2, dtype='float32', activation='relu', kernel_regularizer='l1_l2')(n)
+    n = layers.Dropout(DROPOUT)(n)
     
     #skip = layers.TimeDistributed(layers.Dense(UNITS, dtype='float32', kernel_regularizer='l1_l2', activation='tanh'), name="dense-skip")(skip)
-    #skip = layers.Flatten()(skip)
     #skip = layers.GlobalMaxPool1D(name="skip")(skip)
     #n = layers.Add(name="added")([n, skip])
 
@@ -595,9 +557,10 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
     if epoch > 0:
         model = keras.models.load_model(model_path)
     else:
+        from keras.metrics import Recall, Precision
         model = build_model(train_dataset.shape)
         model.summary()
-        model.compile(optimizer="adam", loss="binary_crossentropy", metrics=['accuracy', 'AUC'])
+        model.compile(optimizer="adam", loss="binary_crossentropy", metrics=['accuracy', Recall(class_id=0), Precision(class_id=0)])
         model.save(model_path)
     
     gc.collect()
@@ -627,7 +590,7 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
     oldsint = signal.signal(signal.SIGINT, handler)
     oldterm = signal.signal(signal.SIGTERM, handler)
 
-    model.fit(train_dataset, validation_data=test_dataset, epochs=EPOCHS, initial_epoch=epoch, callbacks=cb)
+    model.fit(train_dataset, validation_data=test_dataset, epochs=EPOCHS, initial_epoch=epoch, callbacks=cb, class_weight={0:0.75,1:1.3334})
 
     #model.save(model_path) the checkpoint already saved the vest version
     return (ecp.last_epoch+1, model.stop_training or ecp.last_epoch+1 >= EPOCHS)
@@ -680,7 +643,7 @@ def do_predict(flog:dict, model, opts:Any):
     data = load_nonpersistent(flog, False)
     data,_,_,times = load_data_sliding_window(data)
 
-    prediction = model.predict(DataGenerator(data), verbose=True)
+    prediction = model.predict(make_data_generator(data), verbose=True)
 
     results = [(0,(0,0))]
     for i in range(len(prediction)):
