@@ -29,13 +29,13 @@ RATE = 29.97
 
 # training params
 RNN = 'conv'
-DEPTH = 2
+DEPTH = 4
 F = 32
-K = 11
+K = 13
 UNITS = 32
-DROPOUT = 0.4
-EPOCHS = 40
-BATCH_SIZE = 128
+DROPOUT = 0.35
+EPOCHS = 50
+BATCH_SIZE = 256
 TEST_PERC = 0.25
 PATIENCE = 5
 
@@ -512,33 +512,24 @@ def build_model(input_shape):
             n = layers.MaxPooling1D(pool_size=2)(n)
         n = layers.Dropout(DROPOUT)(n)
 
+    # squeeze and excite
+    se = layers.GlobalAveragePooling1D()(n)
+    se = layers.Dense(isqrt(n.shape[-1]), activation='relu')(se)
+    se = layers.Dense(n.shape[-1], activation='sigmoid')(se)
+    se = layers.Reshape((1,se.shape[-1]))(se)  # match shape for multiply
+    n = layers.Multiply()([n, se])
+
     #for i in range(DEPTH):
     #    n = layers.Conv1D(filters=F, kernel_size=K, dilation_rate=2**i, padding='same', activation='relu', kernel_regularizer='l1_l2')(n)
     #    n = layers.BatchNormalization()(n)
     #    n = layers.Dropout(DROPOUT)(n)
 
-    #se = layers.GlobalAveragePooling1D(name="squeeze")(n)
-    #se = layers.Dense(isqrt(n.shape[-1]), activation='relu', name='excite1')(se)
-    #se = layers.Dense(n.shape[-1], activation='sigmoid', name='excite2')(se)
-    #se = layers.Reshape((1,se.shape[-1]))(se)  # match shape for multiply
-    #n = layers.Multiply(name="se_apply")([n, se])
-
-    # Transformer-style self attention block w/feed-forward
-    n = layers.MultiHeadAttention(num_heads=2, key_dim=F)(n, n)
-    ff = layers.Dense(UNITS*2, activation='relu')(n)
-    ff = layers.Dense(UNITS)(ff)
-    ff = layers.Dropout(DROPOUT)(ff)
-    n = layers.Add([ff, n])
-    n = layers.LayerNormalization(epsilon=1e-6)(n)
-
     #n = layers.GlobalAveragePooling1D()(n)
     n = layers.Flatten()(n)
 
-    #n = layers.Dense(UNITS*2, dtype='float32', activation='relu', kernel_regularizer='l1_l2')(n)
-    #n = layers.Dropout(DROPOUT)(n)
     n = layers.Dense(UNITS, dtype='float32', activation='relu', kernel_regularizer='l1_l2')(n)
     n = layers.Dropout(DROPOUT)(n)
-    n = layers.Dense(UNITS//2, dtype='float32', activation='relu', kernel_regularizer='l1_l2')(n)
+    n = layers.Dense(UNITS, dtype='float32', activation='relu', kernel_regularizer='l1_l2')(n)
     n = layers.Dropout(DROPOUT)(n)
     
     #skip = layers.TimeDistributed(layers.Dense(UNITS, dtype='float32', kernel_regularizer='l1_l2', activation='tanh'), name="dense-skip")(skip)
@@ -569,9 +560,9 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
 
     from keras import callbacks
 
-    cb.append(callbacks.EarlyStopping(monitor='loss', patience=PATIENCE+1))
+    cb.append(callbacks.EarlyStopping(monitor='loss', patience=PATIENCE))
     cb.append(callbacks.EarlyStopping(monitor='val_accuracy', patience=PATIENCE+2))
-    cb.append(callbacks.ReduceLROnPlateau(monitor='val_accuracy', patience=PATIENCE))
+    cb.append(callbacks.ReduceLROnPlateau(monitor='val_accuracy', patience=PATIENCE-1))
     
     class EpochModelCheckpoint(callbacks.ModelCheckpoint):
         def on_epoch_end(self, epoch, logs=None):
