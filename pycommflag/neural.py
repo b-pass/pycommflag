@@ -28,7 +28,7 @@ SUMMARY_RATE = 1
 RATE = 29.97
 
 # training params
-RNN = 'conv'
+RNN = 'muchconv'
 DEPTH = 4
 F = 32
 K = 13
@@ -134,7 +134,7 @@ def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]],
     
     return filtered_tags
 
-def condense(frames: np.ndarray, step: int) -> np.ndarray:
+def condense(frames: np.ndarray, step: int, summarize=True) -> np.ndarray:
     """
     Condense video frames by averaging specific features over specified step sizes.
     
@@ -164,21 +164,37 @@ def condense(frames: np.ndarray, step: int) -> np.ndarray:
     if n_frames >= step:
         # Reshape the array to group frames by step size
         valid_frames = frames[:(n_frames//step)*step].reshape(-1, step, frames.shape[1])
-
-        condensed = np.average(valid_frames, axis=1)
         
-        condensed[:, 3] = np.count_nonzero(valid_frames[:, :, 3] >= 0.5, axis=1) / step  # Diff ratio
-        condensed[:, -2] = np.where(condensed[:, -2] >= 0.5, 1.0, 0.0)
+        # Initialize condensed array with middle frame of each group
+        # This preserves all features that don't need averaging
+        condensed = valid_frames[:, step//2].copy()
+
+        # Update only the features that need condensing
+        if summarize:
+            condensed[:, 1] = np.mean(valid_frames[:, :, 1], axis=1, dtype='float32')  # Average logo
+            condensed[:, 2] = np.mean(valid_frames[:, :, 2], axis=1, dtype='float32')  # Average blank
+            condensed[:, 3] = np.count_nonzero(valid_frames[:, :, 3] >= 0.5, axis=1) / step  # Diff ratio
+        else:
+            condensed[:, 1] = np.mean(valid_frames[:, :, 1], axis=1, dtype='float32')  # Logo percentage
+            condensed[:, 2] = np.max(valid_frames[:, :, 2], axis=1)  # Blank present
+            condensed[:, 3] = np.max(valid_frames[:, :, 3], axis=1)  # Diff max
     else:
         condensed = None
     
     if remaining > 0:
         # Do the final, partial condensing
         last_frames = frames[-remaining:]
-        last_condensed = np.average(last_frames, axis=0)
-        
-        last_condensed[3] = np.count_nonzero(last_frames[:, 3] >= 0.5) / remaining  # Diff ratio
-        last_condensed[-2] = 1.0 if last_condensed[-2] >= 0.5 else 0.0
+
+        last_condensed = last_frames[remaining//2].copy()  # Keep all features from middle frame
+
+        if summarize:
+            last_condensed[1] = np.mean(last_frames[:, 1], dtype='float32')  # Average logo
+            last_condensed[2] = np.mean(last_frames[:, 2], dtype='float32')  # Average blank
+            last_condensed[3] = np.count_nonzero(last_frames[:, 3] >= 0.5) / remaining  # Diff ratio
+        else:
+            last_condensed[1] = np.mean(last_frames[:, 1], dtype='float32')  # Logo percentage
+            last_condensed[2] = np.max(last_frames[:, 2])  # Blank present
+            last_condensed[3] = np.max(last_frames[:, 3])  # Diff max
         
         if condensed is not None:
             condensed = np.vstack((condensed, last_condensed))
@@ -275,8 +291,11 @@ def load_nonpersistent(flog:dict, for_training=False)->np.ndarray:
     # change the first column to be normalized timestamps (30 minute segments)
     frames[...,0] = (frames[...,0] % 1800.0) / 1800.0
 
-    wbefore = round(WINDOW_BEFORE * SUMMARY_RATE)
-    wafter = round(WINDOW_AFTER * SUMMARY_RATE)
+    # normalize frame rate
+    frames = condense(frames, round(frame_rate / RATE), summarize=False)
+
+    wbefore = round(WINDOW_BEFORE * RATE)
+    wafter = round(WINDOW_AFTER * RATE)
 
     timestamps = frames[:, -3]
     answers = frames[:, -2]
@@ -293,18 +312,16 @@ def load_nonpersistent(flog:dict, for_training=False)->np.ndarray:
         elif tt == SceneType.COMMERCIAL.value:
             answers[si:ei] = 1.0
     
-    condensed = condense(frames, round(frame_rate/SUMMARY_RATE))
-    
     #for x in [0,1]:
     #    print(f'{x}) {np.count_nonzero(answers == x)}')
 
-    condensed = np.concatenate((
-        np.tile(condensed[0], (wbefore,1)),
-        condensed,
-        np.tile(condensed[-1], (wafter,1)),
+    frames = np.concatenate((
+        np.tile(frames[0], (wbefore,1)),
+        frames,
+        np.tile(frames[-1], (wafter,1)),
     ))
 
-    return condensed
+    return frames
 
 def load_persistent(flogname:str,for_training=True):
     fname = flogname
@@ -316,11 +333,10 @@ def load_persistent(flogname:str,for_training=True):
         fname = fname[:-5]
     
     if not os.path.exists(fname + '.data.npy'):
-        condensed = load_nonpersistent(processor.read_feature_log(flogname), for_training)
-        np.save(fname+'.data.npy', condensed)
+        frames = load_nonpersistent(processor.read_feature_log(flogname), for_training)
+        np.save(fname+'.data.npy', frames)
     
-    condensed = np.load(fname+'.data.npy', mmap_mode='r')
-    return condensed
+    return np.load(fname+'.data.npy', mmap_mode='r')
 
 def make_data_generator(*args, **kwargs):
     from keras.utils import Sequence
@@ -349,24 +365,26 @@ def make_data_generator(*args, **kwargs):
                 return d
     return DataGenerator(*args, **kwargs)
 
-def load_data_sliding_window(condensed:np.ndarray)->tuple[np.ndarray,np.ndarray,np.ndarray,np.ndarray]:
-    if condensed is None:
+def load_data_sliding_window(frames:np.ndarray)->tuple[np.ndarray,np.ndarray,np.ndarray,np.ndarray]:
+    if frames is None:
         return ([],[],[],[])
     
-    wbefore = round(WINDOW_BEFORE * SUMMARY_RATE)
-    wafter = round(WINDOW_AFTER * SUMMARY_RATE)
+    orig = frames
 
-    timestamps = condensed[wbefore:-wafter,-3]
-    answers = condensed[wbefore:-wafter,-2]
-    weights = condensed[wbefore:-wafter,-1]
-    condensed = condensed[:, :-3]
+    wbefore = round(WINDOW_BEFORE * RATE)
+    wafter = round(WINDOW_AFTER * RATE)
+
+    timestamps = frames[wbefore:-wafter,-3]
+    answers = frames[wbefore:-wafter,-2]
+    weights = frames[wbefore:-wafter,-1]
+    frames = frames[:, :-3]
     
     from numpy.lib.stride_tricks import sliding_window_view
-    frames = sliding_window_view(condensed, (wbefore+1+wafter, condensed.shape[1],)).squeeze()
+    frames = sliding_window_view(frames, (wbefore+1+wafter, frames.shape[1],)).squeeze()
 
     #print(len(self.frames), len(self.timestamps))
 
-    assert(np.shares_memory(condensed, frames))
+    assert(np.shares_memory(orig, frames))
     assert(len(frames) == len(timestamps))
     assert(len(frames) == len(answers))
     assert(len(frames) == len(weights))
@@ -504,6 +522,8 @@ def build_model(input_shape):
     n = inputs
 
     #n = layers.TimeDistributed(layers.Dense(UNITS//2, dtype='float32', kernel_regularizer='l1_l2', activation='relu'))(n)
+    n = layers.Conv1D(filters=F, kernel_size=61, padding='same', activation='relu')(n)
+    n = layers.MaxPooling1D(pool_size=30)(n)
 
     for i in range(DEPTH):
         n = layers.Conv1D(filters=F, kernel_size=K, padding='same', activation='relu')(n)
