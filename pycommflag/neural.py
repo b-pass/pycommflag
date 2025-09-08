@@ -25,15 +25,15 @@ from . import neural
 WINDOW_BEFORE = 60
 WINDOW_AFTER = 60
 SUMMARY_RATE = 1
-RATE = 29.97
+RATE = 10
 
 # training params
 RNN = 'muchconv'
 DEPTH = 4
 F = 32
-K = 13
+K = 11
 UNITS = 32
-DROPOUT = 0.35
+DROPOUT = 0.4
 EPOCHS = 50
 BATCH_SIZE = 256
 TEST_PERC = 0.25
@@ -338,58 +338,130 @@ def load_persistent(flogname:str,for_training=True):
     
     return np.load(fname+'.data.npy', mmap_mode='r')
 
-def make_data_generator(*args, **kwargs):
-    from keras.utils import Sequence
-    class DataGenerator(Sequence):
-        def __init__(self, data, answers=None, weights=None):
-            self.data = np.array(data, dtype='float32')
-            self.answers = np.array(answers, dtype='float32') if answers else None
-            self.weights = np.array(weights, dtype='float32') if weights else None
-            self.len = ceil(len(self.data) / BATCH_SIZE)
-            self.shape = (self.len, BATCH_SIZE, len(data[0]), len(data[0][0]))
+def sliding_window_skip(arr, window_size, repeat_skip):
+    # Calculate the shape and strides for the sliding window view over an array that had np.repeat previously run on it
+    from numpy.lib.stride_tricks import as_strided
+    new_shape = (arr.shape[0] - (window_size-1)*repeat_skip, window_size, arr.shape[1])
+    new_strides = (arr.strides[0], arr.strides[0] * repeat_skip, arr.strides[1])
+    return as_strided(arr, shape=new_shape, strides=new_strides, writeable=False)
+
+from keras.utils import Sequence
+class WindowStackGenerator(Sequence):
+    def __init__(self, frames=None, ordered=True):
+        super().__init__()
+        if frames is None:
+            return
         
-        def __len__(self):
-            return self.len
+        wbefore = round(WINDOW_BEFORE * RATE)
+        wafter = round(WINDOW_AFTER * RATE)
+        self.batch_size = BATCH_SIZE
+
+
+        # frames has been tile with rate on each side and has timestamps,answers,weights concatted...
+        # unpack all that
+        self.timestamps = frames[wbefore:-wafter,-3]
+        self.answers = frames[wbefore:-wafter,-2]
+        self.weights = frames[wbefore:-wafter,-1]
+        frames = frames[:, :-3]
         
-        def __getitem__(self, index):
-            index *= BATCH_SIZE
-            d = self.data[index:index+BATCH_SIZE]
-            if self.answers is not None:
-                a = self.answers[index:index+BATCH_SIZE]
-                if self.weights is not None:
-                    w = self.weights[index:index+BATCH_SIZE]
-                    return d,a,w
-                else:
-                    return d,a
-            else:
-                return d
-    return DataGenerator(*args, **kwargs)
+        from numpy.lib.stride_tricks import sliding_window_view
+        self.frames = sliding_window_view(frames, (wbefore+1+wafter, frames.shape[1],)).squeeze()
 
-def load_data_sliding_window(frames:np.ndarray)->tuple[np.ndarray,np.ndarray,np.ndarray,np.ndarray]:
-    if frames is None:
-        return ([],[],[],[])
+        assert(np.shares_memory(frames, self.frames))
+        assert(len(self.frames) == len(self.timestamps))
+        assert(len(self.frames) == len(self.answers))
+        assert(len(self.frames) == len(self.weights))
+
+        self.stride = len(self.frames) // self.batch_size # we want every N to add up to about the Batch Size
+        self.len = ceil(len(self.frames) / self.batch_size)
+        self.shape = ( self.len, self.batch_size, self.frames.shape[-2], self.frames.shape[-1] )
+        self.offset = 0
+
+        self.set_ordered(ordered)
+
+    def split(self, split=0.75):
+        a = WindowStackGenerator()
+        b = WindowStackGenerator()
+        for (k,v) in self.__dict__.items():
+            setattr(a, k, v)
+            setattr(b, k, v)
+        
+        from random import randrange
+
+        swap = randrange(2) == 0
+        if swap:
+            split = 1 - split
+
+        a.set_ordered(False)
+        a.offset = 0
+        a.len = ceil( (len(self.frames) * split) / self.batch_size )
+        a.shape = (a.len,) + a.shape[1:]
+
+        b.set_ordered(False)
+        b.offset = a.len
+        b.len = self.len - a.len
+        b.shape = (b.len,) + b.shape[1:]
+        
+        if swap:
+            return (b,a)
+        else:
+            return (a,b)
     
-    orig = frames
-
-    wbefore = round(WINDOW_BEFORE * RATE)
-    wafter = round(WINDOW_AFTER * RATE)
-
-    timestamps = frames[wbefore:-wafter,-3]
-    answers = frames[wbefore:-wafter,-2]
-    weights = frames[wbefore:-wafter,-1]
-    frames = frames[:, :-3]
+    def __len__(self):
+        return self.len
     
-    from numpy.lib.stride_tricks import sliding_window_view
-    frames = sliding_window_view(frames, (wbefore+1+wafter, frames.shape[1],)).squeeze()
-
-    #print(len(self.frames), len(self.timestamps))
-
-    assert(np.shares_memory(orig, frames))
-    assert(len(frames) == len(timestamps))
-    assert(len(frames) == len(answers))
-    assert(len(frames) == len(weights))
-
-    return frames, answers, weights, timestamps
+    def __getitem__(self, index):
+        return self.getter(index)
+    
+    def set_ordered(self, ordered=True):
+        self.getter = self.get_ordered if ordered else self.get_unordered
+    
+    def get_ordered(self, index):
+        index = (index + self.offset) * self.batch_size
+        endex = index + self.batch_size
+        return (self.frames[index:endex], self.answers[index:endex], self.weights[index:endex])
+    
+    def get_unordered(self, index):
+        index += self.offset
+        return (self.frames[index::self.stride], self.answers[index::self.stride], self.weights[index::self.stride])
+    
+class MultiGenerator(Sequence):
+    def __init__(self, elements:list[WindowStackGenerator], **kwargs):
+        super().__init__(**kwargs)
+        self.elements = elements
+        self.num_elements = len(self.elements)
+        self._recalc()
+    
+    def _recalc(self):
+        self.lengths = []
+        self.offsets = []
+        self.len = 0
+        shape = self.elements[0].shape[1:]
+        for e in self.elements:
+            assert(e.shape[1:] == shape)
+            #if e.shape[1:] != shape:
+            #    print(e.shape[1:], "incompatible with", shape,"--",e.frames.shape, "vs", self.elements[0].frames.shape)
+            
+            x = len(e)
+            self.lengths.append(x)
+            self.offsets.append(self.len)
+            self.len += x
+        self.shape = (self.len,) + shape
+        self.offsets = np.array(self.offsets, dtype='uint32')
+        
+    def shuffle(self):
+        from random import shuffle
+        shuffle(self.elements)
+        for e in self.elements:
+            e.set_ordered(False)
+        self._recalc()
+        
+    def __len__(self):
+        return self.len
+    
+    def __getitem__(self, index):
+        ei = np.searchsorted(self.offsets, index, 'right')-1
+        return self.elements[ei][index - self.offsets[ei]]
 
 def load_data(opts, do_not_test=False) -> tuple:
     datafiles = opts.ml_data
@@ -414,51 +486,44 @@ def load_data(opts, do_not_test=False) -> tuple:
                 i += 1
 
     dlen = 0
-    data = ([],[],[])
+    data = []
     tlen = 0
-    test = ([],[],[])
+    test = []
 
     for f in datafiles:
         if os.path.isdir(f) or f.endswith('.npy'):
             continue
         print("Loading",f)
-        stuff = load_data_sliding_window(load_persistent(f))
-        if stuff is not None:
-            dlen += len(stuff[0])
-            for x in range(3):
-                for i in range(len(stuff[x])):
-                    data[x].append(stuff[x][i])
+        stuff = WindowStackGenerator(load_persistent(f), ordered=False)
+        dlen += len(stuff)
+        data.append(stuff)
     
     for f in testfiles:
         if os.path.isdir(f) or f.endswith('.npy'):
             continue
         print("Loading test",f)
-        stuff = load_data_sliding_window(load_persistent(f))
-        if stuff is not None:
-            tlen += len(stuff[0])
-            for x in range(3):
-                for i in range(len(stuff[x])):
-                    test[x].append(stuff[x][i])
+        stuff = WindowStackGenerator(load_persistent(f))
+        tlen += len(stuff)
+        test.append(stuff)
+    
     stuff = None
-
-    data = list(zip(*data))
-    random.shuffle(data)
 
     if not do_not_test:
         need = int(dlen*TEST_PERC+1) - tlen
         if need > dlen/100 and tlen/(tlen+dlen) < 0.1:
             print(f'Need to move {need} of {dlen} elements to the test/eval set (have {tlen} will have ~{need+tlen})')
-            for i in range(need):
-                e = data[i]
-                test[0].append(e[0])
-                test[1].append(e[1])
-                test[2].append(e[2])
-            data = data[need:]
+            datakeep = 1 - need/dlen
+            orig = data
+            data = []
+            dlen = 0
+            for o in orig:
+                (d,t) = o.split(datakeep)
+                dlen += len(d)
+                tlen += len(t)
+                data.append(d)
+                test.append(t)
     
-    data = make_data_generator(*zip(*data))
-    test = make_data_generator(*test) if test else None
-    
-    return data,test
+    return (MultiGenerator(data), MultiGenerator(test))
 
 def train(opts:Any=None):
     # yield CPU time to useful tasks, this is a background thing...
@@ -522,8 +587,9 @@ def build_model(input_shape):
     n = inputs
 
     #n = layers.TimeDistributed(layers.Dense(UNITS//2, dtype='float32', kernel_regularizer='l1_l2', activation='relu'))(n)
-    n = layers.Conv1D(filters=F, kernel_size=61, padding='same', activation='relu')(n)
-    n = layers.MaxPooling1D(pool_size=30)(n)
+    n = layers.Conv1D(filters=F, kernel_size=round(RATE), strides=round(RATE), padding='same', activation='relu')(n)
+    #n = layers.MaxPooling1D(pool_size=30)(n)
+    n = layers.Dropout(DROPOUT)(n)
 
     for i in range(DEPTH):
         n = layers.Conv1D(filters=F, kernel_size=K, padding='same', activation='relu')(n)
@@ -651,10 +717,10 @@ def do_predict(flog:dict, model, opts:Any):
     duration = flog.get('duration', 0)
     assert(model.output_shape[-1] == 1)
     
-    data = load_nonpersistent(flog, False)
-    data,_,_,times = load_data_sliding_window(data)
+    data = WindowStackGenerator(load_nonpersistent(flog, False))
+    times = data.timestamps
 
-    prediction = model.predict(make_data_generator(data), verbose=True)
+    prediction = model.predict(data, verbose=True)
 
     results = [(0,(0,0))]
     for i in range(len(prediction)):
