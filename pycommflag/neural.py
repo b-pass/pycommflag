@@ -33,9 +33,9 @@ DEPTH = 4
 F = 32
 K = 13
 UNITS = 32
-DROPOUT = 0.35
+DROPOUT = 0.3
 EPOCHS = 50
-BATCH_SIZE = 256
+BATCH_SIZE = 128
 TEST_PERC = 0.25
 PATIENCE = 5
 
@@ -166,9 +166,10 @@ def condense(frames: np.ndarray, step: int) -> np.ndarray:
         valid_frames = frames[:(n_frames//step)*step].reshape(-1, step, frames.shape[1])
 
         condensed = np.average(valid_frames, axis=1)
-        
+
+        condensed[:, 0] = valid_frames[:, step//2, 0] # middle timestamp
         condensed[:, 3] = np.count_nonzero(valid_frames[:, :, 3] >= 0.5, axis=1) / step  # Diff ratio
-        condensed[:, -2] = np.where(condensed[:, -2] >= 0.5, 1.0, 0.0)
+        condensed[:, -2] = np.where(condensed[:, -2] >= 0.5, 1.0, 0.0) # answer
     else:
         condensed = None
     
@@ -177,8 +178,9 @@ def condense(frames: np.ndarray, step: int) -> np.ndarray:
         last_frames = frames[-remaining:]
         last_condensed = np.average(last_frames, axis=0)
         
+        last_condensed[0] = last_frames[remaining//2, 0] # middle timestamp
         last_condensed[3] = np.count_nonzero(last_frames[:, 3] >= 0.5) / remaining  # Diff ratio
-        last_condensed[-2] = 1.0 if last_condensed[-2] >= 0.5 else 0.0
+        last_condensed[-2] = 1.0 if last_condensed[-2] >= 0.5 else 0.0 # answer
         
         if condensed is not None:
             condensed = np.vstack((condensed, last_condensed))
@@ -504,13 +506,17 @@ def build_model(input_shape):
     n = inputs
 
     #n = layers.TimeDistributed(layers.Dense(UNITS//2, dtype='float32', kernel_regularizer='l1_l2', activation='relu'))(n)
-
+    n = layers.Conv1D(filters=F, kernel_size=1, padding='same', name='initial_proj')(inputs)
+    
     for i in range(DEPTH):
+        residual = n
         n = layers.Conv1D(filters=F, kernel_size=K, padding='same', activation='relu')(n)
         n = layers.BatchNormalization()(n)
+        n = layers.Dropout(DROPOUT)(n)
+        n = layers.Add(name=f'residual_add_{i}')([n, residual])
+        n = layers.Activation('relu')(n)
         if i < DEPTH-1:
             n = layers.MaxPooling1D(pool_size=2)(n)
-        n = layers.Dropout(DROPOUT)(n)
 
     # squeeze and excite
     se = layers.GlobalAveragePooling1D()(n)
@@ -524,11 +530,16 @@ def build_model(input_shape):
     #    n = layers.BatchNormalization()(n)
     #    n = layers.Dropout(DROPOUT)(n)
 
-    #n = layers.GlobalAveragePooling1D()(n)
-    n = layers.Flatten()(n)
+    n = layers.GlobalAveragePooling1D()(n)
+    #n = layers.Flatten()(n)
 
     n = layers.Dense(UNITS, dtype='float32', activation='relu', kernel_regularizer='l1_l2')(n)
     n = layers.Dropout(DROPOUT)(n)
+
+    skip_connection = layers.GlobalAveragePooling1D()(inputs)
+    skip_connection = layers.Dense(UNITS//2, activation='relu', kernel_regularizer='l1_l2')(skip_connection)
+    n = layers.Concatenate()([n, skip_connection])
+
     n = layers.Dense(UNITS, dtype='float32', activation='relu', kernel_regularizer='l1_l2')(n)
     n = layers.Dropout(DROPOUT)(n)
     
