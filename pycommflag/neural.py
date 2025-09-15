@@ -28,7 +28,7 @@ SUMMARY_RATE = 1
 RATE = 29.97
 
 # training params
-RNN = 'conv'
+RNN = 'res'
 DEPTH = 4
 F = 32
 K = 13
@@ -530,8 +530,8 @@ def build_model(input_shape):
     #    n = layers.BatchNormalization()(n)
     #    n = layers.Dropout(DROPOUT)(n)
 
-    n = layers.GlobalAveragePooling1D()(n)
-    #n = layers.Flatten()(n)
+    #n = layers.GlobalAveragePooling1D()(n)
+    n = layers.Flatten()(n)
 
     n = layers.Dense(UNITS, dtype='float32', activation='relu', kernel_regularizer='l1_l2')(n)
     n = layers.Dropout(DROPOUT)(n)
