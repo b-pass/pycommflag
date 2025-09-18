@@ -29,13 +29,13 @@ RATE = 29.97
 
 # training params
 RNN = 'res'
-DEPTH = 4
+DEPTH = 6
 F = 32
 K = 13
 UNITS = 32
-DROPOUT = 0.3
+DROPOUT = 0.4
 EPOCHS = 50
-BATCH_SIZE = 128
+BATCH_SIZE = 64
 TEST_PERC = 0.25
 PATIENCE = 5
 
@@ -505,49 +505,50 @@ def build_model(input_shape):
     inputs = Input(shape=input_shape[-2:], dtype='float32', name="input")
     n = inputs
 
-    #n = layers.TimeDistributed(layers.Dense(UNITS//2, dtype='float32', kernel_regularizer='l1_l2', activation='relu'))(n)
-    n = layers.Conv1D(filters=F, kernel_size=1, padding='same', name='initial_proj')(inputs)
-    
-    for i in range(DEPTH):
-        residual = n
+    for i in range(min(DEPTH,4)):
+        #residual = n
         n = layers.Conv1D(filters=F, kernel_size=K, padding='same', activation='relu')(n)
         n = layers.BatchNormalization()(n)
-        n = layers.Dropout(DROPOUT)(n)
-        n = layers.Add(name=f'residual_add_{i}')([n, residual])
-        n = layers.Activation('relu')(n)
-        if i < DEPTH-1:
+        #n = layers.Dropout(DROPOUT)(n)
+        n = layers.SpatialDropout1D(DROPOUT)(n)
+        #n = layers.Add(name=f'residual_add_{i}')([n, residual])
+        #n = layers.Activation('relu')(n)
+        if i < DEPTH-1 and i < 3:
             n = layers.MaxPooling1D(pool_size=2)(n)
 
-    # squeeze and excite
+    # squeeze and excite (channel/feature attention)
     se = layers.GlobalAveragePooling1D()(n)
     se = layers.Dense(isqrt(n.shape[-1]), activation='relu')(se)
     se = layers.Dense(n.shape[-1], activation='sigmoid')(se)
     se = layers.Reshape((1,se.shape[-1]))(se)  # match shape for multiply
     n = layers.Multiply()([n, se])
 
-    #for i in range(DEPTH):
-    #    n = layers.Conv1D(filters=F, kernel_size=K, dilation_rate=2**i, padding='same', activation='relu', kernel_regularizer='l1_l2')(n)
-    #    n = layers.BatchNormalization()(n)
-    #    n = layers.Dropout(DROPOUT)(n)
+    # After final conv layer, before flatten
+    attention = layers.Dense(1, activation='tanh')(n)
+    attention = layers.Flatten()(attention)
+    attention = layers.Activation('softmax')(attention)
+    attention = layers.RepeatVector(n.shape[-1])(attention)
+    attention = layers.Permute([2, 1])(attention)
+    n = layers.Multiply()([n, attention])
 
-    #n = layers.GlobalAveragePooling1D()(n)
+    i = DEPTH - 4
+    while i > 0:
+        Kstep = [13, 11, 7, 5, 3]
+        #print(-i,Kstep[-i])
+        n = layers.Conv1D(filters=F, kernel_size=Kstep[-i], padding='same', activation='relu')(n)
+        n = layers.BatchNormalization()(n)
+        #n = layers.Dropout(DROPOUT)(n)
+        n = layers.SpatialDropout1D(DROPOUT)(n)
+        i -= 1
+
     n = layers.Flatten()(n)
 
-    n = layers.Dense(UNITS, dtype='float32', activation='relu', kernel_regularizer='l1_l2')(n)
+    n = layers.Dense(UNITS, dtype='float32', activation='relu')(n)
     n = layers.Dropout(DROPOUT)(n)
 
-    skip_connection = layers.GlobalAveragePooling1D()(inputs)
-    skip_connection = layers.Dense(UNITS//2, activation='relu', kernel_regularizer='l1_l2')(skip_connection)
-    n = layers.Concatenate()([n, skip_connection])
-
-    n = layers.Dense(UNITS, dtype='float32', activation='relu', kernel_regularizer='l1_l2')(n)
+    n = layers.Dense(UNITS, dtype='float32', activation='relu')(n)
     n = layers.Dropout(DROPOUT)(n)
     
-    #skip = layers.TimeDistributed(layers.Dense(UNITS, dtype='float32', kernel_regularizer='l1_l2', activation='tanh'), name="dense-skip")(skip)
-    #skip = layers.GlobalMaxPool1D(name="skip")(skip)
-    #n = layers.Add(name="added")([n, skip])
-
-    #n = layers.Dense(UNITS//2, dtype='float32', activation='relu', kernel_regularizer='l1_l2', name="final")(n)
     outputs = layers.Dense(1, dtype='float32', activation='sigmoid', name="output")(n)
     
     return Model(inputs, outputs)
@@ -562,7 +563,7 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
         from keras.metrics import Recall, Precision
         model = build_model(train_dataset.shape)
         model.summary()
-        model.compile(optimizer="adam", loss="binary_crossentropy", metrics=['accuracy', Recall(class_id=0), Precision(class_id=0)])
+        model.compile(optimizer="adam", loss=keras.losses.BinaryCrossentropy(label_smoothing=0.1), metrics=['accuracy', Recall(class_id=0), Precision(class_id=0)])
         model.save(model_path)
     
     gc.collect()
@@ -592,7 +593,7 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
     oldsint = signal.signal(signal.SIGINT, handler)
     oldterm = signal.signal(signal.SIGTERM, handler)
 
-    model.fit(train_dataset, validation_data=test_dataset, epochs=EPOCHS, initial_epoch=epoch, callbacks=cb, class_weight={0:0.75,1:1.3334})
+    model.fit(train_dataset, validation_data=test_dataset, epochs=EPOCHS, initial_epoch=epoch, callbacks=cb, class_weight={0:0.75, 1:1.5})
 
     #model.save(model_path) the checkpoint already saved the vest version
     return (ecp.last_epoch+1, model.stop_training or ecp.last_epoch+1 >= EPOCHS)
