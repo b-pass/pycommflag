@@ -28,7 +28,7 @@ SUMMARY_RATE = 1
 RATE = 29.97
 
 # training params
-RNN = 'res'
+RNN = 'conv'
 DEPTH = 6
 F = 32
 K = 13
