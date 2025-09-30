@@ -33,7 +33,7 @@ DEPTH = 6
 F = 32
 K = 13
 UNITS = 32
-DROPOUT = 0.4
+DROPOUT = 0.3
 EPOCHS = 50
 BATCH_SIZE = 64
 TEST_PERC = 0.25
@@ -287,13 +287,15 @@ def load_nonpersistent(flog:dict, for_training=False)->np.ndarray:
     for (tt,(st,et)) in tags:
         if type(tt) is not int: tt = tt.value
 
-        si = np.searchsorted(timestamps, st)
-        ei = np.searchsorted(timestamps, et)
+        si = np.searchsorted(timestamps, st, 'left')
+        ei = np.searchsorted(timestamps, et, 'right')
 
         if tt == SceneType.DO_NOT_USE.value:
             weights[si:ei] = 0 # ignore this entire section
         elif tt == SceneType.COMMERCIAL.value:
             answers[si:ei] = 1.0
+        elif tt != SceneType.SHOW.value:
+            weights[si:ei] = 0.5
     
     condensed = condense(frames, round(frame_rate/SUMMARY_RATE))
     
@@ -505,16 +507,21 @@ def build_model(input_shape):
     inputs = Input(shape=input_shape[-2:], dtype='float32', name="input")
     n = inputs
 
+    #residual = layers.Conv1D(F, 1, padding='same')(n)
     for i in range(min(DEPTH,4)):
-        #residual = n
-        n = layers.Conv1D(filters=F, kernel_size=K, padding='same', activation='relu')(n)
+        n = layers.DepthwiseConv1D(K, padding='same')(n)
         n = layers.BatchNormalization()(n)
-        #n = layers.Dropout(DROPOUT)(n)
-        n = layers.SpatialDropout1D(DROPOUT)(n)
+        n = layers.Activation('relu')(n)
+        #n = layers.SpatialDropout1D(DROPOUT)(n)
+        
+        n = layers.Conv1D(F, 1, padding='same')(n)
+        n = layers.BatchNormalization()(n)
         #n = layers.Add(name=f'residual_add_{i}')([n, residual])
-        #n = layers.Activation('relu')(n)
+        n = layers.Activation('relu')(n)
+        n = layers.SpatialDropout1D(DROPOUT)(n)
         if i < DEPTH-1 and i < 3:
             n = layers.MaxPooling1D(pool_size=2)(n)
+        residual = n
 
     # squeeze and excite (channel/feature attention)
     se = layers.GlobalAveragePooling1D()(n)
@@ -535,10 +542,16 @@ def build_model(input_shape):
     while i > 0:
         Kstep = [13, 11, 7, 5, 3]
         #print(-i,Kstep[-i])
-        n = layers.Conv1D(filters=F, kernel_size=Kstep[-i], padding='same', activation='relu')(n)
+
+        n = layers.DepthwiseConv1D(Kstep[-i], padding='same')(n)
         n = layers.BatchNormalization()(n)
-        #n = layers.Dropout(DROPOUT)(n)
+        n = layers.Activation('relu')(n)
+        #n = layers.SpatialDropout1D(DROPOUT)(n)
+        n = layers.Conv1D(F, 1, padding='same')(n)
+        n = layers.BatchNormalization()(n)
         n = layers.SpatialDropout1D(DROPOUT)(n)
+        n = layers.Activation('relu')(n)
+
         i -= 1
 
     n = layers.Flatten()(n)
