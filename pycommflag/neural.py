@@ -33,11 +33,56 @@ DEPTH = 6
 F = 32
 K = 13
 UNITS = 32
-DROPOUT = 0.4
+DROPOUT = 0.3
 EPOCHS = 50
 BATCH_SIZE = 64
 TEST_PERC = 0.25
 PATIENCE = 5
+
+def build_model(input_shape):
+    from keras import layers, regularizers, Input, Model
+
+    inputs = Input(shape=input_shape[-2:], dtype='float32', name="input")
+    n = inputs
+
+    l2reg = None #regularizers.l2(0.0001)
+
+    for i in range(min(DEPTH,4)):
+        n = layers.Conv1D(filters=F, kernel_size=K, padding='same', activation='relu', kernel_regularizer=l2reg)(n)
+        n = layers.BatchNormalization()(n)
+        n = layers.SpatialDropout1D(DROPOUT)(n)
+        if i < DEPTH-1 and i < 3:
+            n = layers.MaxPooling1D(pool_size=2)(n)
+
+    # Replace SE + custom attention with MultiHeadAttention
+    n = layers.MultiHeadAttention(
+        num_heads=4,
+        key_dim=F // 4,
+        dropout=DROPOUT / 2
+    )(n, n)  # self-attention
+    n = layers.LayerNormalization()(n)
+
+    i = DEPTH - 4
+    while i > 0:
+        Kstep = [13, 11, 7, 5, 3]
+        #print(-i,Kstep[-i])
+        n = layers.Conv1D(filters=F, kernel_size=Kstep[-i], padding='same', activation='relu', kernel_regularizer=l2reg)(n)
+        n = layers.BatchNormalization()(n)
+        n = layers.SpatialDropout1D(DROPOUT)(n)
+        i -= 1
+
+    n = layers.GlobalAveragePooling1D()(n)
+    #n = layers.Flatten()(n)
+
+    n = layers.Dense(UNITS, dtype='float32', activation='relu', kernel_regularizer=l2reg)(n)
+    n = layers.Dropout(DROPOUT)(n)
+
+    n = layers.Dense(UNITS, dtype='float32', activation='relu', kernel_regularizer=l2reg)(n)
+    n = layers.Dropout(DROPOUT)(n)
+    
+    outputs = layers.Dense(1, dtype='float32', activation='sigmoid', name="output")(n)
+    
+    return Model(inputs, outputs)
 
 def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]], 
                  blanks: List[Tuple[bool, Tuple[float, float]]], 
@@ -136,57 +181,44 @@ def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]],
 
 def condense(frames: np.ndarray, step: int) -> np.ndarray:
     """
-    Condense video frames by averaging specific features over specified step sizes.
-    
-    Args:
-        frames: numpy array of shape (n_frames, n_features) where features at indices:
-               1: logo
-               2: blank
-               3: diff
-               Are summarized.
-               All other features are preserved from the first frame of each group.
-        step: number of frames to combine into one
-        summarize: 
-                True: summarize and aggregate feature values
-                False: try to pick the most important value instead.
-    
-    Returns:
-        Condensed numpy array with averaged features for logo, blank, diff
-        and preserved values for other features
+    Summarize video features by aggregating the specified step size.
     """
     if step <= 1:
         return frames
 
-    # audio features are spread across time anyway so we dont need to sumarize them unless the condense step is more than 0.5s
+    def doit(a):
+        # first, average everything
+        res = []
+        res.append(np.percentile(a[:, :, 3], 90, axis=1)) # diff 90th
+        res.append(np.max(a[:, :, 3], axis=1)) # diff max
+        for f in [4,5]: # fvol, rvol
+            res.append(np.max(a[:, :, f], axis=1)) # vol max
+            res.append(np.std(a[:, :, f], axis=1)) # vol std dev
+
+        res = [np.average(a[:, :, 0:6], axis=1)] + [x.reshape(x.shape[0], 1) for x in res] + [np.average(a[:, :, 6:], axis=1)]
+
+        res[0][:, 0] = a[:, a.shape[1]//2, 0] # Use the middle timestamp
+        res[0][:, 3] = np.count_nonzero(a[:, :, 3] >= 0.5, axis=1) / a.shape[1]  # Diff count above 0.5
+        
+        res[-1][:, -2] = np.count_nonzero(a[:, :, -2] >= 0.5, axis=1) / a.shape[1] # answer
+        
+        return np.concatenate([x.reshape((x.shape[0], 1)) if len(x.shape) == 1 else x for x in res], axis=1)
     
     n_frames = len(frames)
     remaining = n_frames % step
     if n_frames >= step:
         # Reshape the array to group frames by step size
-        valid_frames = frames[:(n_frames//step)*step].reshape(-1, step, frames.shape[1])
-
-        condensed = np.average(valid_frames, axis=1)
-
-        condensed[:, 0] = valid_frames[:, step//2, 0] # middle timestamp
-        condensed[:, 3] = np.count_nonzero(valid_frames[:, :, 3] >= 0.5, axis=1) / step  # Diff ratio
-        condensed[:, -2] = np.where(condensed[:, -2] >= 0.5, 1.0, 0.0) # answer
+        condensed = doit( frames[:(n_frames//step)*step].reshape(-1, step, frames.shape[1]) )
     else:
         condensed = None
     
     if remaining > 0:
         # Do the final, partial condensing
-        last_frames = frames[-remaining:]
-        last_condensed = np.average(last_frames, axis=0)
-        
-        last_condensed[0] = last_frames[remaining//2, 0] # middle timestamp
-        last_condensed[3] = np.count_nonzero(last_frames[:, 3] >= 0.5) / remaining  # Diff ratio
-        last_condensed[-2] = 1.0 if last_condensed[-2] >= 0.5 else 0.0 # answer
-        
-        if condensed is not None:
-            condensed = np.vstack((condensed, last_condensed))
-        else:
-            condensed = last_condensed
-    
+        partial = doit( frames[-remaining:].reshape(-1, remaining, frames.shape[1]) )
+
+        if condensed is None:
+            return partial
+        return np.vstack((condensed, partial))
     return condensed
 
 def load_nonpersistent(flog:dict, for_training=False)->np.ndarray:
@@ -271,8 +303,10 @@ def load_nonpersistent(flog:dict, for_training=False)->np.ndarray:
     frames = np.append(frames, frames[...,0].reshape((-1,1)), axis=1)
 
     # add a column for answers [-2]
-    # and a column for weights [-1]
-    frames = np.insert(frames, frames.shape[1], [[0.0], [1.0]], axis=1)
+    frames = np.append(frames, np.zeros((frames.shape[0],1), dtype=np.float32), axis=1)
+
+    # add a column for weights [-1]
+    frames = np.append(frames, np.ones((frames.shape[0],1), dtype=np.float32), axis=1)
 
     # change the first column to be normalized timestamps (30 minute segments)
     frames[...,0] = (frames[...,0] % 1800.0) / 1800.0
@@ -294,6 +328,8 @@ def load_nonpersistent(flog:dict, for_training=False)->np.ndarray:
             weights[si:ei] = 0 # ignore this entire section
         elif tt == SceneType.COMMERCIAL.value:
             answers[si:ei] = 1.0
+        elif tt != SceneType.SHOW.value:
+            weights[si:ei] = 0.75
     
     condensed = condense(frames, round(frame_rate/SUMMARY_RATE))
     
@@ -498,60 +534,6 @@ def train(opts:Any=None):
     print()
 
     return 0
-
-def build_model(input_shape):
-    from keras import layers, Input, Model
-
-    inputs = Input(shape=input_shape[-2:], dtype='float32', name="input")
-    n = inputs
-
-    for i in range(min(DEPTH,4)):
-        #residual = n
-        n = layers.Conv1D(filters=F, kernel_size=K, padding='same', activation='relu')(n)
-        n = layers.BatchNormalization()(n)
-        #n = layers.Dropout(DROPOUT)(n)
-        n = layers.SpatialDropout1D(DROPOUT)(n)
-        #n = layers.Add(name=f'residual_add_{i}')([n, residual])
-        #n = layers.Activation('relu')(n)
-        if i < DEPTH-1 and i < 3:
-            n = layers.MaxPooling1D(pool_size=2)(n)
-
-    # squeeze and excite (channel/feature attention)
-    se = layers.GlobalAveragePooling1D()(n)
-    se = layers.Dense(isqrt(n.shape[-1]), activation='relu')(se)
-    se = layers.Dense(n.shape[-1], activation='sigmoid')(se)
-    se = layers.Reshape((1,se.shape[-1]))(se)  # match shape for multiply
-    n = layers.Multiply()([n, se])
-
-    # After final conv layer, before flatten
-    attention = layers.Dense(1, activation='tanh')(n)
-    attention = layers.Flatten()(attention)
-    attention = layers.Activation('softmax')(attention)
-    attention = layers.RepeatVector(n.shape[-1])(attention)
-    attention = layers.Permute([2, 1])(attention)
-    n = layers.Multiply()([n, attention])
-
-    i = DEPTH - 4
-    while i > 0:
-        Kstep = [13, 11, 7, 5, 3]
-        #print(-i,Kstep[-i])
-        n = layers.Conv1D(filters=F, kernel_size=Kstep[-i], padding='same', activation='relu')(n)
-        n = layers.BatchNormalization()(n)
-        #n = layers.Dropout(DROPOUT)(n)
-        n = layers.SpatialDropout1D(DROPOUT)(n)
-        i -= 1
-
-    n = layers.Flatten()(n)
-
-    n = layers.Dense(UNITS, dtype='float32', activation='relu')(n)
-    n = layers.Dropout(DROPOUT)(n)
-
-    n = layers.Dense(UNITS, dtype='float32', activation='relu')(n)
-    n = layers.Dropout(DROPOUT)(n)
-    
-    outputs = layers.Dense(1, dtype='float32', activation='sigmoid', name="output")(n)
-    
-    return Model(inputs, outputs)
 
 def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,bool]:
     import keras
