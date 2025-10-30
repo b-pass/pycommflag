@@ -29,23 +29,24 @@ RATE = 29.97
 
 # training params
 RNN = 'conv'
-DEPTH = 6
+DEPTH = 8
 F = 32
 K = 13
 UNITS = 32
-DROPOUT = 0.3
+DROPOUT = 0.4
 EPOCHS = 50
 BATCH_SIZE = 64
 TEST_PERC = 0.25
-PATIENCE = 5
+PATIENCE = 7
 
-def build_model(input_shape):
+def build_model(input_shape=(121,17)):
     from keras import layers, regularizers, Input, Model
 
     inputs = Input(shape=input_shape[-2:], dtype='float32', name="input")
     n = inputs
 
-    l2reg = None #regularizers.l2(0.0001)
+    l2reg = regularizers.l2(0.00001)
+    residual = None
 
     for i in range(min(DEPTH,4)):
         n = layers.Conv1D(filters=F, kernel_size=K, padding='same', activation='relu', kernel_regularizer=l2reg)(n)
@@ -53,12 +54,16 @@ def build_model(input_shape):
         n = layers.SpatialDropout1D(DROPOUT)(n)
         if i < DEPTH-1 and i < 3:
             n = layers.MaxPooling1D(pool_size=2)(n)
-
-    # Replace SE + custom attention with MultiHeadAttention
+        else:
+            residual = n
+    
+    if residual is None:
+        residual = n
+    
     n = layers.MultiHeadAttention(
-        num_heads=4,
-        key_dim=F // 4,
-        dropout=DROPOUT / 2
+        num_heads=8,
+        key_dim=F // 2,
+        dropout=DROPOUT
     )(n, n)  # self-attention
     n = layers.LayerNormalization()(n)
 
@@ -70,6 +75,8 @@ def build_model(input_shape):
         n = layers.BatchNormalization()(n)
         n = layers.SpatialDropout1D(DROPOUT)(n)
         i -= 1
+
+    n = layers.Add()([n, residual])
 
     n = layers.GlobalAveragePooling1D()(n)
     #n = layers.Flatten()(n)
