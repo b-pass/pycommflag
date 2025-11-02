@@ -30,7 +30,7 @@ RATE = 29.97
 # training params
 RNN = 'conv'
 DEPTH = 8
-F = 32
+F = 48
 K = 13
 UNITS = 32
 DROPOUT = 0.4
@@ -45,7 +45,7 @@ def build_model(input_shape=(121,17)):
     inputs = Input(shape=input_shape[-2:], dtype='float32', name="input")
     n = inputs
 
-    l2reg = regularizers.l2(0.00001)
+    l2reg = regularizers.l2(0.00003)
     residual = None
 
     for i in range(min(DEPTH,4)):
@@ -60,9 +60,15 @@ def build_model(input_shape=(121,17)):
     if residual is None:
         residual = n
     
+    attn = layers.GlobalAveragePooling1D()(n) # Squeeze
+    attn = layers.Dense(n.shape[-1] // 8, activation='relu')(attn) # bottleneck
+    attn = layers.Dense(n.shape[-1], activation='sigmoid')(attn) # Excite
+    attn = layers.Reshape((1, n.shape[-1]))(attn) # fix dimensions
+    n = layers.Multiply()([n, attn]) # apply SE
+ 
     n = layers.MultiHeadAttention(
         num_heads=8,
-        key_dim=F // 2,
+        key_dim=F // 8,
         dropout=DROPOUT
     )(n, n)  # self-attention
     n = layers.LayerNormalization()(n)
@@ -78,7 +84,9 @@ def build_model(input_shape=(121,17)):
 
     n = layers.Add()([n, residual])
 
-    n = layers.GlobalAveragePooling1D()(n)
+    x = layers.GlobalAveragePooling1D()(n)
+    y = layers.GlobalMaxPooling1D()(n)
+    n = layers.Concatenate()([x,y])
     #n = layers.Flatten()(n)
 
     n = layers.Dense(UNITS, dtype='float32', activation='relu', kernel_regularizer=l2reg)(n)
@@ -207,7 +215,7 @@ def condense(frames: np.ndarray, step: int) -> np.ndarray:
         res[0][:, 0] = a[:, a.shape[1]//2, 0] # Use the middle timestamp
         res[0][:, 3] = np.count_nonzero(a[:, :, 3] >= 0.5, axis=1) / a.shape[1]  # Diff count above 0.5
         
-        res[-1][:, -2] = np.count_nonzero(a[:, :, -2] >= 0.5, axis=1) / a.shape[1] # answer
+        res[-1][:, -2] = np.count_nonzero(a[:, :, -2] >= 0.5, axis=1) / a.shape[1] # answer is proportional 
         
         return np.concatenate([x.reshape((x.shape[0], 1)) if len(x.shape) == 1 else x for x in res], axis=1)
     
@@ -552,7 +560,7 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
         from keras.metrics import Recall, Precision
         model = build_model(train_dataset.shape)
         model.summary()
-        model.compile(optimizer="adam", loss=keras.losses.BinaryCrossentropy(label_smoothing=0.1), metrics=['accuracy', Recall(class_id=0), Precision(class_id=0)])
+        model.compile(optimizer="adam", loss=keras.losses.BinaryCrossentropy(label_smoothing=0), metrics=['accuracy', Recall(class_id=0), Precision(class_id=0)])
         model.save(model_path)
     
     gc.collect()
