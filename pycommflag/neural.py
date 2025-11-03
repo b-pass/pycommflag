@@ -48,17 +48,18 @@ def build_model(input_shape=(121,17)):
     l2reg = regularizers.l2(0.00003)
     residual = None
 
-    for i in range(min(DEPTH,4)):
+    for d in range(3):
+        if d >= DEPTH:
+            break
         n = layers.Conv1D(filters=F, kernel_size=K, padding='same', activation='relu', kernel_regularizer=l2reg)(n)
         n = layers.BatchNormalization()(n)
         n = layers.SpatialDropout1D(DROPOUT)(n)
-        if i < DEPTH-1 and i < 3:
-            n = layers.MaxPooling1D(pool_size=2)(n)
-        else:
-            residual = n
+        n = layers.MaxPooling1D(pool_size=2)(n)
     
-    if residual is None:
-        residual = n
+    n = layers.Conv1D(filters=F, kernel_size=K, padding='same', activation='relu', kernel_regularizer=l2reg)(n)
+    n = layers.BatchNormalization()(n)
+    n = layers.SpatialDropout1D(DROPOUT)(n)
+    residual = n
     
     attn = layers.GlobalAveragePooling1D()(n) # Squeeze
     attn = layers.Dense(n.shape[-1] // 8, activation='relu')(attn) # bottleneck
@@ -73,14 +74,14 @@ def build_model(input_shape=(121,17)):
     )(n, n)  # self-attention
     n = layers.LayerNormalization()(n)
 
-    i = DEPTH - 4
-    while i > 0:
-        Kstep = [13, 11, 7, 5, 3]
-        #print(-i,Kstep[-i])
-        n = layers.Conv1D(filters=F, kernel_size=Kstep[-i], padding='same', activation='relu', kernel_regularizer=l2reg)(n)
+    for Ks in [13, 11, 7, 5, 3]:
+        if d >= DEPTH:
+            break
+        d += 1
+        
+        n = layers.Conv1D(filters=F, kernel_size=Ks, padding='same', activation='relu', kernel_regularizer=l2reg)(n)
         n = layers.BatchNormalization()(n)
         n = layers.SpatialDropout1D(DROPOUT)(n)
-        i -= 1
 
     n = layers.Add()([n, residual])
 
