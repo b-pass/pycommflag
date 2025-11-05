@@ -37,7 +37,7 @@ DROPOUT = 0.4
 EPOCHS = 50
 BATCH_SIZE = 64
 TEST_PERC = 0.25
-PATIENCE = 7
+PATIENCE = 5
 
 def build_model(input_shape=(121,17)):
     from keras import layers, regularizers, Input, Model
@@ -45,7 +45,7 @@ def build_model(input_shape=(121,17)):
     inputs = Input(shape=input_shape[-2:], dtype='float32', name="input")
     n = inputs
 
-    l2reg = regularizers.l2(0.00003)
+    l2reg = regularizers.l2(0.00002)
     residual = None
 
     for d in range(3):
@@ -59,14 +59,15 @@ def build_model(input_shape=(121,17)):
     n = layers.Conv1D(filters=F, kernel_size=K, padding='same', activation='relu', kernel_regularizer=l2reg)(n)
     n = layers.BatchNormalization()(n)
     n = layers.SpatialDropout1D(DROPOUT)(n)
+     
     residual = n
-    
+
     attn = layers.GlobalAveragePooling1D()(n) # Squeeze
     attn = layers.Dense(n.shape[-1] // 8, activation='relu')(attn) # bottleneck
     attn = layers.Dense(n.shape[-1], activation='sigmoid')(attn) # Excite
     attn = layers.Reshape((1, n.shape[-1]))(attn) # fix dimensions
     n = layers.Multiply()([n, attn]) # apply SE
- 
+
     n = layers.MultiHeadAttention(
         num_heads=8,
         key_dim=F // 8,
@@ -78,7 +79,7 @@ def build_model(input_shape=(121,17)):
         if d >= DEPTH:
             break
         d += 1
-        
+
         n = layers.Conv1D(filters=F, kernel_size=Ks, padding='same', activation='relu', kernel_regularizer=l2reg)(n)
         n = layers.BatchNormalization()(n)
         n = layers.SpatialDropout1D(DROPOUT)(n)
@@ -572,7 +573,21 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
 
     cb.append(callbacks.EarlyStopping(monitor='loss', patience=PATIENCE))
     cb.append(callbacks.EarlyStopping(monitor='val_accuracy', patience=PATIENCE+2))
-    cb.append(callbacks.ReduceLROnPlateau(monitor='val_accuracy', patience=PATIENCE-1))
+
+    def cosine_annealing_with_warmup(epoch, lr):
+        WARMUP = 3
+        FINETUNE = 25
+        
+        if epoch < WARMUP:
+            # Warm up
+            return 0.001 * (epoch + 1) / WARMUP
+        
+        # Cosine annealing 
+        progress = (epoch - WARMUP) / (FINETUNE - WARMUP)
+        return max( 0.0001 + (0.001 - 0.0001) * 0.5 * (1 + np.cos(np.pi * progress)), 0.00001 )
+    
+    cb.append(callbacks.LearningRateScheduler(cosine_annealing_with_warmup, verbose=1))
+    #cb.append(callbacks.ReduceLROnPlateau(monitor='val_accuracy', patience=PATIENCE-1))
     
     class EpochModelCheckpoint(callbacks.ModelCheckpoint):
         def on_epoch_end(self, epoch, logs=None):
@@ -591,7 +606,7 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
     oldsint = signal.signal(signal.SIGINT, handler)
     oldterm = signal.signal(signal.SIGTERM, handler)
 
-    model.fit(train_dataset, validation_data=test_dataset, epochs=EPOCHS, initial_epoch=epoch, callbacks=cb, class_weight={0:0.75, 1:1.5})
+    model.fit(train_dataset, validation_data=test_dataset, epochs=EPOCHS, initial_epoch=epoch, callbacks=cb, class_weight={0:0.65, 1:1/0.65})
 
     #model.save(model_path) the checkpoint already saved the vest version
     return (ecp.last_epoch+1, model.stop_training or ecp.last_epoch+1 >= EPOCHS)
