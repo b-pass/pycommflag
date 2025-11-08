@@ -21,6 +21,8 @@ from .feature_span import *
 from . import processor
 from . import neural
 
+random.seed(42)
+
 # data params, both for train and for inference
 WINDOW_BEFORE = 60
 WINDOW_AFTER = 60
@@ -40,7 +42,9 @@ TEST_PERC = 0.25
 PATIENCE = 5
 
 def build_model(input_shape=(121,17)):
-    from keras import layers, regularizers, Input, Model
+    from keras import layers, regularizers, utils, Input, Model
+
+    utils.set_random_seed(17)
 
     inputs = Input(shape=input_shape[-2:], dtype='float32', name="input")
     n = inputs
@@ -75,7 +79,7 @@ def build_model(input_shape=(121,17)):
     )(n, n)  # self-attention
     n = layers.LayerNormalization()(n)
 
-    for Ks in [13, 11, 7, 5, 3]:
+    for Ks in [7, 5, 5, 3, 3]:
         if d >= DEPTH:
             break
         d += 1
@@ -572,7 +576,7 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
     from keras import callbacks
 
     cb.append(callbacks.EarlyStopping(monitor='loss', patience=PATIENCE))
-    cb.append(callbacks.EarlyStopping(monitor='val_accuracy', patience=PATIENCE+2))
+    cb.append(callbacks.EarlyStopping(monitor='val_accuracy', patience=PATIENCE))
 
     def cosine_annealing_with_warmup(epoch, lr):
         WARMUP = 3
@@ -586,7 +590,7 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
         progress = (epoch - WARMUP) / (FINETUNE - WARMUP)
         return max( 0.0001 + (0.001 - 0.0001) * 0.5 * (1 + np.cos(np.pi * progress)), 0.00001 )
     
-    cb.append(callbacks.LearningRateScheduler(cosine_annealing_with_warmup, verbose=1))
+    cb.append(callbacks.LearningRateScheduler(cosine_annealing_with_warmup))
     #cb.append(callbacks.ReduceLROnPlateau(monitor='val_accuracy', patience=PATIENCE-1))
     
     class EpochModelCheckpoint(callbacks.ModelCheckpoint):
@@ -818,6 +822,8 @@ def eval(opts:Any):
     except: pass
 
     datafiles = []
+    if opts.ml_data is None: opts.ml_data = []
+    
     for f in opts.ml_data:
         if os.path.isdir(f) or f.endswith('.npy'):
             continue
@@ -826,7 +832,6 @@ def eval(opts:Any):
     
     print("EVALUATE", len(opts.eval), "on", len(datafiles))
 
-    import tensorflow as tf
     import keras
 
     models = {}
