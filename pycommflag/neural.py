@@ -21,7 +21,7 @@ from .feature_span import *
 from . import processor
 from . import neural
 
-random.seed(42)
+random.seed(1711)
 
 # data params, both for train and for inference
 WINDOW_BEFORE = 60
@@ -30,21 +30,21 @@ SUMMARY_RATE = 1
 RATE = 29.97
 
 # training params
-RNN = 'conv'
+MTYPE = 'conv'
 DEPTH = 8
 F = 48
 K = 13
 UNITS = 32
 DROPOUT = 0.4
 EPOCHS = 50
-BATCH_SIZE = 64
+BATCH_SIZE = 128
 TEST_PERC = 0.25
-PATIENCE = 5
+PATIENCE = 7
 
 def build_model(input_shape=(121,17)):
     from keras import layers, regularizers, utils, Input, Model
 
-    utils.set_random_seed(17)
+    #utils.set_random_seed(1711)
 
     inputs = Input(shape=input_shape[-2:], dtype='float32', name="input")
     n = inputs
@@ -63,14 +63,8 @@ def build_model(input_shape=(121,17)):
     n = layers.Conv1D(filters=F, kernel_size=K, padding='same', activation='relu', kernel_regularizer=l2reg)(n)
     n = layers.BatchNormalization()(n)
     n = layers.SpatialDropout1D(DROPOUT)(n)
-     
+    
     residual = n
-
-    attn = layers.GlobalAveragePooling1D()(n) # Squeeze
-    attn = layers.Dense(n.shape[-1] // 8, activation='relu')(attn) # bottleneck
-    attn = layers.Dense(n.shape[-1], activation='sigmoid')(attn) # Excite
-    attn = layers.Reshape((1, n.shape[-1]))(attn) # fix dimensions
-    n = layers.Multiply()([n, attn]) # apply SE
 
     n = layers.MultiHeadAttention(
         num_heads=8,
@@ -79,7 +73,16 @@ def build_model(input_shape=(121,17)):
     )(n, n)  # self-attention
     n = layers.LayerNormalization()(n)
 
-    for Ks in [7, 5, 5, 3, 3]:
+    attn = layers.GlobalAveragePooling1D()(n) # Squeeze
+    attn = layers.Dense(n.shape[-1] // 8, activation='relu', kernel_regularizer=l2reg)(attn) # bottleneck
+    attn = layers.Dense(n.shape[-1], activation='sigmoid', kernel_regularizer=l2reg)(attn) # Excite
+    attn = layers.Reshape((1, n.shape[-1]))(attn) # fix dimensions
+    n = layers.Multiply()([n, attn]) # apply SE
+
+    #n = layers.Add()([n, residual])
+    #residual = n
+
+    for Ks in [7, 5, 5, 3, 3, 3, 3, 3]:
         if d >= DEPTH:
             break
         d += 1
@@ -390,22 +393,35 @@ def make_data_generator(*args, **kwargs):
             self.weights = np.array(weights, dtype='float32') if weights else None
             self.len = ceil(len(self.data) / BATCH_SIZE)
             self.shape = (self.len, BATCH_SIZE, len(data[0]), len(data[0][0]))
+            self.shuf = np.arange(0, len(self.data), dtype='int')
+            self.do_shuf = False
         
         def __len__(self):
             return self.len
         
         def __getitem__(self, index):
             index *= BATCH_SIZE
-            d = self.data[index:index+BATCH_SIZE]
+            indexes = self.shuf[index:index+BATCH_SIZE]
+            d = self.data[indexes]
             if self.answers is not None:
-                a = self.answers[index:index+BATCH_SIZE]
+                a = self.answers[indexes]
                 if self.weights is not None:
-                    w = self.weights[index:index+BATCH_SIZE]
+                    w = self.weights[indexes]
                     return d,a,w
                 else:
                     return d,a
             else:
                 return d
+        
+        def on_epoch_end(self):
+            if self.do_shuf:
+                self.shuffle()
+            return super().on_epoch_end()
+        
+        def shuffle(self):
+            self.do_shuf = True
+            self.shuf = np.random.randint(0, len(self.data), len(self.data))
+
     return DataGenerator(*args, **kwargs)
 
 def load_data_sliding_window(condensed:np.ndarray)->tuple[np.ndarray,np.ndarray,np.ndarray,np.ndarray]:
@@ -482,21 +498,23 @@ def load_data(opts, do_not_test=False) -> tuple:
                     test[x].append(stuff[x][i])
     stuff = None
 
-    data = list(zip(*data))
-    random.shuffle(data)
-
     if not do_not_test:
         need = int(dlen*TEST_PERC+1) - tlen
         if need > dlen/100 and tlen/(tlen+dlen) < 0.1:
             print(f'Need to move {need} of {dlen} elements to the test/eval set (have {tlen} will have ~{need+tlen})')
+            data = list(zip(*data))
+            random.shuffle(data)
             for i in range(need):
                 e = data[i]
                 test[0].append(e[0])
                 test[1].append(e[1])
                 test[2].append(e[2])
             data = data[need:]
+            data = zip(*data)
     
-    data = make_data_generator(*zip(*data))
+    data = make_data_generator(*data)
+    data.shuffle()
+
     test = make_data_generator(*test) if test else None
     
     return data,test
@@ -525,7 +543,7 @@ def train(opts:Any=None):
     stop = False
     epoch = 0
 
-    #model_path = '/tmp/train-xyz.pycf.model.keras'
+    #model_path = '/tmp/x.keras'
     #epoch = 10
 
     _train_some(model_path, data, test, epoch)
@@ -543,7 +561,7 @@ def train(opts:Any=None):
     print(tmetrics)
 
     if tmetrics[1] >= 0.80:
-        name = f'{opts.models_dir if opts and opts.models_dir else "."}{os.sep}pycf-{tmetrics[1]:.04f}-c{F}x{K}x{DEPTH}-{RNN}{UNITS}-w{WINDOW_BEFORE}x{WINDOW_AFTER}-{int(time.time())}.keras'
+        name = f'{opts.models_dir if opts and opts.models_dir else "."}{os.sep}pycf-{tmetrics[1]:.04f}-c{F}x{K}x{DEPTH}-{MTYPE}{UNITS}-w{WINDOW_BEFORE}x{WINDOW_AFTER}-{int(time.time())}.keras'
         print()
         print('Saving as ' + name)
 
