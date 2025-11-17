@@ -21,7 +21,7 @@ from .feature_span import *
 from . import processor
 from . import neural
 
-random.seed(1711)
+random.seed(17)
 
 # data params, both for train and for inference
 WINDOW_BEFORE = 60
@@ -37,14 +37,14 @@ K = 13
 UNITS = 32
 DROPOUT = 0.4
 EPOCHS = 50
-BATCH_SIZE = 128
+BATCH_SIZE = 64
 TEST_PERC = 0.25
 PATIENCE = 7
 
 def build_model(input_shape=(121,17)):
     from keras import layers, regularizers, utils, Input, Model
 
-    #utils.set_random_seed(1711)
+    utils.set_random_seed(17)
 
     inputs = Input(shape=input_shape[-2:], dtype='float32', name="input")
     n = inputs
@@ -53,8 +53,6 @@ def build_model(input_shape=(121,17)):
     residual = None
 
     for d in range(3):
-        if d >= DEPTH:
-            break
         n = layers.Conv1D(filters=F, kernel_size=K, padding='same', activation='relu', kernel_regularizer=l2reg)(n)
         n = layers.BatchNormalization()(n)
         n = layers.SpatialDropout1D(DROPOUT)(n)
@@ -63,8 +61,18 @@ def build_model(input_shape=(121,17)):
     n = layers.Conv1D(filters=F, kernel_size=K, padding='same', activation='relu', kernel_regularizer=l2reg)(n)
     n = layers.BatchNormalization()(n)
     n = layers.SpatialDropout1D(DROPOUT)(n)
-    
+
+    n = layers.Conv1D(filters=F, kernel_size=7, padding='same', activation='relu', kernel_regularizer=l2reg)(n)
+    n = layers.BatchNormalization()(n)
+    n = layers.SpatialDropout1D(DROPOUT)(n)
+
     residual = n
+
+    attn = layers.GlobalAveragePooling1D()(n) # Squeeze
+    attn = layers.Dense(n.shape[-1] // 8, activation='relu')(attn) # bottleneck
+    attn = layers.Dense(n.shape[-1], activation='sigmoid')(attn) # Excite
+    attn = layers.Reshape((1, n.shape[-1]))(attn) # fix dimensions
+    n = layers.Multiply()([n, attn]) # apply SE
 
     n = layers.MultiHeadAttention(
         num_heads=8,
@@ -73,20 +81,10 @@ def build_model(input_shape=(121,17)):
     )(n, n)  # self-attention
     n = layers.LayerNormalization()(n)
 
-    attn = layers.GlobalAveragePooling1D()(n) # Squeeze
-    attn = layers.Dense(n.shape[-1] // 8, activation='relu', kernel_regularizer=l2reg)(attn) # bottleneck
-    attn = layers.Dense(n.shape[-1], activation='sigmoid', kernel_regularizer=l2reg)(attn) # Excite
-    attn = layers.Reshape((1, n.shape[-1]))(attn) # fix dimensions
-    n = layers.Multiply()([n, attn]) # apply SE
-
     #n = layers.Add()([n, residual])
     #residual = n
 
-    for Ks in [7, 5, 5, 3, 3, 3, 3, 3]:
-        if d >= DEPTH:
-            break
-        d += 1
-
+    for Ks in [5, 5, 3]:
         n = layers.Conv1D(filters=F, kernel_size=Ks, padding='same', activation='relu', kernel_regularizer=l2reg)(n)
         n = layers.BatchNormalization()(n)
         n = layers.SpatialDropout1D(DROPOUT)(n)
