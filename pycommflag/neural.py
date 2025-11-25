@@ -21,7 +21,7 @@ from .feature_span import *
 from . import processor
 from . import neural
 
-random.seed(17)
+#random.seed(17)
 
 # data params, both for train and for inference
 WINDOW_BEFORE = 60
@@ -37,27 +37,26 @@ K = 13
 UNITS = 32
 DROPOUT = 0.4
 EPOCHS = 50
-BATCH_SIZE = 64
+BATCH_SIZE = 32
 TEST_PERC = 0.25
 PATIENCE = 7
 
 def build_model(input_shape=(121,17)):
     from keras import layers, regularizers, utils, Input, Model
 
-    utils.set_random_seed(17)
+    #utils.set_random_seed(17)
 
     inputs = Input(shape=input_shape[-2:], dtype='float32', name="input")
     n = inputs
 
-    l2reg = regularizers.l2(0.00002)
-    residual = None
+    l2reg = regularizers.l2(0.00003)
 
     for d in range(3):
         n = layers.Conv1D(filters=F, kernel_size=K, padding='same', activation='relu', kernel_regularizer=l2reg)(n)
         n = layers.BatchNormalization()(n)
         n = layers.SpatialDropout1D(DROPOUT)(n)
         n = layers.MaxPooling1D(pool_size=2)(n)
-    
+
     n = layers.Conv1D(filters=F, kernel_size=K, padding='same', activation='relu', kernel_regularizer=l2reg)(n)
     n = layers.BatchNormalization()(n)
     n = layers.SpatialDropout1D(DROPOUT)(n)
@@ -81,8 +80,8 @@ def build_model(input_shape=(121,17)):
     )(n, n)  # self-attention
     n = layers.LayerNormalization()(n)
 
-    #n = layers.Add()([n, residual])
-    #residual = n
+    n = layers.Add()([n, residual])
+    residual = n
 
     for Ks in [5, 5, 3]:
         n = layers.Conv1D(filters=F, kernel_size=Ks, padding='same', activation='relu', kernel_regularizer=l2reg)(n)
