@@ -60,7 +60,9 @@ def write_feature_log(flog:dict, log_file:str|TextIO):
             first = False
         else:
             log_file.write(',\n')
-        log_file.write(f'"{k}" : {json.dumps(v, cls=FancyEncoder)}')
+        log_file.write(f'"{k}" : ')
+        json.dump(v, log_file, cls=FancyEncoder)
+        #log_file.write(f'"{k}" : {json.dumps(v, cls=FancyEncoder)}')
     log_file.write("\n}\n")
     log_file.close()
 

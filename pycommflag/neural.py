@@ -36,6 +36,7 @@ F = 48
 K = 13
 UNITS = 32
 DROPOUT = 0.4
+L2REG = 0.00003
 EPOCHS = 50
 BATCH_SIZE = 32
 TEST_PERC = 0.25
@@ -49,7 +50,7 @@ def build_model(input_shape=(121,17)):
     inputs = Input(shape=input_shape[-2:], dtype='float32', name="input")
     n = inputs
 
-    l2reg = regularizers.l2(0.00003)
+    l2reg = regularizers.l2(L2REG)
 
     for d in range(3):
         n = layers.Conv1D(filters=F, kernel_size=K, padding='same', activation='relu', kernel_regularizer=l2reg)(n)
@@ -675,8 +676,8 @@ def do_predict(flog:dict, model, opts:Any):
     duration = flog.get('duration', 0)
     assert(model.output_shape[-1] == 1)
     
-    data = load_nonpersistent(flog, False)
-    data,_,_,times = load_data_sliding_window(data)
+    df = load_nonpersistent(flog, False)
+    data,_,_,times = load_data_sliding_window(df)
 
     prediction = model.predict(make_data_generator(data), verbose=True)
 

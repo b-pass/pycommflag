@@ -53,6 +53,7 @@ def run(opts) -> None|int:
         i = 0
         for fl in opts.reprocess:
             i += 1
+            
             if not os.path.exists(fl) or not os.path.isfile(fl):
                 continue
             gc.collect()
@@ -90,7 +91,7 @@ def run(opts) -> None|int:
             from .neural import predict, diff_tags
             try:
                 old = flog.get('tags', [])
-                result = predict(flog, opts, fl)
+                result = predict(flog, opts)
                 (missing,extra,all) = diff_tags(old, result)
 
                 chng = ''
@@ -99,7 +100,10 @@ def run(opts) -> None|int:
                         chng += f'{e-b}s {"missing" if t < 0 else "extra"} at {b} to {e}; '
                 print(f'{vf}: {len(result)} breaks - changed {extra-missing} seconds : {chng}')
 
-                output(opts, result, flog)
+                if chng or missing or extra or len(old) != len(all):
+                    from . import processor
+                    processor.write_feature_log(flog, fl)
+                    output(opts, result, flog)
             except Exception as e:
                 import traceback
                 print('EXCEPTION')
