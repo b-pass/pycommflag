@@ -21,7 +21,7 @@ from .feature_span import *
 from . import processor
 from . import neural
 
-#random.seed(17)
+random.seed(121117)
 
 # data params, both for train and for inference
 WINDOW_BEFORE = 60
@@ -35,17 +35,17 @@ DEPTH = 8
 F = 48
 K = 13
 UNITS = 32
-DROPOUT = 0.4
-L2REG = 0.00003
+DROPOUT = 0.30
+L2REG = 0.00002
 EPOCHS = 50
 BATCH_SIZE = 32
 TEST_PERC = 0.25
-PATIENCE = 7
+PATIENCE = 10
 
 def build_model(input_shape=(121,17)):
     from keras import layers, regularizers, utils, Input, Model
 
-    #utils.set_random_seed(17)
+    utils.set_random_seed(121117)
 
     inputs = Input(shape=input_shape[-2:], dtype='float32', name="input")
     n = inputs
@@ -391,15 +391,14 @@ def make_data_generator(*args, **kwargs):
             self.weights = np.array(weights, dtype='float32') if weights else None
             self.len = ceil(len(self.data) / BATCH_SIZE)
             self.shape = (self.len, BATCH_SIZE, len(data[0]), len(data[0][0]))
-            self.shuf = np.arange(0, len(self.data), dtype='int')
+            self.shuf = np.arange(len(self.data), dtype='int')
             self.do_shuf = False
         
         def __len__(self):
             return self.len
         
         def __getitem__(self, index):
-            index *= BATCH_SIZE
-            indexes = self.shuf[index:index+BATCH_SIZE]
+            indexes = self.shuf[index*BATCH_SIZE:(index+1)*BATCH_SIZE]
             d = self.data[indexes]
             if self.answers is not None:
                 a = self.answers[indexes]
@@ -417,8 +416,9 @@ def make_data_generator(*args, **kwargs):
             return super().on_epoch_end()
         
         def shuffle(self):
+            #print("Doing the data generator shufflehussle")
             self.do_shuf = True
-            self.shuf = np.random.randint(0, len(self.data), len(self.data))
+            self.shuf = np.random.randint(len(self.data), size=len(self.data))
 
     return DataGenerator(*args, **kwargs)
 
@@ -580,9 +580,10 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
         model = keras.models.load_model(model_path)
     else:
         from keras.metrics import Recall, Precision
+        from keras.losses import BinaryFocalCrossentropy, BinaryCrossentropy
         model = build_model(train_dataset.shape)
         model.summary()
-        model.compile(optimizer="adam", loss=keras.losses.BinaryCrossentropy(label_smoothing=0), metrics=['accuracy', Recall(class_id=0), Precision(class_id=0)])
+        model.compile(optimizer="adam", loss=BinaryFocalCrossentropy(alpha=0.4, gamma=2.), metrics=['accuracy', Recall(class_id=0), Precision(class_id=0)])
         model.save(model_path)
     
     gc.collect()
@@ -595,7 +596,7 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
     cb.append(callbacks.EarlyStopping(monitor='val_accuracy', patience=PATIENCE))
 
     def cosine_annealing_with_warmup(epoch, lr):
-        WARMUP = 3
+        WARMUP = 5
         FINETUNE = 25
         
         if epoch < WARMUP:
@@ -626,7 +627,8 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
     oldsint = signal.signal(signal.SIGINT, handler)
     oldterm = signal.signal(signal.SIGTERM, handler)
 
-    model.fit(train_dataset, validation_data=test_dataset, epochs=EPOCHS, initial_epoch=epoch, callbacks=cb, class_weight={0:0.65, 1:1/0.65})
+    # no class weights with Focal loss: , class_weight={0:0.65, 1:1/0.65}
+    model.fit(train_dataset, validation_data=test_dataset, epochs=EPOCHS, initial_epoch=epoch, callbacks=cb)
 
     #model.save(model_path) the checkpoint already saved the vest version
     return (ecp.last_epoch+1, model.stop_training or ecp.last_epoch+1 >= EPOCHS)
