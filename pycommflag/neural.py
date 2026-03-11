@@ -398,10 +398,9 @@ def make_data_generator(*args, **kwargs):
             return self.len
         
         def __getitem__(self, index):
-            index *= BATCH_SIZE
-            indexes = self.shuf[index:index+BATCH_SIZE]
+            indexes = self.shuf[index*BATCH_SIZE:(index+1)*BATCH_SIZE]
+            d = self.data[indexes]
             if self.answers is not None:
-                d = self.data[indexes]
                 a = self.answers[indexes]
                 if self.weights is not None:
                     w = self.weights[indexes]
@@ -409,7 +408,7 @@ def make_data_generator(*args, **kwargs):
                 else:
                     return d,a
             else:
-                return self.data[indexes]
+                return d
         
         def on_epoch_end(self):
             if self.do_shuf:
