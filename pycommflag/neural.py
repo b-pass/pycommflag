@@ -30,80 +30,69 @@ SUMMARY_RATE = 1
 RATE = 29.97
 
 # training params
-MTYPE = 'conv'
-DEPTH = 8
-F = 48
-K = 13
-UNITS = 32
-DROPOUT = 0.30
-L2REG = 0.00002
+MTYPE = 'tcn'
 EPOCHS = 50
 BATCH_SIZE = 32
 TEST_PERC = 0.25
 PATIENCE = 10
 
-def build_model(input_shape=(121,17)):
-    from keras import layers, regularizers, utils, Input, Model
+# --- Tunable Hyperparameters ---
+F        = 32 # TCN filter count
+K        = 3  # TCN kernel size
+DILATIONS = [1, 2, 4, 8] # TCN dilation schedule
+GRU_UNITS = 24
+DROPOUT   = 0.35
+GRU_DROPOUT = 0.1
+L2        = 0.00015
+F_UNITS   = 16
 
-    utils.set_random_seed(121117)
+def build_model(input_shape=(121, 21)):
+    from keras import layers, regularizers, utils, Input, Model
+    utils.set_random_seed(111217)
 
     inputs = Input(shape=input_shape[-2:], dtype='float32', name="input")
-    n = inputs
 
-    l2reg = regularizers.l2(L2REG)
+    # some features are unreliable ...
+    x = layers.SpatialDropout1D(0.075)(inputs)
 
-    for d in range(3):
-        n = layers.Conv1D(filters=F, kernel_size=K, padding='same', activation='relu', kernel_regularizer=l2reg)(n)
-        n = layers.BatchNormalization()(n)
-        n = layers.SpatialDropout1D(DROPOUT)(n)
-        n = layers.MaxPooling1D(pool_size=2)(n)
+    x = layers.Dense(32, name="projection")(x)
+    x = layers.LayerNormalization()(x)
+    x = layers.Activation("relu")(x)
 
-    n = layers.Conv1D(filters=F, kernel_size=K, padding='same', activation='relu', kernel_regularizer=l2reg)(n)
-    n = layers.BatchNormalization()(n)
-    n = layers.SpatialDropout1D(DROPOUT)(n)
+    # --- TCN Blocks ---
+    for i, dilation_rate in enumerate(DILATIONS, start=1):
+        name_prefix = f"tcn{i}"
 
-    n = layers.Conv1D(filters=F, kernel_size=7, padding='same', activation='relu', kernel_regularizer=l2reg)(n)
-    n = layers.BatchNormalization()(n)
-    n = layers.SpatialDropout1D(DROPOUT)(n)
+        residual = x
+        x = layers.Conv1D(F, K,
+                          padding="same",
+                          dilation_rate=dilation_rate,
+                          kernel_regularizer=regularizers.l2(L2),
+                          name=f"{name_prefix}_conv1")(x)
+        x = layers.LayerNormalization(name=f"{name_prefix}_ln1")(x)
+        x = layers.Activation("relu", name=f"{name_prefix}_relu1")(x)
 
-    residual = n
+        x = layers.Conv1D(F, K,
+                          padding="same",
+                          dilation_rate=dilation_rate,
+                          kernel_regularizer=regularizers.l2(L2),
+                          name=f"{name_prefix}_conv2")(x)
+        x = layers.LayerNormalization(name=f"{name_prefix}_ln2")(x)
+        x = layers.Activation("relu", name=f"{name_prefix}_relu2")(x)
 
-    attn = layers.GlobalAveragePooling1D()(n) # Squeeze
-    attn = layers.Dense(n.shape[-1] // 8, activation='relu')(attn) # bottleneck
-    attn = layers.Dense(n.shape[-1], activation='sigmoid')(attn) # Excite
-    attn = layers.Reshape((1, n.shape[-1]))(attn) # fix dimensions
-    n = layers.Multiply()([n, attn]) # apply SE
+        if residual.shape[-1] != F:
+            residual = layers.Conv1D(F, 1, padding="same",
+                                     name=f"{name_prefix}_res_proj")(residual)
 
-    n = layers.MultiHeadAttention(
-        num_heads=8,
-        key_dim=F // 8,
-        dropout=DROPOUT
-    )(n, n)  # self-attention
-    n = layers.LayerNormalization()(n)
+        x = layers.Add(name=f"{name_prefix}_res")([x, residual])
 
-    n = layers.Add()([n, residual])
-    residual = n
+    x = layers.Bidirectional(layers.GRU(GRU_UNITS, dropout=GRU_DROPOUT, recurrent_dropout=0.0),name="bigru")(x)
 
-    for Ks in [5, 5, 3]:
-        n = layers.Conv1D(filters=F, kernel_size=Ks, padding='same', activation='relu', kernel_regularizer=l2reg)(n)
-        n = layers.BatchNormalization()(n)
-        n = layers.SpatialDropout1D(DROPOUT)(n)
+    x = layers.Dense(F_UNITS, kernel_regularizer=regularizers.l2(L2), name="classifier")(x)
+    x = layers.Activation("relu")(x)
+    x = layers.Dropout(DROPOUT)(x)
+    outputs = layers.Dense(1, activation="sigmoid", name="output")(x)
 
-    n = layers.Add()([n, residual])
-
-    x = layers.GlobalAveragePooling1D()(n)
-    y = layers.GlobalMaxPooling1D()(n)
-    n = layers.Concatenate()([x,y])
-    #n = layers.Flatten()(n)
-
-    n = layers.Dense(UNITS, dtype='float32', activation='relu', kernel_regularizer=l2reg)(n)
-    n = layers.Dropout(DROPOUT)(n)
-
-    n = layers.Dense(UNITS, dtype='float32', activation='relu', kernel_regularizer=l2reg)(n)
-    n = layers.Dropout(DROPOUT)(n)
-    
-    outputs = layers.Dense(1, dtype='float32', activation='sigmoid', name="output")(n)
-    
     return Model(inputs, outputs)
 
 def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]], 
@@ -209,20 +198,27 @@ def condense(frames: np.ndarray, step: int) -> np.ndarray:
         return frames
 
     def doit(a):
-        # first, average everything
         res = []
         res.append(np.percentile(a[:, :, 3], 90, axis=1)) # diff 90th
         res.append(np.max(a[:, :, 3], axis=1)) # diff max
         for f in [4,5]: # fvol, rvol
             res.append(np.max(a[:, :, f], axis=1)) # vol max
             res.append(np.std(a[:, :, f], axis=1)) # vol std dev
+        
+        # min of the logo run and blank run features
+        res.append(np.min(a[:,:, -6], axis=1))
+        res.append(np.min(a[:,:, -5], axis=1))
 
+        # average things except those calculated above
         res = [np.average(a[:, :, 0:6], axis=1)] + [x.reshape(x.shape[0], 1) for x in res] + [np.average(a[:, :, 6:], axis=1)]
 
         res[0][:, 0] = a[:, a.shape[1]//2, 0] # Use the middle timestamp
         res[0][:, 3] = np.count_nonzero(a[:, :, 3] >= 0.5, axis=1) / a.shape[1]  # Diff count above 0.5
+
+        res[0][:, -6] = a[:, a.shape[1]-1, -6] # Use the end nblank run count
+        res[0][:, -5] = a[:, a.shape[1]-1, -5] # Use the end nlogo run count
         
-        res[-1][:, -2] = np.count_nonzero(a[:, :, -2] >= 0.5, axis=1) / a.shape[1] # answer is proportional 
+        res[-1][:, -2] = np.count_nonzero(a[:, :, -2] >= 0.5, axis=1) / a.shape[1] # answer class is proportional 
         
         return np.concatenate([x.reshape((x.shape[0], 1)) if len(x.shape) == 1 else x for x in res], axis=1)
     
@@ -318,20 +314,38 @@ def load_nonpersistent(flog:dict, for_training=False)->np.ndarray:
     # change the diff column to be normalized [0,30] -> [0,1]
     frames[...,3] = np.clip(frames[...,3] / 30, 0, 1.0)
 
+    # add a column for time since logo [-6] and time since blank [-5]
+    runs = np.zeros((len(frames),2), dtype='float32')
+    nblank_run = 0
+    nlogo_run = 0
+    for n in range(len(frames)):
+        if frames[n][1] > 0.5:
+            nlogo_run = 0
+        else:
+            nlogo_run += 1
+            runs[n][0] = min(nlogo_run, frame_rate * 360) / (frame_rate * 360)
+        
+        if frames[n][2] > 0.5:
+            nblank_run = 0
+        else:
+            nblank_run += 1
+            runs[n][1] = min(nblank_run, frame_rate * 15) / (frame_rate * 15)
+    frames = np.append(frames, runs, axis=1)
+
     # add a column for time percentage [-4]
     frames = np.append(frames, (frames[...,0]/endtime)[:,np.newaxis], axis=1)
 
-    # add a column for with the real timestamps [-3]
+    # add a column for the real timestamps [-3]
     frames = np.append(frames, frames[...,0].reshape((-1,1)), axis=1)
+
+    # change the first column to be normalized timestamps (30 minute segments)
+    frames[...,0] = (frames[...,0] % 1800.0) / 1800.0
 
     # add a column for answers [-2]
     frames = np.append(frames, np.zeros((frames.shape[0],1), dtype=np.float32), axis=1)
 
     # add a column for weights [-1]
     frames = np.append(frames, np.ones((frames.shape[0],1), dtype=np.float32), axis=1)
-
-    # change the first column to be normalized timestamps (30 minute segments)
-    frames[...,0] = (frames[...,0] % 1800.0) / 1800.0
 
     wbefore = round(WINDOW_BEFORE * SUMMARY_RATE)
     wafter = round(WINDOW_AFTER * SUMMARY_RATE)
@@ -386,6 +400,7 @@ def make_data_generator(*args, **kwargs):
     from keras.utils import Sequence
     class DataGenerator(Sequence):
         def __init__(self, data, answers=None, weights=None):
+            super().__init__()
             self.data = np.array(data, dtype='float32')
             self.answers = np.array(answers, dtype='float32') if answers else None
             self.weights = np.array(weights, dtype='float32') if weights else None
@@ -559,7 +574,7 @@ def train(opts:Any=None):
     print(tmetrics)
 
     if tmetrics[1] >= 0.80:
-        name = f'{opts.models_dir if opts and opts.models_dir else "."}{os.sep}pycf-{tmetrics[1]:.04f}-c{F}x{K}x{DEPTH}-{MTYPE}{UNITS}-w{WINDOW_BEFORE}x{WINDOW_AFTER}-{int(time.time())}.keras'
+        name = f'{opts.models_dir if opts and opts.models_dir else "."}{os.sep}pycf-{tmetrics[1]:.04f}-{MTYPE}-x{len(DILATIONS)}-g{GRU_UNITS}-f{F_UNITS}-w{WINDOW_BEFORE}x{WINDOW_AFTER}-{int(time.time())}.keras'
         print()
         print('Saving as ' + name)
 
@@ -596,16 +611,17 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
     cb.append(callbacks.EarlyStopping(monitor='val_accuracy', patience=PATIENCE))
 
     def cosine_annealing_with_warmup(epoch, lr):
-        WARMUP = 5
-        FINETUNE = 25
+        WARMUP = 4
+        TOTAL_EPOCHS = 35
+        MAX_LR = 0.001
+        MIN_LR = 0.00001 # Set your true floor here
         
         if epoch < WARMUP:
-            # Warm up
-            return 0.001 * (epoch + 1) / WARMUP
-        
-        # Cosine annealing 
-        progress = (epoch - WARMUP) / (FINETUNE - WARMUP)
-        return max( 0.0001 + (0.001 - 0.0001) * 0.5 * (1 + np.cos(np.pi * progress)), 0.00001 )
+            return MAX_LR * (epoch + 1) / WARMUP
+            
+        # Option A: Smooth decay all the way to the ending epoch
+        progress = (epoch - WARMUP) / (TOTAL_EPOCHS - WARMUP)
+        return MIN_LR + (MAX_LR - MIN_LR) * 0.5 * (1 + np.cos(np.pi * progress))
     
     cb.append(callbacks.LearningRateScheduler(cosine_annealing_with_warmup))
     #cb.append(callbacks.ReduceLROnPlateau(monitor='val_accuracy', patience=PATIENCE-1))
