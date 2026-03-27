@@ -21,7 +21,8 @@ from .feature_span import *
 from . import processor
 from . import neural
 
-random.seed(121117)
+SEED = 1711
+random.seed(SEED)
 
 # data params, both for train and for inference
 WINDOW_BEFORE = 60
@@ -38,22 +39,24 @@ PATIENCE = 10
 
 # --- Tunable Hyperparameters ---
 F        = 32 # TCN filter count
-K        = 3  # TCN kernel size
+K        = 5  # TCN kernel size
 DILATIONS = [1, 2, 4, 8] # TCN dilation schedule
 GRU_UNITS = 24
-DROPOUT   = 0.35
-GRU_DROPOUT = 0.1
-L2        = 0.00015
-F_UNITS   = 16
+F_UNITS   = 32
+GRU_DROPOUT = 0.15
+DROPOUT   = 0.4
+START_DROP= 0.075
+L2        = 0.0001
 
 def build_model(input_shape=(121, 21)):
     from keras import layers, regularizers, utils, Input, Model
-    utils.set_random_seed(111217)
+    random.seed(SEED)
+    utils.set_random_seed(SEED)
 
     inputs = Input(shape=input_shape[-2:], dtype='float32', name="input")
 
     # some features are unreliable ...
-    x = layers.SpatialDropout1D(0.075)(inputs)
+    x = layers.SpatialDropout1D(START_DROP)(inputs)
 
     x = layers.Dense(32, name="projection")(x)
     x = layers.LayerNormalization()(x)
@@ -88,9 +91,15 @@ def build_model(input_shape=(121, 21)):
 
     x = layers.Bidirectional(layers.GRU(GRU_UNITS, dropout=GRU_DROPOUT, recurrent_dropout=0.0),name="bigru")(x)
 
+    #attn = layers.MultiHeadAttention(num_heads=4, key_dim=8, dropout=GRU_DROPOUT)(x, x)  # self-attention
+    #x = layers.Add(name="mha_residual")([x, attn])
+    #x = layers.LayerNormalization()(x)
+    #x = x[:, 60, :]
+
     x = layers.Dense(F_UNITS, kernel_regularizer=regularizers.l2(L2), name="classifier")(x)
     x = layers.Activation("relu")(x)
     x = layers.Dropout(DROPOUT)(x)
+
     outputs = layers.Dense(1, activation="sigmoid", name="output")(x)
 
     return Model(inputs, outputs)
@@ -574,7 +583,7 @@ def train(opts:Any=None):
     print(tmetrics)
 
     if tmetrics[1] >= 0.80:
-        name = f'{opts.models_dir if opts and opts.models_dir else "."}{os.sep}pycf-{tmetrics[1]:.04f}-{MTYPE}-x{len(DILATIONS)}-g{GRU_UNITS}-f{F_UNITS}-w{WINDOW_BEFORE}x{WINDOW_AFTER}-{int(time.time())}.keras'
+        name = f'{opts.models_dir if opts and opts.models_dir else "."}{os.sep}pycf-{tmetrics[1]:.04f}-{MTYPE}-{F}x{K}-x{len(DILATIONS)}-g{GRU_UNITS}-f{F_UNITS}-w{WINDOW_BEFORE}x{WINDOW_AFTER}-{int(time.time())}.keras'
         print()
         print('Saving as ' + name)
 
@@ -598,7 +607,7 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
         from keras.losses import BinaryFocalCrossentropy, BinaryCrossentropy
         model = build_model(train_dataset.shape)
         model.summary()
-        model.compile(optimizer="adam", loss=BinaryFocalCrossentropy(alpha=0.4, gamma=2.), metrics=['accuracy', Recall(class_id=0), Precision(class_id=0)])
+        model.compile(optimizer="adam", loss=BinaryFocalCrossentropy(alpha=0.667, gamma=1.5, label_smoothing=0.05), metrics=['accuracy', Recall(), Precision()])
         model.save(model_path)
     
     gc.collect()
@@ -608,7 +617,7 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
     from keras import callbacks
 
     cb.append(callbacks.EarlyStopping(monitor='loss', patience=PATIENCE))
-    cb.append(callbacks.EarlyStopping(monitor='val_accuracy', patience=PATIENCE))
+    cb.append(callbacks.EarlyStopping(monitor='val_loss', patience=PATIENCE))
 
     def cosine_annealing_with_warmup(epoch, lr):
         WARMUP = 4
@@ -631,7 +640,7 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
             self.last_epoch = epoch
             return super().on_epoch_end(epoch, logs)
 
-    ecp = EpochModelCheckpoint(model_path, monitor='val_accuracy', verbose=1, save_best_only=True)
+    ecp = EpochModelCheckpoint(model_path, monitor='val_loss', verbose=1, save_best_only=True)
     cb.append(ecp)
 
     def handler(signum, frame):
@@ -671,8 +680,12 @@ def predict(feature_log:str|TextIO|dict, opts:Any, write_log=None)->list:
             raise Exception(f"Model files '{blah}' or '{mf}' do not exist")
     
     model:keras.models.Model = keras.models.load_model(mf)
+    assert(model.output_shape[-1] == 1)
 
-    results = do_predict(flog, model, opts)
+    data,_,_,times = load_data_sliding_window(load_nonpersistent(flog, False))
+    prediction = model.predict(make_data_generator(data), verbose=True)
+
+    results = post_predict(flog, prediction, times, opts)
     if not results:
         results = []
 
@@ -690,19 +703,13 @@ def predict(feature_log:str|TextIO|dict, opts:Any, write_log=None)->list:
     
     return results
 
-def do_predict(flog:dict, model, opts:Any):
+def post_predict(flog:dict, prediction, times, opts:Any, threshold=0.5):
     duration = flog.get('duration', 0)
-    assert(model.output_shape[-1] == 1)
-    
-    df = load_nonpersistent(flog, False)
-    data,_,_,times = load_data_sliding_window(df)
-
-    prediction = model.predict(make_data_generator(data), verbose=True)
 
     results = [(0,(0,0))]
     for i in range(len(prediction)):
         when = float(times[i])
-        ans = SceneType.COMMERCIAL.value if prediction[i] >= 0.5 else SceneType.SHOW.value
+        ans = SceneType.COMMERCIAL.value if prediction[i] >= threshold else SceneType.SHOW.value
         
         results[-1] = (results[-1][0], (results[-1][1][0], when))
         if ans != results[-1][0]:
@@ -912,11 +919,31 @@ def eval(opts:Any):
             log.exception(f"Unable to load {f}")
             continue
         
+        #etotal = np.zeros(100)
+        etotal = None
         for (mf, model) in models.items():
             try:
-                result = do_predict(flog, model, opts)
-                (missing,extra,_) = diff_tags(realtags, result)
+                data,_,_,times = load_data_sliding_window(load_nonpersistent(flog, False))
 
+                prediction = model.predict(make_data_generator(data), verbose=True)
+                
+                if etotal is not None:
+                    best = []
+                    best_count = duration
+                    for it in range(0, 100):
+                        thresh = it / 100.0
+                        result = post_predict(flog, prediction, times, opts, threshold=thresh)
+                        (missing,extra,_) = diff_tags(realtags, result)
+                        etotal[it] += missing+extra
+                        if missing+extra == best_count:
+                            best.append(thresh)
+                        elif missing+extra < best_count:
+                            best_count = missing+extra
+                            best = [thresh]
+                    #print(f"BEST THRESHOLD = {best[0]} to {best[-1]}")
+
+                result = post_predict(flog, prediction, times, opts) #, threshold=best[0])
+                (missing,extra,_) = diff_tags(realtags, result)
                 acc = 100 - 100*(missing+extra)/duration
                 print(f'{f} @ {mf} -> Acc {round(acc,4)}% <- FN:{round(missing,3)} + FP:{round(extra,3)} = {round(missing+extra,3)} seconds WRONG')
                 all_missing[mf] += missing
@@ -936,3 +963,12 @@ def eval(opts:Any):
         print(f'{mf}: \t-{all_missing[mf]} \t+{all_extra[mf]} \t{total_wrong} \t{acc}')
     print()
 
+    if etotal is not None:
+        best = 0
+        for i in range(100):
+            print(f"Threshold {i/100} error = {etotal[i]}")
+            if etotal[i] < etotal[best]:
+                best = i
+        print("BEST overall error rate at threshold", best/100)
+
+    
