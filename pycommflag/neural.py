@@ -27,26 +27,22 @@ random.seed(SEED)
 # data params, both for train and for inference
 WINDOW_BEFORE = 60
 WINDOW_AFTER = 60
-SUMMARY_RATE = 1
-RATE = 29.97
-
-# training params
-MTYPE = 'tcn'
-EPOCHS = 50
-BATCH_SIZE = 32
-TEST_PERC = 0.25
-PATIENCE = 10
 
 # --- Tunable Hyperparameters ---
-F        = 32 # TCN filter count
-K        = 5  # TCN kernel size
+MTYPE     = 'tcn'
+EPOCHS    = 50
+BATCH_SIZE= 128
+TEST_PERC = 0.25
+PATIENCE  = 10
+F         = 32 # TCN filter count
+K         = 5  # TCN kernel size
 DILATIONS = [1, 2, 4, 8] # TCN dilation schedule
 GRU_UNITS = 24
 F_UNITS   = 32
 GRU_DROPOUT = 0.15
 DROPOUT   = 0.4
 START_DROP= 0.075
-L2        = 0.0001
+L2        = 0.0002
 
 def build_model(input_shape=(121, 21)):
     from keras import layers, regularizers, utils, Input, Model
@@ -199,54 +195,239 @@ def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]],
     
     return filtered_tags
 
-def condense(frames: np.ndarray, step: int) -> np.ndarray:
+def aggregate_to_1hz(frames: np.ndarray, total_duration: float) -> np.ndarray:
     """
-    Summarize video features by aggregating the specified step size.
+    Input:  (n_frames, 12) — time, logo, blank, diff, fvol, rvol, silence, speech, music, noise, answer, weight
+    Output: (n_seconds, 41) — all features in [0,1] except col 38=time, col 39=answer, col 40=weight
     """
-    if step <= 1:
-        return frames
-
-    def doit(a):
-        res = []
-        res.append(np.percentile(a[:, :, 3], 90, axis=1)) # diff 90th
-        res.append(np.max(a[:, :, 3], axis=1)) # diff max
-        for f in [4,5]: # fvol, rvol
-            res.append(np.max(a[:, :, f], axis=1)) # vol max
-            res.append(np.std(a[:, :, f], axis=1)) # vol std dev
-        
-        # min of the logo run and blank run features
-        res.append(np.min(a[:,:, -6], axis=1))
-        res.append(np.min(a[:,:, -5], axis=1))
-
-        # average things except those calculated above
-        res = [np.average(a[:, :, 0:6], axis=1)] + [x.reshape(x.shape[0], 1) for x in res] + [np.average(a[:, :, 6:], axis=1)]
-
-        res[0][:, 0] = a[:, a.shape[1]//2, 0] # Use the middle timestamp
-        res[0][:, 3] = np.count_nonzero(a[:, :, 3] >= 0.5, axis=1) / a.shape[1]  # Diff count above 0.5
-
-        res[0][:, -6] = a[:, a.shape[1]-1, -6] # Use the end nblank run count
-        res[0][:, -5] = a[:, a.shape[1]-1, -5] # Use the end nlogo run count
-        
-        res[-1][:, -2] = np.count_nonzero(a[:, :, -2] >= 0.5, axis=1) / a.shape[1] # answer class is proportional 
-        
-        return np.concatenate([x.reshape((x.shape[0], 1)) if len(x.shape) == 1 else x for x in res], axis=1)
     
-    n_frames = len(frames)
-    remaining = n_frames % step
-    if n_frames >= step:
-        # Reshape the array to group frames by step size
-        condensed = doit( frames[:(n_frames//step)*step].reshape(-1, step, frames.shape[1]) )
-    else:
-        condensed = None
-    
-    if remaining > 0:
-        # Do the final, partial condensing
-        partial = doit( frames[-remaining:].reshape(-1, remaining, frames.shape[1]) )
+    from numpy.lib.stride_tricks import sliding_window_view
 
-        if condensed is None:
-            return partial
-        return np.vstack((condensed, partial))
-    return condensed
+    # Input column indices
+    _TIME    = 0
+    _LOGO    = 1
+    _BLANK   = 2
+    _DIFF    = 3
+    _FVOL    = 4
+    _RVOL    = 5
+    _SILENCE = 6
+    _SPEECH  = 7
+    _MUSIC   = 8
+    _NOISE   = 9
+    _ANSWER  = 10
+    _WEIGHT  = 11
+    _TOTAL_INPUT = 12
+    assert(frames.shape[1] == _TOTAL_INPUT)
+
+    # Normalization constants
+    DIFF_CAP         = 30.0
+    DIFF_CUT_THRESH  = 15.0
+    CONSEC_LOGO_CAP  = 600.0
+    CONSEC_BLANK_CAP = 15.0
+    VOL_ROLL_SECS    = 15
+    MAX_AUDIO_TRANS  = 10.0
+    AMBIGUITY_LOW    = 0.3
+    AMBIGUITY_HIGH   = 0.7
+
+    def _consecutive_runs(binary_arr):
+        """Vectorized: for each position, how many consecutive 1s up to and including here."""
+        result = np.zeros(len(binary_arr), dtype=np.float32)
+        padded = np.concatenate([[0], binary_arr.astype(int), [0]])
+        starts = np.where(np.diff(padded) == 1)[0]
+        ends   = np.where(np.diff(padded) == -1)[0]
+        for s, e in zip(starts, ends):
+            result[s:e] = np.arange(1, e - s + 1, dtype=np.float32)
+        return result
+
+    def _rolling_window(arr, W, fn):
+        padded = np.pad(arr, (W - 1, 0), mode='edge')
+        windows = sliding_window_view(padded, W)
+        return fn(windows, axis=1).astype(np.float32)
+
+    n_seconds = max(1, int(np.ceil(total_duration)))
+
+    # ── Sort frames by second ──────────────────────────────────────────────
+    frame_sec = np.clip(np.floor(frames[:, _TIME]).astype(int), 0, n_seconds - 1)
+    fs        = frames
+    fss       = frame_sec
+
+    sec_counts  = np.bincount(fss, minlength=n_seconds)                     # (n_seconds,)
+    sec_offsets = np.concatenate([[0], np.cumsum(sec_counts)])               # (n_seconds+1,)
+    nonempty    = np.where(sec_counts > 0)[0]
+    ne_starts   = sec_offsets[nonempty]                                      # frame index of first frame in each non-empty second
+    assert(len(ne_starts) > 0)
+
+    # ── Position within second (for half-window deltas) ───────────────────
+    pos_in_sec   = np.arange(len(fs)) - np.repeat(sec_offsets[:-1], sec_counts)
+    half_per_sec = np.maximum(1, sec_counts) // 2
+    is_first     = pos_in_sec < np.repeat(half_per_sec, sec_counts)
+    is_second    = ~is_first
+
+    # ── Vectorized helpers ─────────────────────────────────────────────────
+    def ps_sum(arr):
+        out = np.zeros(n_seconds, dtype=np.float64)
+        out[nonempty] = np.add.reduceat(arr.astype(np.float64), ne_starts)
+        return out
+
+    def ps_mean(arr):
+        return (ps_sum(arr) / np.maximum(1, sec_counts)).astype(np.float32)
+
+    def ps_sum_masked(arr, mask):
+        out = np.zeros(n_seconds, dtype=np.float64)
+        np.add.at(out, fss[mask], arr[mask].astype(np.float64))
+        return out
+
+    def ps_half_delta(arr):
+        """(mean_2nd_half - mean_1st_half) remapped from [-1,1] → [0,1]"""
+        cnt2 = np.maximum(1, sec_counts - half_per_sec)
+        m1 = (ps_sum_masked(arr, is_first)  / np.maximum(1, half_per_sec)).astype(np.float32)
+        m2 = (ps_sum_masked(arr, is_second) / cnt2).astype(np.float32)
+        return np.clip((m2 - m1 + 1.0) / 2.0, 0.0, 1.0).astype(np.float32)
+
+    def ps_max(arr):
+        out = np.zeros(n_seconds, dtype=np.float32)
+        out[nonempty] = np.maximum.reduceat(arr.astype(np.float32), ne_starts)
+        return out
+
+    def ps_min(arr):
+        out = np.zeros(n_seconds, dtype=np.float32)
+        out[nonempty] = np.minimum.reduceat(arr.astype(np.float32), ne_starts)
+        return out
+
+    def ps_std(arr):
+        m  = ps_mean(arr)
+        m2 = ps_mean(arr ** 2)
+        return np.sqrt(np.maximum(0.0, m2 - m ** 2)).astype(np.float32)
+
+    # ── Time ──────────────────────────────────────────────────────────────
+    t_center      = np.arange(n_seconds, dtype=np.float32) + 0.5
+    time_in_block = (t_center % 1800.0) / 1800.0
+    pct_through   = np.clip(t_center / total_duration, 0.0, 1.0).astype(np.float32)
+
+    # ── Logo ──────────────────────────────────────────────────────────────
+    logo                = fs[:, _LOGO]
+    logo_rate           = ps_mean(logo)
+    logo_majority       = (logo_rate >= 0.5).astype(np.float32)
+    logo_transition     = np.abs(np.diff(logo_majority, prepend=logo_majority[0])).astype(np.float32)
+    logo_window_present = (logo_rate > 0).astype(np.float32)
+    consec_logo_norm    = np.clip(_consecutive_runs(logo_majority) / CONSEC_LOGO_CAP, 0.0, 1.0)
+
+    # ── Blank ─────────────────────────────────────────────────────────────
+    blank               = fs[:, _BLANK]
+    blank_rate          = ps_mean(blank)
+    blank_any           = (blank_rate > 0).astype(np.float32)
+    blank_window_present = blank_any.copy()
+
+    b              = (blank >= 0.5).astype(np.int8)
+    b_prev         = np.roll(b, 1)
+    b_prev[sec_offsets[nonempty]] = 0          # treat start of each second as coming from 0
+    blank_events   = ps_sum(np.maximum(0, b - b_prev))
+    blank_event_rate = np.clip(blank_events / np.maximum(1, sec_counts), 0.0, 1.0).astype(np.float32)
+    consec_blank_norm = np.clip(_consecutive_runs(blank_any) / CONSEC_BLANK_CAP, 0.0, 1.0)
+
+    # ── Frame diff ────────────────────────────────────────────────────────
+    diff_raw  = fs[:, _DIFF]
+    diff      = np.clip(diff_raw / DIFF_CAP, 0.0, 1.0).astype(np.float32)
+    diff_mean = ps_mean(diff)
+    diff_std  = ps_std(diff)
+    diff_max  = ps_max(diff)
+    cut_rate  = ps_mean((diff_raw >= DIFF_CUT_THRESH).astype(np.float32))
+    diff_delta = ps_half_delta(diff)
+
+    # median and p90 — small per-second loop, only ~30 frames each
+    diff_median = np.zeros(n_seconds, dtype=np.float32)
+    diff_p90    = np.zeros(n_seconds, dtype=np.float32)
+    for i in nonempty:
+        d = diff[sec_offsets[i]:sec_offsets[i + 1]]
+        diff_median[i] = np.median(d)
+        diff_p90[i]    = np.percentile(d, 90)
+
+    # ── Volume ────────────────────────────────────────────────────────────
+    fvol = fs[:, _FVOL]
+    rvol = fs[:, _RVOL]
+
+    fvol_mean = ps_mean(fvol);  fvol_std = ps_std(fvol)
+    fvol_max  = ps_max(fvol);   fvol_min = ps_min(fvol)
+    rvol_mean = ps_mean(rvol);  rvol_std = ps_std(rvol)
+    rvol_max  = ps_max(rvol);   rvol_min = ps_min(rvol)
+
+    eps              = 1e-6
+    ratio            = fvol / (fvol + rvol + eps)
+    frvol_ratio_mean = ps_mean(ratio)
+    frvol_ratio_std  = ps_std(ratio)
+    fvol_delta       = ps_half_delta(fvol)
+    rvol_delta       = ps_half_delta(rvol)
+
+    # ── Audio type ────────────────────────────────────────────────────────
+    silence_mean = ps_mean(fs[:, _SILENCE])
+    speech_mean  = ps_mean(fs[:, _SPEECH])
+    music_mean   = ps_mean(fs[:, _MUSIC])
+    noise_mean   = ps_mean(fs[:, _NOISE])
+
+    audio_stack = fs[:, _SILENCE:_NOISE+1]
+    dominant    = np.argmax(audio_stack, axis=1)
+    dom_diff    = (np.diff(dominant, prepend=dominant[0]) != 0).astype(np.float32)
+    dom_diff[sec_offsets[nonempty]] = 0.0      # don't count boundary as transition
+    audio_trans_norm = np.clip(ps_sum(dom_diff) / MAX_AUDIO_TRANS, 0.0, 1.0).astype(np.float32)
+
+    # ── Rolling volume ────────────────────────────────────────────────────
+    W = VOL_ROLL_SECS
+    roll_fvol_max = _rolling_window(fvol_max, W, np.max)
+    roll_rvol_max = _rolling_window(rvol_max, W, np.max)
+    roll_fvol_std = _rolling_window(fvol_std, W, np.mean)
+    roll_rvol_std = _rolling_window(rvol_std, W, np.mean)
+
+    # ── Answer + weight ───────────────────────────────────────────────────
+    commercial_frac = ps_mean(fs[:, _ANSWER])
+    answer          = (commercial_frac >= 0.5).astype(np.float32)
+    base_weight     = ps_min(fs[:, _WEIGHT])
+    #ambiguous       = (commercial_frac > AMBIGUITY_LOW) & (commercial_frac < AMBIGUITY_HIGH)
+    weight          = base_weight #np.where(ambiguous, 0.0, base_weight).astype(np.float32)
+
+    # ── Assemble ──────────────────────────────────────────────────────────
+    return np.column_stack([
+        pct_through,          #  0
+        time_in_block,        #  1
+        logo_rate,            #  2
+        logo_transition,      #  3
+        logo_window_present,  #  4
+        consec_logo_norm,     #  5
+        blank_rate,           #  6
+        blank_event_rate,     #  7
+        blank_window_present, #  8
+        consec_blank_norm,    #  9
+        diff_mean,            # 10
+        diff_median,          # 11
+        diff_std,             # 12
+        diff_max,             # 13
+        diff_p90,             # 14
+        cut_rate,             # 15
+        diff_delta,           # 16
+        fvol_mean,            # 17
+        fvol_min,             # 18
+        fvol_max,             # 19
+        fvol_std,             # 20
+        rvol_mean,            # 21
+        rvol_min,             # 22
+        rvol_max,             # 23
+        rvol_std,             # 24
+        frvol_ratio_mean,     # 25
+        frvol_ratio_std,      # 26
+        fvol_delta,           # 27
+        rvol_delta,           # 28
+        silence_mean,         # 29
+        speech_mean,          # 30
+        music_mean,           # 31
+        noise_mean,           # 32
+        audio_trans_norm,     # 33
+        roll_fvol_max,        # 34
+        roll_rvol_max,        # 35
+        roll_fvol_std,        # 36
+        roll_rvol_std,        # 37
+        t_center,             # 38
+        answer,               # 39
+        weight,               # 40
+    ]).astype(np.float32)
 
 def load_nonpersistent(flog:dict, for_training=False)->np.ndarray:
     version = flog.get('file_version', 10)
@@ -311,7 +492,7 @@ def load_nonpersistent(flog:dict, for_training=False)->np.ndarray:
             del frames[:b]
         del tags[0]
 
-    if len(frames) < (WINDOW_BEFORE + WINDOW_AFTER) * 2 * round(RATE):
+    if len(frames) < (WINDOW_BEFORE + WINDOW_AFTER) * 2:
         return None
     
     # ok now we can numpy....
@@ -320,71 +501,38 @@ def load_nonpersistent(flog:dict, for_training=False)->np.ndarray:
     if not have_logo:
         frames[..., 1] = 0
 
-    # change the diff column to be normalized [0,30] -> [0,1]
-    frames[...,3] = np.clip(frames[...,3] / 30, 0, 1.0)
-
-    # add a column for time since logo [-6] and time since blank [-5]
-    runs = np.zeros((len(frames),2), dtype='float32')
-    nblank_run = 0
-    nlogo_run = 0
-    for n in range(len(frames)):
-        if frames[n][1] > 0.5:
-            nlogo_run = 0
-        else:
-            nlogo_run += 1
-            runs[n][0] = min(nlogo_run, frame_rate * 360) / (frame_rate * 360)
-        
-        if frames[n][2] > 0.5:
-            nblank_run = 0
-        else:
-            nblank_run += 1
-            runs[n][1] = min(nblank_run, frame_rate * 15) / (frame_rate * 15)
-    frames = np.append(frames, runs, axis=1)
-
-    # add a column for time percentage [-4]
-    frames = np.append(frames, (frames[...,0]/endtime)[:,np.newaxis], axis=1)
-
-    # add a column for the real timestamps [-3]
-    frames = np.append(frames, frames[...,0].reshape((-1,1)), axis=1)
-
-    # change the first column to be normalized timestamps (30 minute segments)
-    frames[...,0] = (frames[...,0] % 1800.0) / 1800.0
-
     # add a column for answers [-2]
     frames = np.append(frames, np.zeros((frames.shape[0],1), dtype=np.float32), axis=1)
 
     # add a column for weights [-1]
     frames = np.append(frames, np.ones((frames.shape[0],1), dtype=np.float32), axis=1)
 
-    wbefore = round(WINDOW_BEFORE * SUMMARY_RATE)
-    wafter = round(WINDOW_AFTER * SUMMARY_RATE)
-
-    timestamps = frames[:, -3]
+    timestamps = frames[:, 0]
     answers = frames[:, -2]
     weights = frames[:, -1]
 
     for (tt,(st,et)) in tags:
         if type(tt) is not int: tt = tt.value
 
-        si = np.searchsorted(timestamps, st)
-        ei = np.searchsorted(timestamps, et)
+        si = np.searchsorted(timestamps, st, 'left')
+        ei = np.searchsorted(timestamps, et, 'right')
 
         if tt == SceneType.DO_NOT_USE.value:
             weights[si:ei] = 0 # ignore this entire section
         elif tt == SceneType.COMMERCIAL.value:
             answers[si:ei] = 1.0
         elif tt != SceneType.SHOW.value:
-            weights[si:ei] = 0.75
+            weights[si:ei] = 0.5 # de-value the information here, it might be wonky
     
-    condensed = condense(frames, round(frame_rate/SUMMARY_RATE))
+    condensed = aggregate_to_1hz(frames, endtime)
     
     #for x in [0,1]:
     #    print(f'{x}) {np.count_nonzero(answers == x)}')
 
     condensed = np.concatenate((
-        np.tile(condensed[0], (wbefore,1)),
+        np.tile(condensed[0], (WINDOW_BEFORE,1)),
         condensed,
-        np.tile(condensed[-1], (wafter,1)),
+        np.tile(condensed[-1], (WINDOW_AFTER,1)),
     ))
 
     return condensed
@@ -450,16 +598,13 @@ def load_data_sliding_window(condensed:np.ndarray)->tuple[np.ndarray,np.ndarray,
     if condensed is None:
         return ([],[],[],[])
     
-    wbefore = round(WINDOW_BEFORE * SUMMARY_RATE)
-    wafter = round(WINDOW_AFTER * SUMMARY_RATE)
-
-    timestamps = condensed[wbefore:-wafter,-3]
-    answers = condensed[wbefore:-wafter,-2]
-    weights = condensed[wbefore:-wafter,-1]
+    timestamps = condensed[WINDOW_BEFORE:-WINDOW_AFTER,-3]
+    answers = condensed[WINDOW_BEFORE:-WINDOW_AFTER,-2]
+    weights = condensed[WINDOW_BEFORE:-WINDOW_AFTER,-1]
     condensed = condensed[:, :-3]
     
     from numpy.lib.stride_tricks import sliding_window_view
-    frames = sliding_window_view(condensed, (wbefore+1+wafter, condensed.shape[1],)).squeeze()
+    frames = sliding_window_view(condensed, (WINDOW_BEFORE+1+WINDOW_AFTER, condensed.shape[1],)).squeeze()
 
     #print(len(self.frames), len(self.timestamps))
 
@@ -607,7 +752,7 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
         from keras.losses import BinaryFocalCrossentropy, BinaryCrossentropy
         model = build_model(train_dataset.shape)
         model.summary()
-        model.compile(optimizer="adam", loss=BinaryFocalCrossentropy(alpha=0.667, gamma=1.5, label_smoothing=0.05), metrics=['accuracy', Recall(), Precision()])
+        model.compile(optimizer="adam", loss=BinaryFocalCrossentropy(alpha=0.667, gamma=1.5), metrics=['accuracy', Recall(), Precision()])
         model.save(model_path)
     
     gc.collect()
