@@ -33,7 +33,7 @@ RATE = 29.97
 # training params
 MTYPE = 'tcn'
 EPOCHS = 50
-BATCH_SIZE = 32
+BATCH_SIZE = 128
 TEST_PERC = 0.25
 PATIENCE = 10
 
@@ -227,7 +227,7 @@ def condense(frames: np.ndarray, step: int) -> np.ndarray:
         res[0][:, -6] = a[:, a.shape[1]-1, -6] # Use the end nblank run count
         res[0][:, -5] = a[:, a.shape[1]-1, -5] # Use the end nlogo run count
         
-        res[-1][:, -2] = np.count_nonzero(a[:, :, -2] >= 0.5, axis=1) / a.shape[1] # answer class is proportional 
+        res[-1][:, -2] = (np.count_nonzero(a[:, :, -2] >= 0.5, axis=1) >= a.shape[1]/2).astype('float32')
         
         return np.concatenate([x.reshape((x.shape[0], 1)) if len(x.shape) == 1 else x for x in res], axis=1)
     
@@ -607,7 +607,7 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
         from keras.losses import BinaryFocalCrossentropy, BinaryCrossentropy
         model = build_model(train_dataset.shape)
         model.summary()
-        model.compile(optimizer="adam", loss=BinaryFocalCrossentropy(alpha=0.667, gamma=1.5, label_smoothing=0.05), metrics=['accuracy', Recall(), Precision()])
+        model.compile(optimizer="adam", loss=BinaryFocalCrossentropy(alpha=0.667, gamma=1.5, label_smoothing=0.025), metrics=['accuracy', Recall(), Precision()])
         model.save(model_path)
     
     gc.collect()
