@@ -33,7 +33,7 @@ RATE = 29.97
 # training params
 MTYPE = 'tcn'
 EPOCHS = 50
-BATCH_SIZE = 128
+BATCH_SIZE = 64
 TEST_PERC = 0.25
 PATIENCE = 10
 
@@ -89,7 +89,7 @@ def build_model(input_shape=(121, 21)):
 
         x = layers.Add(name=f"{name_prefix}_res")([x, residual])
 
-    x = layers.Bidirectional(layers.GRU(GRU_UNITS, dropout=GRU_DROPOUT, recurrent_dropout=0.0),name="bigru")(x)
+    x = layers.Bidirectional(layers.GRU(GRU_UNITS, dropout=GRU_DROPOUT),name="bigru")(x)
 
     #attn = layers.MultiHeadAttention(num_heads=4, key_dim=8, dropout=GRU_DROPOUT)(x, x)  # self-attention
     #x = layers.Add(name="mha_residual")([x, attn])
@@ -224,10 +224,11 @@ def condense(frames: np.ndarray, step: int) -> np.ndarray:
         res[0][:, 0] = a[:, a.shape[1]//2, 0] # Use the middle timestamp
         res[0][:, 3] = np.count_nonzero(a[:, :, 3] >= 0.5, axis=1) / a.shape[1]  # Diff count above 0.5
 
-        res[0][:, -6] = a[:, a.shape[1]-1, -6] # Use the end nblank run count
-        res[0][:, -5] = a[:, a.shape[1]-1, -5] # Use the end nlogo run count
+        res[-1][:, -6] = a[:, a.shape[1]-1, -6] # Use the end nblank run count
+        res[-1][:, -5] = a[:, a.shape[1]-1, -5] # Use the end nlogo run count
         
         res[-1][:, -2] = (np.count_nonzero(a[:, :, -2] >= 0.5, axis=1) >= a.shape[1]/2).astype('float32')
+        res[-1][:, -1] = np.min(a[:, :, -1])
         
         return np.concatenate([x.reshape((x.shape[0], 1)) if len(x.shape) == 1 else x for x in res], axis=1)
     
@@ -377,6 +378,19 @@ def load_nonpersistent(flog:dict, for_training=False)->np.ndarray:
             weights[si:ei] = 0.75
     
     condensed = condense(frames, round(frame_rate/SUMMARY_RATE))
+
+    prev_t = condensed[1][-2]
+    for i in range(2, len(condensed)-1):
+        if prev_t != condensed[i][-2]:
+            prev_t = condensed[i][-2]
+            if condensed[i-2][-1] >= 1.0:
+                condensed[i-2][-1] = 1.5
+            if condensed[i-1][-1] >= 1.0:
+                condensed[i-1][-1] = 2.0
+            if condensed[i][-1] >= 1.0:
+                condensed[i][-1] = 2.0
+            if condensed[i+1][-1] >= 1.0:
+                condensed[i+1][-1] = 1.5
     
     #for x in [0,1]:
     #    print(f'{x}) {np.count_nonzero(answers == x)}')
@@ -607,7 +621,7 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
         from keras.losses import BinaryFocalCrossentropy, BinaryCrossentropy
         model = build_model(train_dataset.shape)
         model.summary()
-        model.compile(optimizer="adam", loss=BinaryFocalCrossentropy(alpha=0.667, gamma=1.5, label_smoothing=0.025), metrics=['accuracy', Recall(), Precision()])
+        model.compile(optimizer="adam", loss=BinaryFocalCrossentropy(alpha=0.6, gamma=1.5, label_smoothing=0.025), metrics=['accuracy', Recall(), Precision()])
         model.save(model_path)
     
     gc.collect()
@@ -617,7 +631,7 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
     from keras import callbacks
 
     cb.append(callbacks.EarlyStopping(monitor='loss', patience=PATIENCE))
-    cb.append(callbacks.EarlyStopping(monitor='val_loss', patience=PATIENCE))
+    cb.append(callbacks.EarlyStopping(monitor='val_accuracy', patience=PATIENCE))
 
     def cosine_annealing_with_warmup(epoch, lr):
         WARMUP = 4
@@ -640,7 +654,7 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
             self.last_epoch = epoch
             return super().on_epoch_end(epoch, logs)
 
-    ecp = EpochModelCheckpoint(model_path, monitor='val_loss', verbose=1, save_best_only=True)
+    ecp = EpochModelCheckpoint(model_path, monitor='val_accuracy', verbose=1, save_best_only=True)
     cb.append(ecp)
 
     def handler(signum, frame):
