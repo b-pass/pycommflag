@@ -3,4 +3,5 @@ scipy>=1.10.0
 numpy==1.26.4
 tensorflow>=2.11.0
 scikit_image>=0.20.0
+mysqlclient>=2.2.8
 
