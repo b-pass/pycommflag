@@ -182,6 +182,8 @@ class DnnSegmenter:
 
         if len(batch) > 0:
             batch = np.concatenate(batch)
+            if len(batch.shape) < 4:
+                batch = np.expand_dims(batch, axis=-1)
             rawpred = self.nn.predict(batch, batch_size=self.batch_size, verbose=0)
         gc.collect()
             
