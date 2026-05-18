@@ -575,7 +575,7 @@ def guess_external_breaks(opts:Any)->list:
                 if m := re.match(r'^(?:FI)?LE\s*PROCESSING\s*COMPLETE\s*\d+\s*FRAMES\s*(?:AT\s*)?\s*(\d+).*?$', cf.readline()):
                     if m[1]:
                         fps = float(m[1])/100
-                markre = re.compile('(\d+)\s*(\d+)\s*')
+                markre = re.compile(r'(\d+)\s*(\d+)\s*')
                 for line in cf.readlines():
                     if line[0:4] in ('FILE','----'):
                         continue

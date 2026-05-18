@@ -21,7 +21,7 @@ from .feature_span import *
 from . import processor
 from . import neural
 
-SEED = 1711
+SEED = 121711
 random.seed(SEED)
 
 # data params, both for train and for inference
@@ -37,16 +37,13 @@ BATCH_SIZE = 64
 TEST_PERC = 0.25
 PATIENCE = 10
 
-# --- Tunable Hyperparameters ---
 F        = 32 # TCN filter count
 K        = 5  # TCN kernel size
 DILATIONS = [1, 2, 4, 8] # TCN dilation schedule
-GRU_UNITS = 24
-F_UNITS   = 32
-GRU_DROPOUT = 0.15
 DROPOUT   = 0.4
 START_DROP= 0.075
 L2        = 0.0001
+NOISE = 0
 
 def build_model(input_shape=(121, 21)):
     from keras import layers, regularizers, utils, Input, Model
@@ -58,8 +55,11 @@ def build_model(input_shape=(121, 21)):
     # some features are unreliable ...
     x = layers.SpatialDropout1D(START_DROP)(inputs)
 
-    x = layers.Dense(32, name="projection")(x)
-    x = layers.LayerNormalization()(x)
+    if NOISE > 0:
+        x = layers.GaussianNoise(NOISE, name="input_noise")(x)
+
+    x = layers.Dense(F, name="projection")(x)
+    x = layers.BatchNormalization()(x)
     x = layers.Activation("relu")(x)
 
     # --- TCN Blocks ---
@@ -72,31 +72,48 @@ def build_model(input_shape=(121, 21)):
                           dilation_rate=dilation_rate,
                           kernel_regularizer=regularizers.l2(L2),
                           name=f"{name_prefix}_conv1")(x)
-        x = layers.LayerNormalization(name=f"{name_prefix}_ln1")(x)
-        x = layers.Activation("relu", name=f"{name_prefix}_relu1")(x)
+        x = layers.BatchNormalization(name=f"{name_prefix}_ln1")(x)
+        x = layers.Activation("swish", name=f"{name_prefix}_act1")(x)
+        x = layers.SpatialDropout1D(0.1)(x) # Add this to both Conv units in the block
 
         x = layers.Conv1D(F, K,
                           padding="same",
                           dilation_rate=dilation_rate,
                           kernel_regularizer=regularizers.l2(L2),
                           name=f"{name_prefix}_conv2")(x)
-        x = layers.LayerNormalization(name=f"{name_prefix}_ln2")(x)
-        x = layers.Activation("relu", name=f"{name_prefix}_relu2")(x)
+        x = layers.BatchNormalization(name=f"{name_prefix}_ln2")(x)
+        x = layers.Activation("swish", name=f"{name_prefix}_act2")(x)
+        x = layers.SpatialDropout1D(0.1)(x) # Add this to both Conv units in the block
+        
+        # Squeeze: Global Information across the time dimension
+        se = layers.GlobalAveragePooling1D()(x)
+        
+        # Excite: Two dense layers to learn channel weights
+        se = layers.Dense(x.shape[-1]//8, activation='relu', use_bias=False)(se)
+        se = layers.Dense(x.shape[-1], activation='sigmoid', use_bias=False)(se)
 
-        if residual.shape[-1] != F:
-            residual = layers.Conv1D(F, 1, padding="same",
-                                     name=f"{name_prefix}_res_proj")(residual)
+        # Apply
+        se = layers.Reshape((1, x.shape[-1]))(se)
+        x = layers.Multiply()([x, se])
+
+        #if residual.shape[-1] != F:
+        #    residual = layers.Conv1D(F, 1, padding="same",
+        #                             name=f"{name_prefix}_res_proj")(residual)
 
         x = layers.Add(name=f"{name_prefix}_res")([x, residual])
 
-    x = layers.Bidirectional(layers.GRU(GRU_UNITS, dropout=GRU_DROPOUT),name="bigru")(x)
+    #x = layers.Bidirectional(layers.GRU(24, dropout=.1),name="bigru")(x)
+    #x = layers.GlobalAveragePooling1D(name="global_pool")(x)
 
-    #attn = layers.MultiHeadAttention(num_heads=4, key_dim=8, dropout=GRU_DROPOUT)(x, x)  # self-attention
+    #attn = layers.MultiHeadAttention(num_heads=4, key_dim=8, dropout=.1)(x, x)  # self-attention
     #x = layers.Add(name="mha_residual")([x, attn])
-    #x = layers.LayerNormalization()(x)
-    #x = x[:, 60, :]
+    #x = layers.BatchNormalization()(x)
+    a = layers.GlobalMaxPooling1D()(x)
+    b = layers.GlobalAveragePooling1D()(x)
+    c = x[:, 60, :]
+    x = layers.Concatenate(name="hybrid_head")([a, b, c])
 
-    x = layers.Dense(F_UNITS, kernel_regularizer=regularizers.l2(L2), name="classifier")(x)
+    x = layers.Dense(32, kernel_regularizer=regularizers.l2(L2), name="classifier")(x)
     x = layers.Activation("relu")(x)
     x = layers.Dropout(DROPOUT)(x)
 
@@ -597,7 +614,7 @@ def train(opts:Any=None):
     print(tmetrics)
 
     if tmetrics[1] >= 0.80:
-        name = f'{opts.models_dir if opts and opts.models_dir else "."}{os.sep}pycf-{tmetrics[1]:.04f}-{MTYPE}-{F}x{K}-x{len(DILATIONS)}-g{GRU_UNITS}-f{F_UNITS}-w{WINDOW_BEFORE}x{WINDOW_AFTER}-{int(time.time())}.keras'
+        name = f'{opts.models_dir if opts and opts.models_dir else "."}{os.sep}pycf-{tmetrics[1]:.04f}-{MTYPE}-{F}x{K}x{len(DILATIONS)}-sq-w{WINDOW_BEFORE}x{WINDOW_AFTER}-{int(time.time())}.keras'
         print()
         print('Saving as ' + name)
 
