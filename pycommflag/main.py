@@ -164,6 +164,7 @@ def run(opts) -> None|int:
     if opts.chanid:
         from .mythtv import check_method
         if not check_method(opts.chanid):
+            print(f"Flagging disabled on channel {opts.chanid}")
             output(opts, [], None)
             return 0
     

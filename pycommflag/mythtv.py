@@ -27,8 +27,8 @@ def _open():
         user=dbc.get('username', "mythtv"),
         passwd=dbc.get('password', "mythtv"),
         db=dbc.get('databasename', "mythconverg"),
+        autocommit=True
     )
-    g_connection.autocommit(True)
     return g_connection
 
 def _get_filename(cursor, chanid, starttime):
