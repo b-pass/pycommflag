@@ -35,13 +35,13 @@ MTYPE = 'tcn'
 EPOCHS = 50
 BATCH_SIZE = 64
 TEST_PERC = 0.25
-PATIENCE = 10
+PATIENCE = 8
 
 F        = 32 # TCN filter count
 K        = 5  # TCN kernel size
 DILATIONS = [1, 2, 4, 8] # TCN dilation schedule
 DROPOUT   = 0.4
-START_DROP= 0.075
+START_DROP= 0.2
 L2        = 0.0001
 NOISE = 0
 
@@ -85,13 +85,11 @@ def build_model(input_shape=(121, 21)):
         x = layers.Activation("swish", name=f"{name_prefix}_act2")(x)
         x = layers.SpatialDropout1D(0.1)(x) # Add this to both Conv units in the block
         
-        # Squeeze: Global Information across the time dimension
+        # Squeeze
         se = layers.GlobalAveragePooling1D()(x)
-        
-        # Excite: Two dense layers to learn channel weights
-        se = layers.Dense(x.shape[-1]//8, activation='relu', use_bias=False)(se)
+        # Excite
+        se = layers.Dense(x.shape[-1]//4, activation='relu', use_bias=False)(se)
         se = layers.Dense(x.shape[-1], activation='sigmoid', use_bias=False)(se)
-
         # Apply
         se = layers.Reshape((1, x.shape[-1]))(se)
         x = layers.Multiply()([x, se])
@@ -102,18 +100,16 @@ def build_model(input_shape=(121, 21)):
 
         x = layers.Add(name=f"{name_prefix}_res")([x, residual])
 
-    #x = layers.Bidirectional(layers.GRU(24, dropout=.1),name="bigru")(x)
-    #x = layers.GlobalAveragePooling1D(name="global_pool")(x)
-
-    #attn = layers.MultiHeadAttention(num_heads=4, key_dim=8, dropout=.1)(x, x)  # self-attention
+    #attn = layers.MultiHeadAttention(num_heads=2, key_dim=16, dropout=.1)(x, x) 
     #x = layers.Add(name="mha_residual")([x, attn])
-    #x = layers.BatchNormalization()(x)
-    a = layers.GlobalMaxPooling1D()(x)
-    b = layers.GlobalAveragePooling1D()(x)
-    c = x[:, 60, :]
-    x = layers.Concatenate(name="hybrid_head")([a, b, c])
 
-    x = layers.Dense(32, kernel_regularizer=regularizers.l2(L2), name="classifier")(x)
+    # use light attention to focus on a few slices instead of forcing just [60]
+    attn = layers.Dense(1, use_bias=False)(x) 
+    attn = layers.Softmax(axis=1, name="attn")(attn)
+    x = layers.Multiply()([x, attn])
+    x = layers.GlobalAveragePooling1D()(x)
+
+    x = layers.Dense(64, kernel_regularizer=regularizers.l2(L2), name="classifier")(x)
     x = layers.Activation("relu")(x)
     x = layers.Dropout(DROPOUT)(x)
 
@@ -651,8 +647,8 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
     cb.append(callbacks.EarlyStopping(monitor='val_accuracy', patience=PATIENCE))
 
     def cosine_annealing_with_warmup(epoch, lr):
+        global EPOCHS
         WARMUP = 4
-        TOTAL_EPOCHS = 35
         MAX_LR = 0.001
         MIN_LR = 0.00001 # Set your true floor here
         
@@ -660,7 +656,7 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
             return MAX_LR * (epoch + 1) / WARMUP
             
         # Option A: Smooth decay all the way to the ending epoch
-        progress = (epoch - WARMUP) / (TOTAL_EPOCHS - WARMUP)
+        progress = (epoch - WARMUP) / (EPOCHS - WARMUP)
         return MIN_LR + (MAX_LR - MIN_LR) * 0.5 * (1 + np.cos(np.pi * progress))
     
     cb.append(callbacks.LearningRateScheduler(cosine_annealing_with_warmup))

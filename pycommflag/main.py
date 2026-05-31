@@ -54,6 +54,7 @@ def run(opts) -> None|int:
         rm = 0
         for fl in opts.reprocess:
             i += 1
+            if i < 500: continue
 
             if not os.path.exists(fl) or not os.path.isfile(fl):
                 continue

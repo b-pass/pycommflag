@@ -200,6 +200,8 @@ class Player:
                 if frame is None: continue
             except StopIteration:
                 break
+            except IndexError:
+                break
             except av.error.PatchWelcomeError as wtf:
                 log.exception("unrecoverable AV error")
                 os._exit(134)
