@@ -271,6 +271,9 @@ class VideoProc(Thread):
         self.queue.put((frame.time,fcolor,logo_present))
     
     def _proc(self, ftime, fcolor, logo_present):
+        if ftime is None or fcolor is None:
+            return
+        
         self.fcount += 1
 
         column = mean_axis1(fcolor, dtype='int16')
