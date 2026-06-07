@@ -31,19 +31,20 @@ SUMMARY_RATE = 1
 RATE = 29.97
 
 # training params
-MTYPE = 'tcn'
+MTYPE = 'tcnwv'
 EPOCHS = 50
 BATCH_SIZE = 64
 TEST_PERC = 0.25
-PATIENCE = 8
+PATIENCE = 10
 
-F        = 32 # TCN filter count
-K        = 5  # TCN kernel size
+F         = 32 # TCN filter count
+K         = 5  # TCN kernel size
 DILATIONS = [1, 2, 4, 8] # TCN dilation schedule
 DROPOUT   = 0.4
 START_DROP= 0.2
+TCN_DROP  = 0.1
 L2        = 0.0001
-NOISE = 0
+NOISE     = 0.0
 
 def build_model(input_shape=(121, 21)):
     from keras import layers, regularizers, utils, Input, Model
@@ -63,10 +64,15 @@ def build_model(input_shape=(121, 21)):
     x = layers.Activation("relu")(x)
 
     # --- TCN Blocks ---
+    residual = None
+    skips = []
     for i, dilation_rate in enumerate(DILATIONS, start=1):
         name_prefix = f"tcn{i}"
 
+        if residual is not None:
+            x = layers.Add(name=f"{name_prefix}_res")([x, residual])
         residual = x
+
         x = layers.Conv1D(F, K,
                           padding="same",
                           dilation_rate=dilation_rate,
@@ -74,7 +80,7 @@ def build_model(input_shape=(121, 21)):
                           name=f"{name_prefix}_conv1")(x)
         x = layers.BatchNormalization(name=f"{name_prefix}_ln1")(x)
         x = layers.Activation("swish", name=f"{name_prefix}_act1")(x)
-        x = layers.SpatialDropout1D(0.1)(x) # Add this to both Conv units in the block
+        x = layers.SpatialDropout1D(TCN_DROP)(x)
 
         x = layers.Conv1D(F, K,
                           padding="same",
@@ -83,7 +89,7 @@ def build_model(input_shape=(121, 21)):
                           name=f"{name_prefix}_conv2")(x)
         x = layers.BatchNormalization(name=f"{name_prefix}_ln2")(x)
         x = layers.Activation("swish", name=f"{name_prefix}_act2")(x)
-        x = layers.SpatialDropout1D(0.1)(x) # Add this to both Conv units in the block
+        x = layers.SpatialDropout1D(TCN_DROP)(x)
         
         # Squeeze
         se = layers.GlobalAveragePooling1D()(x)
@@ -94,21 +100,26 @@ def build_model(input_shape=(121, 21)):
         se = layers.Reshape((1, x.shape[-1]))(se)
         x = layers.Multiply()([x, se])
 
-        #if residual.shape[-1] != F:
-        #    residual = layers.Conv1D(F, 1, padding="same",
-        #                             name=f"{name_prefix}_res_proj")(residual)
+        skips.append(x)
 
-        x = layers.Add(name=f"{name_prefix}_res")([x, residual])
+    x = layers.Add()(skips)
+    
+    x_norm = layers.LayerNormalization()(x)
+    attn = layers.MultiHeadAttention(num_heads=4, key_dim=8, dropout=.1)(x_norm, x_norm) 
+    x = layers.Add(name="mha_residual")([x, attn])
 
-    #attn = layers.MultiHeadAttention(num_heads=2, key_dim=16, dropout=.1)(x, x) 
-    #x = layers.Add(name="mha_residual")([x, attn])
+    # FFN
+    x_norm = layers.LayerNormalization()(x)
+    ffn = layers.Dense(F * 2, activation='gelu')(x_norm)
+    ffn = layers.Dense(F)(ffn)
+    x = layers.Add()([x, ffn])
 
     # use light attention to focus on a few slices instead of forcing just [60]
-    attn = layers.Dense(1, use_bias=False)(x) 
-    attn = layers.Softmax(axis=1, name="attn")(attn)
-    x = layers.Multiply()([x, attn])
-    x = layers.GlobalAveragePooling1D()(x)
+    #attn = layers.Dense(1, use_bias=False)(x) 
+    #attn = layers.Softmax(axis=1, name="attn")(attn)
+    #x = layers.Multiply()([x, attn])
 
+    x = layers.GlobalAveragePooling1D()(x)
     x = layers.Dense(64, kernel_regularizer=regularizers.l2(L2), name="classifier")(x)
     x = layers.Activation("relu")(x)
     x = layers.Dropout(DROPOUT)(x)
@@ -647,8 +658,8 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
     cb.append(callbacks.EarlyStopping(monitor='val_accuracy', patience=PATIENCE))
 
     def cosine_annealing_with_warmup(epoch, lr):
-        global EPOCHS
         WARMUP = 4
+        TOTAL = 35
         MAX_LR = 0.001
         MIN_LR = 0.00001 # Set your true floor here
         
@@ -656,7 +667,7 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
             return MAX_LR * (epoch + 1) / WARMUP
             
         # Option A: Smooth decay all the way to the ending epoch
-        progress = (epoch - WARMUP) / (EPOCHS - WARMUP)
+        progress = (epoch - WARMUP) / (TOTAL - WARMUP)
         return MIN_LR + (MAX_LR - MIN_LR) * 0.5 * (1 + np.cos(np.pi * progress))
     
     cb.append(callbacks.LearningRateScheduler(cosine_annealing_with_warmup))
