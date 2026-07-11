@@ -21,7 +21,7 @@ from .feature_span import *
 from . import processor
 from . import neural
 
-SEED = 121711
+SEED = 121117
 random.seed(SEED)
 
 # data params, both for train and for inference
@@ -35,7 +35,7 @@ MTYPE = 'tcnwv'
 EPOCHS = 50
 BATCH_SIZE = 64
 TEST_PERC = 0.25
-PATIENCE = 10
+PATIENCE = 11
 
 F         = 32 # TCN filter count
 K         = 5  # TCN kernel size
@@ -47,30 +47,28 @@ L2        = 0.0001
 NOISE     = 0.0
 
 def build_model(input_shape=(121, 21)):
-    from keras import layers, regularizers, utils, Input, Model
+    from keras import layers, regularizers, utils, Input, Model, initializers, ops
     random.seed(SEED)
     utils.set_random_seed(SEED)
 
     inputs = Input(shape=input_shape[-2:], dtype='float32', name="input")
 
+    x = layers.BatchNormalization()(inputs)
+
     # some features are unreliable ...
-    x = layers.SpatialDropout1D(START_DROP)(inputs)
+    x = layers.SpatialDropout1D(START_DROP)(x)
 
     if NOISE > 0:
         x = layers.GaussianNoise(NOISE, name="input_noise")(x)
 
     x = layers.Dense(F, name="projection")(x)
-    x = layers.BatchNormalization()(x)
     x = layers.Activation("relu")(x)
 
     # --- TCN Blocks ---
-    residual = None
     skips = []
     for i, dilation_rate in enumerate(DILATIONS, start=1):
         name_prefix = f"tcn{i}"
 
-        if residual is not None:
-            x = layers.Add(name=f"{name_prefix}_res")([x, residual])
         residual = x
 
         x = layers.Conv1D(F, K,
@@ -102,24 +100,35 @@ def build_model(input_shape=(121, 21)):
 
         skips.append(x)
 
+        x = layers.Add(name=f"{name_prefix}_res")([x, residual])
+        # Add from the FINAL iteration of this loop is not added to skips 
+        # and thus is totally unused in the model... that is intentional
+
     x = layers.Add()(skips)
     
+    positions = ops.arange(x.shape[1])
+    positions = ops.expand_dims(positions, axis=0)
+    emb = layers.Embedding(input_dim=x.shape[1], output_dim=x.shape[2], name="positional_embedding")(positions)
     x_norm = layers.LayerNormalization()(x)
-    attn = layers.MultiHeadAttention(num_heads=4, key_dim=8, dropout=.1)(x_norm, x_norm) 
+    x_norm = layers.Add(name="embed")([x_norm, emb])
+    attn = layers.MultiHeadAttention(num_heads=2, key_dim=16, dropout=DROPOUT, kernel_regularizer=regularizers.l2(L2))(x_norm, x_norm) 
+    attn = layers.Dropout(DROPOUT)(attn)
     x = layers.Add(name="mha_residual")([x, attn])
 
     # FFN
     x_norm = layers.LayerNormalization()(x)
-    ffn = layers.Dense(F * 2, activation='gelu')(x_norm)
-    ffn = layers.Dense(F)(ffn)
+    ffn = layers.Dense(F * 4, activation='gelu', kernel_regularizer=regularizers.l2(L2))(x_norm)
+    ffn = layers.Dense(F, kernel_regularizer=regularizers.l2(L2))(ffn)
+    ffn = layers.Dropout(DROPOUT)(ffn)
     x = layers.Add()([x, ffn])
 
-    # use light attention to focus on a few slices instead of forcing just [60]
-    #attn = layers.Dense(1, use_bias=False)(x) 
-    #attn = layers.Softmax(axis=1, name="attn")(attn)
-    #x = layers.Multiply()([x, attn])
+    #x = layers.GlobalAveragePooling1D()(x)
+    # use light attention to focus on a few slices instead of forcing just [60] or pooling
+    attn = layers.Dense(1, use_bias=False, name="temporal_scores")(x)
+    attn = layers.Softmax(axis=1, name="temporal_attention")(attn)
+    x = layers.Dot(axes=1, name="attention_dot_product")([attn, x])
+    x = layers.Reshape((F,), name="attention_output_reshape")(x)
 
-    x = layers.GlobalAveragePooling1D()(x)
     x = layers.Dense(64, kernel_regularizer=regularizers.l2(L2), name="classifier")(x)
     x = layers.Activation("relu")(x)
     x = layers.Dropout(DROPOUT)(x)
@@ -252,7 +261,7 @@ def condense(frames: np.ndarray, step: int) -> np.ndarray:
         res[-1][:, -5] = a[:, a.shape[1]-1, -5] # Use the end nlogo run count
         
         res[-1][:, -2] = (np.count_nonzero(a[:, :, -2] >= 0.5, axis=1) >= a.shape[1]/2).astype('float32')
-        res[-1][:, -1] = np.min(a[:, :, -1])
+        res[-1][:, -1] = np.min(a[:, :, -1], axis=1)
         
         return np.concatenate([x.reshape((x.shape[0], 1)) if len(x.shape) == 1 else x for x in res], axis=1)
     
@@ -343,37 +352,41 @@ def load_nonpersistent(flog:dict, for_training=False)->np.ndarray:
     frames = np.array(frames, dtype='float32')
 
     if not have_logo:
-        frames[..., 1] = 0
+        frames[:, 1] = 0
 
     # change the diff column to be normalized [0,30] -> [0,1]
-    frames[...,3] = np.clip(frames[...,3] / 30, 0, 1.0)
+    frames[:,3] = np.clip(frames[:,3] / 30, 0, 1.0)
 
-    # add a column for time since logo [-6] and time since blank [-5]
-    runs = np.zeros((len(frames),2), dtype='float32')
-    nblank_run = 0
-    nlogo_run = 0
+    # add a column for global logo presence [-7], time since logo [-6], and time since blank [-5]
+    runs = np.zeros((len(frames),3), dtype='float32')
+    nblank_dist = 0
+    nlogo_dist = 0
+    have_logo = 0
+    havent_logo = 0
     for n in range(len(frames)):
         if frames[n][1] > 0.5:
-            nlogo_run = 0
+            nlogo_dist = 0
+            have_logo += 1
         else:
-            nlogo_run += 1
-            runs[n][0] = min(nlogo_run, frame_rate * 360) / (frame_rate * 360)
+            nlogo_dist += 1
+            runs[n][1] = min(nlogo_dist, frame_rate * 360) / (frame_rate * 360)
         
         if frames[n][2] > 0.5:
-            nblank_run = 0
+            nblank_dist = 0
         else:
-            nblank_run += 1
-            runs[n][1] = min(nblank_run, frame_rate * 15) / (frame_rate * 15)
+            nblank_dist += 1
+            runs[n][2] = min(nblank_dist, frame_rate * 60) / (frame_rate * 60)
+    runs[:,0] = 1.0 if have_logo > havent_logo * .1 else 0.0
     frames = np.append(frames, runs, axis=1)
 
     # add a column for time percentage [-4]
-    frames = np.append(frames, (frames[...,0]/endtime)[:,np.newaxis], axis=1)
+    frames = np.append(frames, (frames[:,0]/endtime)[:,np.newaxis], axis=1)
 
     # add a column for the real timestamps [-3]
-    frames = np.append(frames, frames[...,0].reshape((-1,1)), axis=1)
+    frames = np.append(frames, frames[:,0].reshape((-1,1)), axis=1)
 
     # change the first column to be normalized timestamps (30 minute segments)
-    frames[...,0] = (frames[...,0] % 1800.0) / 1800.0
+    frames[:,0] = (frames[:,0] % 1800.0) / 1800.0
 
     # add a column for answers [-2]
     frames = np.append(frames, np.zeros((frames.shape[0],1), dtype=np.float32), axis=1)
@@ -399,7 +412,7 @@ def load_nonpersistent(flog:dict, for_training=False)->np.ndarray:
         elif tt == SceneType.COMMERCIAL.value:
             answers[si:ei] = 1.0
         elif tt != SceneType.SHOW.value:
-            weights[si:ei] = 0.75
+            weights[si:ei] = 0.9 # gently weight these areas as slightly less important because they might be confusing
     
     condensed = condense(frames, round(frame_rate/SUMMARY_RATE))
 
@@ -480,7 +493,7 @@ def make_data_generator(*args, **kwargs):
         def shuffle(self):
             #print("Doing the data generator shufflehussle")
             self.do_shuf = True
-            self.shuf = np.random.randint(len(self.data), size=len(self.data))
+            self.shuf = np.random.permutation(len(self.data))
 
     return DataGenerator(*args, **kwargs)
 
@@ -645,7 +658,7 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
         from keras.losses import BinaryFocalCrossentropy, BinaryCrossentropy
         model = build_model(train_dataset.shape)
         model.summary()
-        model.compile(optimizer="adam", loss=BinaryFocalCrossentropy(alpha=0.6, gamma=1.5, label_smoothing=0.025), metrics=['accuracy', Recall(), Precision()])
+        model.compile(optimizer="adam", loss=BinaryFocalCrossentropy(alpha=0.6, gamma=1.5, label_smoothing=0.01), metrics=['accuracy', Recall(), Precision()])
         model.save(model_path)
     
     gc.collect()
@@ -659,15 +672,14 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
 
     def cosine_annealing_with_warmup(epoch, lr):
         WARMUP = 4
-        TOTAL = 35
+        TOTAL = 35 # we use a smaller number than total epochs so it settles down to a final value before earlystopping kicks in
         MAX_LR = 0.001
         MIN_LR = 0.00001 # Set your true floor here
         
         if epoch < WARMUP:
             return MAX_LR * (epoch + 1) / WARMUP
-            
-        # Option A: Smooth decay all the way to the ending epoch
-        progress = (epoch - WARMUP) / (TOTAL - WARMUP)
+        
+        progress = min(1.0, (epoch - WARMUP) / (TOTAL - WARMUP))
         return MIN_LR + (MAX_LR - MIN_LR) * 0.5 * (1 + np.cos(np.pi * progress))
     
     cb.append(callbacks.LearningRateScheduler(cosine_annealing_with_warmup))
@@ -700,7 +712,6 @@ def predict(feature_log:str|TextIO|dict, opts:Any, write_log=None)->list:
     from .mythtv import set_job_status
     set_job_status(opts, "Inferencing...")
 
-    import tensorflow as tf
     import keras
 
     flog = processor.read_feature_log(feature_log)
