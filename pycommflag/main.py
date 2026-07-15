@@ -137,15 +137,7 @@ def run(opts) -> None|int:
             print(f'No such video file "{opts.filename}"')
             return 1
 
-        logo = processor.read_logo(flog)
-        spans = processor.read_feature_spans(flog)
-        tags = processor.read_tags(flog)
-        if not tags:
-            tags = processor.external_tags(opts=opts)
-        if opts.model_file or opts.reprocess:
-            from .neural import predict
-            tags = predict(flog, opts)
-        w = gui.Window(video=opts.filename, spans=spans, tags=tags, logo=logo)
+        w = gui.Window(opts=opts, video=opts.filename, flog=flog)
         res = w.run()
         if res is not None:
             flog['tags'] = res
