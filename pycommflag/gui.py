@@ -6,22 +6,29 @@ from PIL import ImageTk, Image
 from .player import Player
 from . import logo_finder
 from . import processor
+from . import neural
 from .feature_span import *
 
 class Window(tk.Tk):
-    def __init__(self, video, spans:dict={}, logo:tuple=None, tags:FeatureSpan|list=None):
+    def __init__(self, opts, video, flog):
         tk.Tk.__init__(self)
         self.title("pycommflag editor")
         self.player = Player(video, no_deinterlace=True)
 
         self.result = None
-        self.spans = spans
         self.position = 0
         self.prev_frame_time = 0
         self.next_frame_time = 1/self.player.frame_rate
         self.settype = None
         self.setpos = 0
-        self.logo = logo
+        
+        self.logo = processor.read_logo(flog)
+        self.spans = processor.read_feature_spans(flog)
+        self.raw = neural.raw_predict(flog, opts)
+        tags = processor.read_tags(flog)
+        if not tags or opts.model_file or opts.reprocess:
+            (times,preds) = zip(*self.raw)
+            tags = neural.post_predict(flog, list(preds), list(times), opts)
         
         p = 0
         self.tags = []
@@ -196,7 +203,7 @@ class Window(tk.Tk):
         self.info = tk.Label(self, text=f'File: {video}; Length:{self.player.duration/60.0:0.1f} mins; {float(self.player.frame_rate)} fps')
         self.info.grid(row=10, column=0, sticky="se", columnspan=5)
 
-        limg = logo_finder.toimage(logo)
+        limg = logo_finder.toimage(self.logo)
         if limg:
             self.misc.append(limg)
             limg = ImageTk.PhotoImage(limg)
@@ -377,20 +384,32 @@ class Window(tk.Tk):
             #print(t,startx,stopx,color)
         return items
     
-    def drawVolume(self, span, top, bottom, height, color):
+    def drawVolume(self, span, top, bottom, height, fcolor, rcolor):
         scale = np.max(np.array(span)[...,1:3])
         sec_per_pix = self.player.duration / self.map_width
-        fprev = None
-        rprev = None
-        for (t,f,r) in span:
-            x = math.floor(t / sec_per_pix)
-            fy = (bottom-height) - (f/scale) * height
-            ry = bottom - (r/scale) * height
-            if fprev is not None:
-                self.mapCanvas.create_line(fprev[0], fprev[1], x, fy, fill=color,width=0.1)
-                self.mapCanvas.create_line(rprev[0], rprev[1], x, ry, fill=color,width=0.1)
-            fprev = (x,fy)
-            rprev = (x,ry)
+        prev = None
+        for (time,value,_) in span:
+            x = math.floor(time / sec_per_pix)
+            y = bottom - (value/scale) * height
+            if prev is not None:
+                self.mapCanvas.create_line(prev[0], prev[1], x, y, fill=fcolor, width=0.05)
+            prev = (x,y)
+        prev = None
+        for (time,_,value) in span:
+            x = math.floor(time / sec_per_pix)
+            y = bottom - (value/scale) * height
+            if prev is not None:
+                self.mapCanvas.create_line(prev[0], prev[1], x, y, fill=rcolor, width=0.1)
+            prev = (x,y)
+    
+    def drawRaw(self, span, top, bottom, height, color):
+        sec_per_pix = self.player.duration / self.map_width
+        prev = (0, math.floor(bottom - .5*height))
+        for (time,value) in span:
+            x = math.floor(time / sec_per_pix)
+            y = bottom - value * height
+            self.mapCanvas.create_line(prev[0], prev[1], x, y, fill=color, width=0.1)
+            prev = (x,y)
     
     def redrawTags(self):
         for x in self.tag_canvas_items:
@@ -429,10 +448,13 @@ class Window(tk.Tk):
         self.drawSpan(self.spans.get('audio',[]), top=pos, bottom=pos+row, colorMap=AudioSegmentLabel.color_map())
         pos += row
 
+        self.drawRaw(self.raw, top=pos, bottom=pos+row, height=row, color='darkred')
+        pos += row
+        
         if 'volume' in self.spans:
-            self.drawVolume(self.spans.get('volume'), top=pos, bottom=pos+row*2, height=row, color='darkblue')
-            pos += row*2
-            
+            self.drawVolume(self.spans.get('volume'), top=pos, bottom=pos+row, height=row, fcolor='darkblue', rcolor='lightblue')
+            pos += row
+        
         self.redrawTags()
 
         # lastly, add the positional indicator

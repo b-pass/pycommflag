@@ -106,18 +106,19 @@ def build_model(input_shape=(121, 21)):
 
     x = layers.Add()(skips)
     
-    positions = ops.arange(x.shape[1])
-    positions = ops.expand_dims(positions, axis=0)
-    emb = layers.Embedding(input_dim=x.shape[1], output_dim=x.shape[2], name="positional_embedding")(positions)
+    #positions = ops.arange(x.shape[1])
+    #positions = ops.expand_dims(positions, axis=0)
+    #emb = layers.Embedding(input_dim=x.shape[1], output_dim=x.shape[2], name="positional_embedding")(positions)
     x_norm = layers.LayerNormalization()(x)
-    x_norm = layers.Add(name="embed")([x_norm, emb])
-    attn = layers.MultiHeadAttention(num_heads=2, key_dim=16, dropout=DROPOUT, kernel_regularizer=regularizers.l2(L2))(x_norm, x_norm) 
+    #x_norm = layers.Add(name="embed")([x_norm, emb])
+    attn = layers.MultiHeadAttention(num_heads=4, key_dim=16, dropout=DROPOUT, kernel_regularizer=regularizers.l2(L2))(x_norm, x_norm) 
     attn = layers.Dropout(DROPOUT)(attn)
     x = layers.Add(name="mha_residual")([x, attn])
 
     # FFN
     x_norm = layers.LayerNormalization()(x)
     ffn = layers.Dense(F * 4, activation='gelu', kernel_regularizer=regularizers.l2(L2))(x_norm)
+    ffn = layers.Dropout(DROPOUT)(ffn)
     ffn = layers.Dense(F, kernel_regularizer=regularizers.l2(L2))(ffn)
     ffn = layers.Dropout(DROPOUT)(ffn)
     x = layers.Add()([x, ffn])
@@ -658,7 +659,7 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
         from keras.losses import BinaryFocalCrossentropy, BinaryCrossentropy
         model = build_model(train_dataset.shape)
         model.summary()
-        model.compile(optimizer="adam", loss=BinaryFocalCrossentropy(alpha=0.6, gamma=1.5, label_smoothing=0.01), metrics=['accuracy', Recall(), Precision()])
+        model.compile(optimizer="adam", loss=BinaryFocalCrossentropy(alpha=0.67, gamma=2, label_smoothing=0.01), metrics=['accuracy', Recall(), Precision()])
         model.save(model_path)
     
     gc.collect()
@@ -708,6 +709,31 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
     #model.save(model_path) the checkpoint already saved the vest version
     return (ecp.last_epoch+1, model.stop_training or ecp.last_epoch+1 >= EPOCHS)
 
+def raw_predict(feature_log:str|TextIO|dict, opts:Any=None)->list:
+    import keras
+
+    flog = processor.read_feature_log(feature_log)
+    frame_rate = flog.get('frame_rate', 29.97)
+    
+    assert(flog['frames'][-1][0] > frame_rate)
+
+    mf = opts.model_file if opts is not None else './model.keras'
+    if not mf and opts:
+        mf = f'{opts.models_dir or "."}{os.sep}model.keras'
+    if not os.path.exists(mf):
+        blah = mf
+        mf = f'{opts.models_dir or "."}{os.sep}model.h5'
+        if not os.path.exists(mf):
+            raise Exception(f"Model files '{blah}' or '{mf}' do not exist")
+    
+    model:keras.models.Model = keras.models.load_model(mf)
+    assert(model.output_shape[-1] == 1)
+
+    data,_,_,times = load_data_sliding_window(load_nonpersistent(flog, False))
+    prediction = model.predict(make_data_generator(data), verbose=True)
+
+    return list(zip(times, prediction.flatten()))
+
 def predict(feature_log:str|TextIO|dict, opts:Any, write_log=None)->list:
     from .mythtv import set_job_status
     set_job_status(opts, "Inferencing...")
@@ -734,7 +760,7 @@ def predict(feature_log:str|TextIO|dict, opts:Any, write_log=None)->list:
     data,_,_,times = load_data_sliding_window(load_nonpersistent(flog, False))
     prediction = model.predict(make_data_generator(data), verbose=True)
 
-    results = post_predict(flog, prediction, times, opts)
+    results = post_predict(flog, prediction.flatten(), times, opts)
     if not results:
         results = []
 
