@@ -31,8 +31,8 @@ SUMMARY_RATE = 1
 RATE = 29.97
 
 # training params
-MTYPE = 'tcnwv'
-EPOCHS = 50
+MTYPE = 'wavenet'
+EPOCHS = 75
 BATCH_SIZE = 64
 TEST_PERC = 0.25
 PATIENCE = 11
@@ -42,11 +42,11 @@ K         = 5  # TCN kernel size
 DILATIONS = [1, 2, 4, 8] # TCN dilation schedule
 DROPOUT   = 0.4
 START_DROP= 0.2
-TCN_DROP  = 0.1
+TCN_DROP  = 0.25
 L2        = 0.0001
 NOISE     = 0.0
 
-def build_model(input_shape=(121, 21)):
+def build_model(input_shape=(None, 121, 22)):
     from keras import layers, regularizers, utils, Input, Model, initializers, ops
     random.seed(SEED)
     utils.set_random_seed(SEED)
@@ -88,41 +88,29 @@ def build_model(input_shape=(121, 21)):
         x = layers.BatchNormalization(name=f"{name_prefix}_ln2")(x)
         x = layers.Activation("swish", name=f"{name_prefix}_act2")(x)
         x = layers.SpatialDropout1D(TCN_DROP)(x)
-        
-        # Squeeze
-        se = layers.GlobalAveragePooling1D()(x)
-        # Excite
-        se = layers.Dense(x.shape[-1]//4, activation='relu', use_bias=False)(se)
-        se = layers.Dense(x.shape[-1], activation='sigmoid', use_bias=False)(se)
-        # Apply
-        se = layers.Reshape((1, x.shape[-1]))(se)
-        x = layers.Multiply()([x, se])
 
-        skips.append(x)
+        # split separate projections for the skip path and the residual path
+        skip_out = layers.Conv1D(F, 1, kernel_regularizer=regularizers.l2(L2),
+                                name=f"{name_prefix}_skip1x1")(x)
+        skips.append(skip_out)
+
+        # On the FINAL iteration of this loop the below 2 parts are not used
+        # keras will prune them later ... that is intentional
+
+        x = layers.Conv1D(F, 1, kernel_regularizer=regularizers.l2(L2),
+                                name=f"{name_prefix}_res1x1")(x)
 
         x = layers.Add(name=f"{name_prefix}_res")([x, residual])
-        # Add from the FINAL iteration of this loop is not added to skips 
-        # and thus is totally unused in the model... that is intentional
 
     x = layers.Add()(skips)
     
-    #positions = ops.arange(x.shape[1])
-    #positions = ops.expand_dims(positions, axis=0)
-    #emb = layers.Embedding(input_dim=x.shape[1], output_dim=x.shape[2], name="positional_embedding")(positions)
-    x_norm = layers.LayerNormalization()(x)
-    #x_norm = layers.Add(name="embed")([x_norm, emb])
-    attn = layers.MultiHeadAttention(num_heads=4, key_dim=16, dropout=DROPOUT, kernel_regularizer=regularizers.l2(L2))(x_norm, x_norm) 
-    attn = layers.Dropout(DROPOUT)(attn)
-    x = layers.Add(name="mha_residual")([x, attn])
-
-    # FFN
-    x_norm = layers.LayerNormalization()(x)
-    ffn = layers.Dense(F * 4, activation='gelu', kernel_regularizer=regularizers.l2(L2))(x_norm)
-    ffn = layers.Dropout(DROPOUT)(ffn)
-    ffn = layers.Dense(F, kernel_regularizer=regularizers.l2(L2))(ffn)
-    ffn = layers.Dropout(DROPOUT)(ffn)
-    x = layers.Add()([x, ffn])
-
+    # Squeeze-Excite for channel attention
+    se = layers.GlobalAveragePooling1D()(x)
+    se = layers.Dense(x.shape[-1]//4, activation='relu', use_bias=False)(se)
+    se = layers.Dense(x.shape[-1], activation='sigmoid', use_bias=False)(se)
+    se = layers.Reshape((1, x.shape[-1]))(se)
+    #x = layers.Multiply()([x, se])
+    
     #x = layers.GlobalAveragePooling1D()(x)
     # use light attention to focus on a few slices instead of forcing just [60] or pooling
     attn = layers.Dense(1, use_bias=False, name="temporal_scores")(x)
@@ -130,7 +118,7 @@ def build_model(input_shape=(121, 21)):
     x = layers.Dot(axes=1, name="attention_dot_product")([attn, x])
     x = layers.Reshape((F,), name="attention_output_reshape")(x)
 
-    x = layers.Dense(64, kernel_regularizer=regularizers.l2(L2), name="classifier")(x)
+    x = layers.Dense(F, kernel_regularizer=regularizers.l2(L2), name="classifier")(x)
     x = layers.Activation("relu")(x)
     x = layers.Dropout(DROPOUT)(x)
 
@@ -376,7 +364,7 @@ def load_nonpersistent(flog:dict, for_training=False)->np.ndarray:
             nblank_dist = 0
         else:
             nblank_dist += 1
-            runs[n][2] = min(nblank_dist, frame_rate * 60) / (frame_rate * 60)
+            runs[n][2] = min(nblank_dist, frame_rate * 360) / (frame_rate * 360)
     runs[:,0] = 1.0 if have_logo > havent_logo * .1 else 0.0
     frames = np.append(frames, runs, axis=1)
 
@@ -673,7 +661,7 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
 
     def cosine_annealing_with_warmup(epoch, lr):
         WARMUP = 4
-        TOTAL = 35 # we use a smaller number than total epochs so it settles down to a final value before earlystopping kicks in
+        TOTAL = ceil(EPOCHS * .75)
         MAX_LR = 0.001
         MIN_LR = 0.00001 # Set your true floor here
         
