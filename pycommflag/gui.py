@@ -15,10 +15,12 @@ class Window(tk.Tk):
         self.title("pycommflag editor")
         self.player = Player(video, no_deinterlace=True)
 
+        self.duration = self.player.duration
+        self.frame_rate = self.player.frame_rate
         self.result = None
         self.position = 0
         self.prev_frame_time = 0
-        self.next_frame_time = 1/self.player.frame_rate
+        self.next_frame_time = 1/self.frame_rate
         self.settype = None
         self.setpos = 0
         
@@ -26,7 +28,7 @@ class Window(tk.Tk):
         self.spans = processor.read_feature_spans(flog)
         self.raw = neural.raw_predict(flog, opts)
         tags = processor.read_tags(flog)
-        if not tags or opts.model_file or opts.reprocess:
+        if not tags or opts.reprocess:
             (times,preds) = zip(*self.raw)
             tags = neural.post_predict(flog, list(preds), list(times), opts)
         
@@ -35,7 +37,7 @@ class Window(tk.Tk):
         if type(tags) is FeatureSpan:
             tags = tags.to_list()
         if tags and len(tags[-1][1]) < 2:
-            tags[-1] = (tags[-1][0], (tags[-1][1][0], self.player.duration))
+            tags[-1] = (tags[-1][0], (tags[-1][1][0], self.duration))
         for (t,(b,e)) in tags:
             if b is None or t is None or e is None: continue
             if b > p:
@@ -45,8 +47,8 @@ class Window(tk.Tk):
             self.tags.append((t,(b,e)))
             p = e
         tags = None
-        if p < self.player.duration:
-            self.tags.append((SceneType.SHOW,(p,self.player.duration)))
+        if p < self.duration:
+            self.tags.append((SceneType.SHOW,(p,self.duration)))
 
         self.misc = []
         self.video_labels = []
@@ -190,17 +192,17 @@ class Window(tk.Tk):
         self.map_width = 1280
         self.mapCanvas = tk.Canvas(self, width=self.map_width, height=self.map_height)
         self.mapCanvas.grid(row=7, column=0, columnspan=5)
-        self.mapCanvas.bind("<Button-1>", lambda e:self.move(abs=float(e.x)/self.map_width*self.player.duration))
+        self.mapCanvas.bind("<Button-1>", lambda e:self.move(abs=float(e.x)/self.map_width*self.duration))
         
         self.scale_pos = tk.DoubleVar()
         self.scroller = tk.Scale(self, 
-                                from_=0, to_=self.player.duration/60, resolution=1/60, tickinterval=5, showvalue=False,
+                                from_=0, to_=self.duration/60, resolution=1/60, tickinterval=5, showvalue=False,
                                 length=self.map_width+25, orient=tk.HORIZONTAL, sliderlength=25,
                                 variable=self.scale_pos,
                                 command=lambda n: self.move(abs=float(n)*60))
         self.scroller.grid(row=9, column=0, columnspan=5)
 
-        self.info = tk.Label(self, text=f'File: {video}; Length:{self.player.duration/60.0:0.1f} mins; {float(self.player.frame_rate)} fps')
+        self.info = tk.Label(self, text=f'File: {video}; Length:{self.duration/60.0:0.1f} mins; {float(self.frame_rate)} fps')
         self.info.grid(row=10, column=0, sticky="se", columnspan=5)
 
         limg = logo_finder.toimage(self.logo)
@@ -239,11 +241,11 @@ class Window(tk.Tk):
             
         for (t,(b,e)) in reversed(span):
             if not t: continue
-            if key == 'blank' and (e-b) >= 3*self.player.frame_rate:
+            if key == 'blank' and (e-b) >= 3*self.frame_rate:
                 p = b+(e-b)/2
             else:
                 p = b
-            if (p - self.position) < -2/self.player.frame_rate:
+            if (p - self.position) < -2/self.frame_rate:
                 self.move(abs=p)
                 return
 
@@ -256,11 +258,11 @@ class Window(tk.Tk):
             
         for (t,(b,e)) in span:
             if not t: continue
-            if key == 'blank' and (e-b) >= 3*self.player.frame_rate:
+            if key == 'blank' and (e-b) >= 3*self.frame_rate:
                 p = b+(e-b)/2
             else:
                 p = b
-            if (p - self.position) > 2/self.player.frame_rate:
+            if (p - self.position) > 2/self.frame_rate:
                 self.move(abs=p)
                 return
 
@@ -271,16 +273,16 @@ class Window(tk.Tk):
         self.move(abs=self.next_frame_time)
 
     def move(self, frames=0, seconds=0, abs=None):
-        seconds += frames/self.player.frame_rate
+        seconds += frames/self.frame_rate
         if abs is not None:
             seconds += abs
         else:
             seconds += self.position
-        seconds = max(0, min(seconds, self.player.duration))
+        seconds = max(0, min(seconds, self.duration))
 
-        self.prev_frame_time = seconds - 1/self.player.frame_rate
+        self.prev_frame_time = seconds - 1/self.frame_rate
         self.position = seconds
-        self.next_frame_time = seconds + 1/self.player.frame_rate
+        self.next_frame_time = seconds + 1/self.frame_rate
         self.images = [None]*5
 
         #print("SEEK", self.prev_frame_time, seconds, self.next_frame_time)
@@ -290,7 +292,7 @@ class Window(tk.Tk):
             if f is not None:
                 self.images[0] = ImageTk.PhotoImage(f.to_image(height=180,width=320))
         
-        f = self.player.seek_exact(max(0, min(seconds - 7/self.player.frame_rate, self.player.duration - 10/self.player.frame_rate)))
+        f = self.player.seek_exact(max(0, min(seconds - 7/self.frame_rate, self.duration - 10/self.frame_rate)))
         
         frames = []
         if f is not None:
@@ -354,11 +356,11 @@ class Window(tk.Tk):
         self.pos_label.configure(text=f'{int(self.position/60):02}:{self.position%60:06.03f}')
         
         self.scale_pos.set(self.position/60) #self.scroller.set(self.position/60)
-        x = math.ceil(self.position / (self.player.duration / self.map_width))
+        x = math.ceil(self.position / (self.duration / self.map_width))
         self.mapCanvas.coords(self.vMapPos, x, 0, x, self.map_height)
         
         if self.vMaybe is not None:
-            startx = math.floor(self.setpos / (self.player.duration / self.map_width))
+            startx = math.floor(self.setpos / (self.duration / self.map_width))
             stopx = x
             if startx > stopx:
                 (startx, stopx) = (stopx, startx)
@@ -369,7 +371,7 @@ class Window(tk.Tk):
 
     def drawSpan(self, span, colorMap, top, bottom, force_width=None, name="span"):
         items = []
-        sec_per_pix = self.player.duration / self.map_width
+        sec_per_pix = self.duration / self.map_width
         for (t,(b,e)) in span:
             color = colorMap.get(t, None)
             if color is None:
@@ -386,7 +388,7 @@ class Window(tk.Tk):
     
     def drawVolume(self, span, top, bottom, height, fcolor, rcolor):
         scale = np.max(np.array(span)[...,1:3])
-        sec_per_pix = self.player.duration / self.map_width
+        sec_per_pix = self.duration / self.map_width
         prev = None
         for (time,value,_) in span:
             x = math.floor(time / sec_per_pix)
@@ -403,7 +405,7 @@ class Window(tk.Tk):
             prev = (x,y)
     
     def drawRaw(self, span, top, bottom, height, color):
-        sec_per_pix = self.player.duration / self.map_width
+        sec_per_pix = self.duration / self.map_width
         prev = (0, math.floor(bottom - .5*height))
         for (time,value) in span:
             x = math.floor(time / sec_per_pix)
@@ -547,7 +549,7 @@ class Window(tk.Tk):
             savepos = self.position
             self.end_tag(None)
             self.position = savepos
-        self.setpos = self.player.duration
+        self.setpos = self.duration
         self.settype = SceneType.DO_NOT_USE
         self.end_tag(None)
         self.settype = None
