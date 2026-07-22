@@ -21,7 +21,7 @@ from .feature_span import *
 from . import processor
 from . import neural
 
-SEED = 121117
+SEED = 17
 random.seed(SEED)
 
 # data params, both for train and for inference
@@ -37,7 +37,7 @@ BATCH_SIZE = 64
 TEST_PERC = 0.25
 PATIENCE = 11
 
-F         = 32 # TCN filter count
+F         = 24 # TCN filter count
 K         = 5  # TCN kernel size
 DILATIONS = [1, 2, 4, 8] # TCN dilation schedule
 DROPOUT   = 0.4
@@ -47,8 +47,7 @@ L2        = 0.0001
 NOISE     = 0.0
 
 def build_model(input_shape=(None, 121, 22)):
-    from keras import layers, regularizers, utils, Input, Model, initializers, ops
-    random.seed(SEED)
+    from keras import layers, regularizers, utils, Input, Model
     utils.set_random_seed(SEED)
 
     inputs = Input(shape=input_shape[-2:], dtype='float32', name="input")
@@ -61,12 +60,11 @@ def build_model(input_shape=(None, 121, 22)):
     if NOISE > 0:
         x = layers.GaussianNoise(NOISE, name="input_noise")(x)
 
-    x = layers.Dense(F, name="projection")(x)
-    x = layers.Activation("relu")(x)
+    x = layers.Dense(F, 'relu', name="projection")(x)
 
     # --- TCN Blocks ---
     skips = []
-    for i, dilation_rate in enumerate(DILATIONS, start=1):
+    for i, dilation_rate in enumerate(DILATIONS):
         name_prefix = f"tcn{i}"
 
         residual = x
@@ -104,25 +102,18 @@ def build_model(input_shape=(None, 121, 22)):
 
     x = layers.Add()(skips)
     
-    # Squeeze-Excite for channel attention
-    se = layers.GlobalAveragePooling1D()(x)
-    se = layers.Dense(x.shape[-1]//4, activation='relu', use_bias=False)(se)
-    se = layers.Dense(x.shape[-1], activation='sigmoid', use_bias=False)(se)
-    se = layers.Reshape((1, x.shape[-1]))(se)
-    #x = layers.Multiply()([x, se])
-    
     #x = layers.GlobalAveragePooling1D()(x)
-    # use light attention to focus on a few slices instead of forcing just [60] or pooling
+    #x = x[:,60,:]
+    # use a learned pooling method to focus on the most important timesteps
     attn = layers.Dense(1, use_bias=False, name="temporal_scores")(x)
     attn = layers.Softmax(axis=1, name="temporal_attention")(attn)
     x = layers.Dot(axes=1, name="attention_dot_product")([attn, x])
     x = layers.Reshape((F,), name="attention_output_reshape")(x)
 
-    x = layers.Dense(F, kernel_regularizer=regularizers.l2(L2), name="classifier")(x)
-    x = layers.Activation("relu")(x)
+    x = layers.Dense(F*2, 'relu', kernel_regularizer=regularizers.l2(L2), name="classifier")(x)
     x = layers.Dropout(DROPOUT)(x)
 
-    outputs = layers.Dense(1, activation="sigmoid", name="output")(x)
+    outputs = layers.Dense(1, 'sigmoid', name="output")(x)
 
     return Model(inputs, outputs)
 
@@ -132,7 +123,9 @@ def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]],
         -> List[Tuple[int, Tuple[float, float]]]:
     """
     Adjust tag boundaries to align with scene transitions using blank frames and diff values.
-    This is because the training data is supplied by humans, and might be off a bit.
+    This is because the training data is supplied by humans, and might be off a couple frames.
+    Using this allows us to repeatably programmatically fine-tune tag locations whether 
+    supplied by humans or AI.
 
     Args:
         tags: List of (tag_type, (start_time, end_time))
@@ -563,7 +556,7 @@ def load_data(opts, do_not_test=False) -> tuple:
     if not do_not_test:
         need = int(dlen*TEST_PERC+1) - tlen
         if need > dlen/100 and tlen/(tlen+dlen) < 0.1:
-            print(f'Need to move {need} of {dlen} elements to the test/eval set (have {tlen} will have ~{need+tlen})')
+            print(f'WARNING: Need to move {need} of {dlen} elements to the test/eval set (have {tlen} will have ~{need+tlen})')
             data = list(zip(*data))
             random.shuffle(data)
             for i in range(need):
@@ -617,7 +610,10 @@ def train(opts:Any=None):
 
     import keras
     #dmetrics = model.evaluate(data, verbose=0)
-    tmetrics = keras.models.load_model(model_path).evaluate(test, verbose=1)
+
+    model = keras.models.load_model(model_path)
+    tmetrics = model.evaluate(test, verbose=1)
+
     print()
     #print(dmetrics)
     print(tmetrics)
@@ -942,6 +938,8 @@ def eval(opts:Any):
     total_time = 0
     all_missing = {}
     all_extra = {}
+    y_pred = []
+    y_true = []
     for mf in opts.eval:
         try:
             models[mf] = keras.models.load_model(mf)
@@ -986,9 +984,11 @@ def eval(opts:Any):
         etotal = None
         for (mf, model) in models.items():
             try:
-                data,_,_,times = load_data_sliding_window(load_nonpersistent(flog, False))
+                data,answers,_,times = load_data_sliding_window(load_nonpersistent(flog, False))
 
                 prediction = model.predict(make_data_generator(data), verbose=True)
+                y_true += answers.tolist()
+                y_pred += prediction.flatten().tolist()
                 
                 if etotal is not None:
                     best = []
@@ -1025,6 +1025,20 @@ def eval(opts:Any):
         acc = '%.5f %%' % ((total_time - total_wrong) * 100.0 / total_time,)
         print(f'{mf}: \t-{all_missing[mf]} \t+{all_extra[mf]} \t{total_wrong} \t{acc}')
     print()
+    print()
+
+    if len(models) < 2:
+        import tensorflow
+        from tensorflow.math import confusion_matrix
+        y_true = np.array(y_true, dtype='float32') >= 0.5
+        y_pred = np.array(y_pred, dtype='float32') >= 0.5
+        cm = confusion_matrix(y_true, y_pred, num_classes=2).numpy()
+        print(cm)
+        tn, fp, fn, tp = cm.ravel()
+        precision = tp / (tp + fp) if (tp + fp) else 0.0
+        recall = tp / (tp + fn) if (tp + fn) else 0.0
+        print(f"  TP={tp} FP={fp} FN={fn} TN={tn} "
+            f"| precision={precision:.4f} recall={recall:.4f}")    
 
     if etotal is not None:
         best = 0
@@ -1033,5 +1047,3 @@ def eval(opts:Any):
             if etotal[i] < etotal[best]:
                 best = i
         print("BEST overall error rate at threshold", best/100)
-
-    
