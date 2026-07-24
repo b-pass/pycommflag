@@ -22,7 +22,6 @@ from . import processor
 from . import neural
 
 SEED = 17
-random.seed(SEED)
 
 # data params, both for train and for inference
 WINDOW_BEFORE = 60
@@ -37,18 +36,17 @@ BATCH_SIZE = 64
 TEST_PERC = 0.25
 PATIENCE = 11
 
-F         = 24 # TCN filter count
+F         = 32 # TCN filter count
 K         = 5  # TCN kernel size
 DILATIONS = [1, 2, 4, 8] # TCN dilation schedule
 DROPOUT   = 0.4
 START_DROP= 0.2
-TCN_DROP  = 0.25
+TCN_DROP  = 0.3
 L2        = 0.0001
 NOISE     = 0.0
 
 def build_model(input_shape=(None, 121, 22)):
-    from keras import layers, regularizers, utils, Input, Model
-    utils.set_random_seed(SEED)
+    from keras import layers, regularizers, Input, Model
 
     inputs = Input(shape=input_shape[-2:], dtype='float32', name="input")
 
@@ -62,7 +60,6 @@ def build_model(input_shape=(None, 121, 22)):
 
     x = layers.Dense(F, 'relu', name="projection")(x)
 
-    # --- TCN Blocks ---
     skips = []
     for i, dilation_rate in enumerate(DILATIONS):
         name_prefix = f"tcn{i}"
@@ -100,17 +97,22 @@ def build_model(input_shape=(None, 121, 22)):
 
         x = layers.Add(name=f"{name_prefix}_res")([x, residual])
 
-    x = layers.Add()(skips)
-    
+    #x = layers.Add(name="skips")(skips)    
+    #x = layers.Activation("relu", name="skip_act1")(x)
+    #x = layers.Conv1D(F, 1, kernel_regularizer=regularizers.l2(L2), name="skip_proj1")(x)
+    #x = layers.Activation("relu", name="skip_act2")(x)
+    #x = layers.Conv1D(F, 1, kernel_regularizer=regularizers.l2(L2), name="skip_proj2")(x)
+
     #x = layers.GlobalAveragePooling1D()(x)
     #x = x[:,60,:]
     # use a learned pooling method to focus on the most important timesteps
-    attn = layers.Dense(1, use_bias=False, name="temporal_scores")(x)
+    NUM_ATT = 1
+    attn = layers.Dense(NUM_ATT, use_bias=False, name="temporal_scores")(x)
     attn = layers.Softmax(axis=1, name="temporal_attention")(attn)
     x = layers.Dot(axes=1, name="attention_dot_product")([attn, x])
-    x = layers.Reshape((F,), name="attention_output_reshape")(x)
+    x = layers.Reshape((NUM_ATT * F,), name="attention_output_reshape")(x)
 
-    x = layers.Dense(F*2, 'relu', kernel_regularizer=regularizers.l2(L2), name="classifier")(x)
+    x = layers.Dense(F, 'relu', kernel_regularizer=regularizers.l2(L2), name="classifier")(x)
     x = layers.Dropout(DROPOUT)(x)
 
     outputs = layers.Dense(1, 'sigmoid', name="output")(x)
@@ -553,7 +555,7 @@ def load_data(opts, do_not_test=False) -> tuple:
                     test[x].append(stuff[x][i])
     stuff = None
 
-    if not do_not_test:
+    if False: #if not do_not_test:
         need = int(dlen*TEST_PERC+1) - tlen
         if need > dlen/100 and tlen/(tlen+dlen) < 0.1:
             print(f'WARNING: Need to move {need} of {dlen} elements to the test/eval set (have {tlen} will have ~{need+tlen})')
@@ -579,80 +581,40 @@ def train(opts:Any=None):
     try: os.nice(19)
     except: pass
 
+    import keras
+    from keras import utils, callbacks
+    from keras.metrics import Recall, Precision, TrueNegatives, TruePositives, FalseNegatives, FalsePositives
+    from keras.losses import BinaryFocalCrossentropy, BinaryCrossentropy
+
+    utils.set_random_seed(SEED)
+
     (data,test) = load_data(opts)
-    
-    #print('Calculating loss weights')
-    #sums = np.sum((np.sum(answers, axis=0), np.sum(test_answers, axis=0)), axis=0)
-    ##weights = [1] * len(sums)
-    ##weights[SceneType.SHOW.value] = sums[SceneType.COMMERCIAL.value] / sums[SceneType.SHOW.value]
-    ##weights[SceneType.COMMERCIAL.value] = sums[SceneType.SHOW.value] / sums[SceneType.COMMERCIAL.value]
-    #sums += 1
-    #weights = (np.sum(sums)-sums)/np.sum(sums)
-    #print("Loss Weights",weights)
     
     print(f"Data shape (x):{data.shape} - Test shape (y):{test.shape if test is not None else 'None'}")
     
     tfile = tempfile.NamedTemporaryFile(prefix='train-', suffix='.pycf.model.keras', )
     model_path = tfile.name
     
-    stop = False
     epoch = 0
 
     #model_path = '/tmp/x.keras'
     #epoch = 10
 
-    _train_some(model_path, data, test, epoch)
-        
-    print()
-    print("Done")
-    print()
-    print('Final Evaluation...')
-
-    import keras
-    #dmetrics = model.evaluate(data, verbose=0)
-
-    model = keras.models.load_model(model_path)
-    tmetrics = model.evaluate(test, verbose=1)
-
-    print()
-    #print(dmetrics)
-    print(tmetrics)
-
-    if tmetrics[1] >= 0.80:
-        name = f'{opts.models_dir if opts and opts.models_dir else "."}{os.sep}pycf-{tmetrics[1]:.04f}-{MTYPE}-{F}x{K}x{len(DILATIONS)}-sq-w{WINDOW_BEFORE}x{WINDOW_AFTER}-{int(time.time())}.keras'
-        print()
-        print('Saving as ' + name)
-
-        import shutil
-        shutil.copy(model_path, name)
-        try: os.chmod(name, 0o644)
-        except: pass
-    
-    print()
-
-    return 0
-
-def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,bool]:
-    import keras
-
     model:keras.models.Model = None
     if epoch > 0:
         model = keras.models.load_model(model_path)
     else:
-        from keras.metrics import Recall, Precision
-        from keras.losses import BinaryFocalCrossentropy, BinaryCrossentropy
-        model = build_model(train_dataset.shape)
+        model = build_model(data.shape)
         model.summary()
-        model.compile(optimizer="adam", loss=BinaryFocalCrossentropy(alpha=0.67, gamma=2, label_smoothing=0.01), metrics=['accuracy', Recall(), Precision()])
+        model.compile(optimizer="adam", 
+                    loss=BinaryFocalCrossentropy(apply_class_balancing=True, alpha=0.67, gamma=2, label_smoothing=0.01), 
+                    metrics=['accuracy', Recall(), Precision()])
         model.save(model_path)
     
     gc.collect()
 
     cb = []
 
-    from keras import callbacks
-
-    cb.append(callbacks.EarlyStopping(monitor='loss', patience=PATIENCE))
     cb.append(callbacks.EarlyStopping(monitor='val_accuracy', patience=PATIENCE))
 
     def cosine_annealing_with_warmup(epoch, lr):
@@ -688,10 +650,40 @@ def _train_some(model_path, train_dataset, test_dataset, epoch=0) -> tuple[int,b
     oldterm = signal.signal(signal.SIGTERM, handler)
 
     # no class weights with Focal loss: , class_weight={0:0.65, 1:1/0.65}
-    model.fit(train_dataset, validation_data=test_dataset, epochs=EPOCHS, initial_epoch=epoch, callbacks=cb)
+    model.fit(data, validation_data=test, epochs=EPOCHS, initial_epoch=epoch, callbacks=cb)
 
-    #model.save(model_path) the checkpoint already saved the vest version
-    return (ecp.last_epoch+1, model.stop_training or ecp.last_epoch+1 >= EPOCHS)
+    print()
+    print("Done")
+    print()
+    print('Final Evaluation...')
+
+    model.compile(optimizer="adam", loss='binary_crossentropy',
+                  metrics=['accuracy', Precision(), Recall(), TrueNegatives(), TruePositives(), FalseNegatives(), FalsePositives()])
+    names = ['loss', 'accuracy', 'precision', 'recall', 'tn', 'tp', 'fn', 'fp']
+
+    dmetrics = model.evaluate(data, verbose=0)
+    print()
+    for name, value in zip(names, dmetrics):
+        print(f"data {name}: {value:.4f}")
+    
+    tmetrics = model.evaluate(test, verbose=0)
+    print()
+    for name, value in zip(names, tmetrics):
+        print(f"test {name}: {value:.4f}")
+
+    if tmetrics[1] >= 0.95:
+        name = f'{opts.models_dir if opts and opts.models_dir else "."}{os.sep}pycf-{tmetrics[1]:.04f}-{MTYPE}-{F}x{K}x{len(DILATIONS)}-sq-w{WINDOW_BEFORE}x{WINDOW_AFTER}-{int(time.time())}.keras'
+        print()
+        print('Saving as ' + name)
+
+        import shutil
+        shutil.copy(model_path, name)
+        try: os.chmod(name, 0o644)
+        except: pass
+    
+    print()
+
+    return 0
 
 def raw_predict(feature_log:str|TextIO|dict, opts:Any=None)->list:
     import keras
