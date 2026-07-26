@@ -21,7 +21,7 @@ from .feature_span import *
 from . import processor
 from . import neural
 
-SEED = 17
+SEED = 121711
 
 # data params, both for train and for inference
 WINDOW_BEFORE = 60
@@ -31,17 +31,17 @@ RATE = 29.97
 
 # training params
 MTYPE = 'wavenet'
-EPOCHS = 75
-BATCH_SIZE = 64
+EPOCHS = 50
+BATCH_SIZE = 128
 TEST_PERC = 0.25
 PATIENCE = floor(EPOCHS * .2)
 
 F         = 32 # TCN filter count
 K         = 5  # TCN kernel size
 DILATIONS = [1, 2, 4, 8] # TCN dilation schedule
-DROPOUT   = 0.3
-START_DROP= 0.2
-TCN_DROP  = 0.2
+DROPOUT   = 0.25
+START_DROP= 0.25
+TCN_DROP  = 0.1
 L2        = 0.0002
 NOISE     = 0.0
 
@@ -99,10 +99,6 @@ def build_model(input_shape=(None, 121, 22)):
 
     x = layers.Add(name="skips")(skips)    
 
-    #x = layers.Activation("relu", name="skip_act1")(x)
-    #x = layers.Conv1D(F, 1, kernel_regularizer=regularizers.l2(L2), name="skip_proj1")(x)
-    #x = layers.Activation("relu", name="skip_act2")(x)
-    #x = layers.Conv1D(F, 1, kernel_regularizer=regularizers.l2(L2), name="skip_proj2")(x)
     #x = layers.SpatialDropout1D(TCN_DROP)(x)
 
     x = layers.LayerNormalization()(x)
@@ -114,16 +110,16 @@ def build_model(input_shape=(None, 121, 22)):
     #x = layers.GlobalAveragePooling1D()(x)
     #x = x[:,60,:]
     # use a learned pooling method to focus on the most important timesteps
-    NUM_ATT = 4
+    NUM_ATT = 2
     attn = layers.Dense(NUM_ATT, use_bias=False, name="temporal_scores")(x)
     attn = layers.Softmax(axis=1, name="temporal_attention")(attn)
     x = layers.Dot(axes=1, name="attention_dot_product")([attn, x])
     x = layers.Flatten()(x) #x = layers.Reshape((NUM_ATT * F,), name="attention_output_reshape")(x)
 
-    x = layers.Dense(F * 2, 'relu', kernel_regularizer=regularizers.l2(L2), name="classifier")(x)
+    x = layers.Dense(F * NUM_ATT, 'relu', kernel_regularizer=regularizers.l2(L2), name="classifier")(x)
     x = layers.Dropout(DROPOUT)(x)
 
-    x = layers.LayerNormalization()(x)
+    #x = layers.LayerNormalization()(x)
 
     outputs = layers.Dense(1, 'sigmoid', name="output")(x)
 
@@ -391,7 +387,7 @@ def load_nonpersistent(flog:dict, for_training=False)->np.ndarray:
         elif tt == SceneType.COMMERCIAL.value:
             answers[si:ei] = 1.0
         elif tt != SceneType.SHOW.value:
-            weights[si:ei] = 0.5 # weight these areas as less important because they might be confusing
+            weights[si:ei] = 0.95 # weight these areas as less important because they might be confusing
     
     condensed = condense(frames, round(frame_rate/SUMMARY_RATE))
 
