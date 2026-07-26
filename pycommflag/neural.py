@@ -34,15 +34,15 @@ MTYPE = 'wavenet'
 EPOCHS = 75
 BATCH_SIZE = 64
 TEST_PERC = 0.25
-PATIENCE = 11
+PATIENCE = floor(EPOCHS * .2)
 
 F         = 32 # TCN filter count
 K         = 5  # TCN kernel size
 DILATIONS = [1, 2, 4, 8] # TCN dilation schedule
-DROPOUT   = 0.4
+DROPOUT   = 0.3
 START_DROP= 0.2
-TCN_DROP  = 0.3
-L2        = 0.0001
+TCN_DROP  = 0.2
+L2        = 0.0002
 NOISE     = 0.0
 
 def build_model(input_shape=(None, 121, 22)):
@@ -50,10 +50,10 @@ def build_model(input_shape=(None, 121, 22)):
 
     inputs = Input(shape=input_shape[-2:], dtype='float32', name="input")
 
-    x = layers.BatchNormalization()(inputs)
-
     # some features are unreliable ...
-    x = layers.SpatialDropout1D(START_DROP)(x)
+    x = layers.SpatialDropout1D(START_DROP)(inputs)
+
+    #x = layers.BatchNormalization()(x)
 
     if NOISE > 0:
         x = layers.GaussianNoise(NOISE, name="input_noise")(x)
@@ -71,7 +71,7 @@ def build_model(input_shape=(None, 121, 22)):
                           dilation_rate=dilation_rate,
                           kernel_regularizer=regularizers.l2(L2),
                           name=f"{name_prefix}_conv1")(x)
-        x = layers.BatchNormalization(name=f"{name_prefix}_ln1")(x)
+        x = layers.LayerNormalization(name=f"{name_prefix}_ln1")(x)
         x = layers.Activation("swish", name=f"{name_prefix}_act1")(x)
         x = layers.SpatialDropout1D(TCN_DROP)(x)
 
@@ -80,7 +80,7 @@ def build_model(input_shape=(None, 121, 22)):
                           dilation_rate=dilation_rate,
                           kernel_regularizer=regularizers.l2(L2),
                           name=f"{name_prefix}_conv2")(x)
-        x = layers.BatchNormalization(name=f"{name_prefix}_ln2")(x)
+        x = layers.LayerNormalization(name=f"{name_prefix}_ln2")(x)
         x = layers.Activation("swish", name=f"{name_prefix}_act2")(x)
         x = layers.SpatialDropout1D(TCN_DROP)(x)
 
@@ -97,23 +97,33 @@ def build_model(input_shape=(None, 121, 22)):
 
         x = layers.Add(name=f"{name_prefix}_res")([x, residual])
 
-    #x = layers.Add(name="skips")(skips)    
+    x = layers.Add(name="skips")(skips)    
+
     #x = layers.Activation("relu", name="skip_act1")(x)
     #x = layers.Conv1D(F, 1, kernel_regularizer=regularizers.l2(L2), name="skip_proj1")(x)
     #x = layers.Activation("relu", name="skip_act2")(x)
     #x = layers.Conv1D(F, 1, kernel_regularizer=regularizers.l2(L2), name="skip_proj2")(x)
+    #x = layers.SpatialDropout1D(TCN_DROP)(x)
+
+    x = layers.LayerNormalization()(x)
+
+    #attn = layers.MultiHeadAttention(num_heads=4, key_dim=8, dropout=DROPOUT)(x_norm, x_norm) 
+    #attn = layers.Dropout(DROPOUT)(attn)
+    #x = layers.Add(name="mha_residual")([x, attn])
 
     #x = layers.GlobalAveragePooling1D()(x)
     #x = x[:,60,:]
     # use a learned pooling method to focus on the most important timesteps
-    NUM_ATT = 1
+    NUM_ATT = 4
     attn = layers.Dense(NUM_ATT, use_bias=False, name="temporal_scores")(x)
     attn = layers.Softmax(axis=1, name="temporal_attention")(attn)
     x = layers.Dot(axes=1, name="attention_dot_product")([attn, x])
-    x = layers.Reshape((NUM_ATT * F,), name="attention_output_reshape")(x)
+    x = layers.Flatten()(x) #x = layers.Reshape((NUM_ATT * F,), name="attention_output_reshape")(x)
 
-    x = layers.Dense(F, 'relu', kernel_regularizer=regularizers.l2(L2), name="classifier")(x)
+    x = layers.Dense(F * 2, 'relu', kernel_regularizer=regularizers.l2(L2), name="classifier")(x)
     x = layers.Dropout(DROPOUT)(x)
+
+    x = layers.LayerNormalization()(x)
 
     outputs = layers.Dense(1, 'sigmoid', name="output")(x)
 
@@ -231,8 +241,7 @@ def condense(frames: np.ndarray, step: int) -> np.ndarray:
             res.append(np.max(a[:, :, f], axis=1)) # vol max
             res.append(np.std(a[:, :, f], axis=1)) # vol std dev
         
-        # min of the logo run and blank run features
-        res.append(np.min(a[:,:, -6], axis=1))
+        # min of the logo run feature
         res.append(np.min(a[:,:, -5], axis=1))
 
         # average things except those calculated above
@@ -240,10 +249,7 @@ def condense(frames: np.ndarray, step: int) -> np.ndarray:
 
         res[0][:, 0] = a[:, a.shape[1]//2, 0] # Use the middle timestamp
         res[0][:, 3] = np.count_nonzero(a[:, :, 3] >= 0.5, axis=1) / a.shape[1]  # Diff count above 0.5
-
-        res[-1][:, -6] = a[:, a.shape[1]-1, -6] # Use the end nblank run count
         res[-1][:, -5] = a[:, a.shape[1]-1, -5] # Use the end nlogo run count
-        
         res[-1][:, -2] = (np.count_nonzero(a[:, :, -2] >= 0.5, axis=1) >= a.shape[1]/2).astype('float32')
         res[-1][:, -1] = np.min(a[:, :, -1], axis=1)
         
@@ -341,27 +347,16 @@ def load_nonpersistent(flog:dict, for_training=False)->np.ndarray:
     # change the diff column to be normalized [0,30] -> [0,1]
     frames[:,3] = np.clip(frames[:,3] / 30, 0, 1.0)
 
-    # add a column for global logo presence [-7], time since logo [-6], and time since blank [-5]
-    runs = np.zeros((len(frames),3), dtype='float32')
-    nblank_dist = 0
+    # add a column for time since logo [-5]
+    run = np.zeros((len(frames),1), dtype='float32')
     nlogo_dist = 0
-    have_logo = 0
-    havent_logo = 0
     for n in range(len(frames)):
         if frames[n][1] > 0.5:
             nlogo_dist = 0
-            have_logo += 1
         else:
             nlogo_dist += 1
-            runs[n][1] = min(nlogo_dist, frame_rate * 360) / (frame_rate * 360)
-        
-        if frames[n][2] > 0.5:
-            nblank_dist = 0
-        else:
-            nblank_dist += 1
-            runs[n][2] = min(nblank_dist, frame_rate * 360) / (frame_rate * 360)
-    runs[:,0] = 1.0 if have_logo > havent_logo * .1 else 0.0
-    frames = np.append(frames, runs, axis=1)
+            run[n][0] = min(nlogo_dist/(frame_rate * 300), 1.0) 
+    frames = np.append(frames, run, axis=1)
 
     # add a column for time percentage [-4]
     frames = np.append(frames, (frames[:,0]/endtime)[:,np.newaxis], axis=1)
@@ -396,7 +391,7 @@ def load_nonpersistent(flog:dict, for_training=False)->np.ndarray:
         elif tt == SceneType.COMMERCIAL.value:
             answers[si:ei] = 1.0
         elif tt != SceneType.SHOW.value:
-            weights[si:ei] = 0.9 # gently weight these areas as slightly less important because they might be confusing
+            weights[si:ei] = 0.5 # weight these areas as less important because they might be confusing
     
     condensed = condense(frames, round(frame_rate/SUMMARY_RATE))
 
@@ -656,6 +651,9 @@ def train(opts:Any=None):
     print("Done")
     print()
     print('Final Evaluation...')
+
+    # reload the best epoch
+    model = keras.models.load_model(model_path)
 
     model.compile(optimizer="adam", loss='binary_crossentropy',
                   metrics=['accuracy', Precision(), Recall(), TrueNegatives(), TruePositives(), FalseNegatives(), FalsePositives()])
