@@ -32,20 +32,20 @@ RATE = 29.97
 # training params
 MTYPE = 'wavenet'
 EPOCHS = 50
-BATCH_SIZE = 128
+BATCH_SIZE = 64
 TEST_PERC = 0.25
 PATIENCE = floor(EPOCHS * .2)
 
 F         = 32 # TCN filter count
 K         = 5  # TCN kernel size
 DILATIONS = [1, 2, 4, 8] # TCN dilation schedule
-DROPOUT   = 0.25
-START_DROP= 0.25
+DROPOUT   = 0.2
+START_DROP= 0.1
 TCN_DROP  = 0.1
-L2        = 0.0002
+L2        = 0.0001
 NOISE     = 0.0
 
-def build_model(input_shape=(None, 121, 22)):
+def build_model(input_shape=(None, 121, 19)):
     from keras import layers, regularizers, Input, Model
 
     inputs = Input(shape=input_shape[-2:], dtype='float32', name="input")
@@ -58,35 +58,42 @@ def build_model(input_shape=(None, 121, 22)):
     if NOISE > 0:
         x = layers.GaussianNoise(NOISE, name="input_noise")(x)
 
-    x = layers.Dense(F, 'relu', name="projection")(x)
+    x = layers.Dense(F, name="input_projection")(x)
+    x = layers.LayerNormalization(name=f"input_normalization")(x)
+    x = layers.Activation("swish", name=f"input_activation")(x)
 
     skips = []
     for i, dilation_rate in enumerate(DILATIONS):
-        name_prefix = f"tcn{i}"
+        name_prefix = f"wave{i}"
 
         residual = x
 
-        x = layers.Conv1D(F, K,
-                          padding="same",
-                          dilation_rate=dilation_rate,
-                          kernel_regularizer=regularizers.l2(L2),
-                          name=f"{name_prefix}_conv1")(x)
-        x = layers.LayerNormalization(name=f"{name_prefix}_ln1")(x)
-        x = layers.Activation("swish", name=f"{name_prefix}_act1")(x)
-        x = layers.SpatialDropout1D(TCN_DROP)(x)
+        for j in (1,2):
+            filt = layers.Conv1D(F, K,
+                                padding="same",
+                                dilation_rate=dilation_rate,
+                                kernel_regularizer=regularizers.l2(L2),
+                                name=f"{name_prefix}_filter{j}")(x)
+            filt = layers.Activation("tanh", name=f"{name_prefix}_filter{j}_act")(filt)
 
-        x = layers.Conv1D(F, K,
-                          padding="same",
-                          dilation_rate=dilation_rate,
-                          kernel_regularizer=regularizers.l2(L2),
-                          name=f"{name_prefix}_conv2")(x)
-        x = layers.LayerNormalization(name=f"{name_prefix}_ln2")(x)
-        x = layers.Activation("swish", name=f"{name_prefix}_act2")(x)
-        x = layers.SpatialDropout1D(TCN_DROP)(x)
+            gate = layers.Conv1D(F, K,
+                                padding="same",
+                                dilation_rate=dilation_rate,
+                                kernel_regularizer=regularizers.l2(L2),
+                                name=f"{name_prefix}_gate{j}")(x)
+            gate = layers.Activation("sigmoid", name=f"{name_prefix}_gate{j}_act")(gate)
+
+            x = layers.Multiply(name=f"{name_prefix}_combine{j}")([filt, gate])
+        
+            #x = layers.LayerNormalization(name=f"{name_prefix}_norm{j}")(x)
+            x = layers.SpatialDropout1D(TCN_DROP)(x)
+
+        x = layers.LayerNormalization(name=f"{name_prefix}_post_norm")(x)
 
         # split separate projections for the skip path and the residual path
         skip_out = layers.Conv1D(F, 1, kernel_regularizer=regularizers.l2(L2),
                                 name=f"{name_prefix}_skip1x1")(x)
+        #skip_out = layers.LayerNormalization(name=f"{name_prefix}_skip_norm")(skip_out)
         skips.append(skip_out)
 
         # On the FINAL iteration of this loop the below 2 parts are not used
@@ -96,19 +103,12 @@ def build_model(input_shape=(None, 121, 22)):
                                 name=f"{name_prefix}_res1x1")(x)
 
         x = layers.Add(name=f"{name_prefix}_res")([x, residual])
+        x = layers.LayerNormalization(name=f"{name_prefix}_res_norm")(x)
 
     x = layers.Add(name="skips")(skips)    
 
-    #x = layers.SpatialDropout1D(TCN_DROP)(x)
-
     x = layers.LayerNormalization()(x)
 
-    #attn = layers.MultiHeadAttention(num_heads=4, key_dim=8, dropout=DROPOUT)(x_norm, x_norm) 
-    #attn = layers.Dropout(DROPOUT)(attn)
-    #x = layers.Add(name="mha_residual")([x, attn])
-
-    #x = layers.GlobalAveragePooling1D()(x)
-    #x = x[:,60,:]
     # use a learned pooling method to focus on the most important timesteps
     NUM_ATT = 2
     attn = layers.Dense(NUM_ATT, use_bias=False, name="temporal_scores")(x)
@@ -116,10 +116,10 @@ def build_model(input_shape=(None, 121, 22)):
     x = layers.Dot(axes=1, name="attention_dot_product")([attn, x])
     x = layers.Flatten()(x) #x = layers.Reshape((NUM_ATT * F,), name="attention_output_reshape")(x)
 
-    x = layers.Dense(F * NUM_ATT, 'relu', kernel_regularizer=regularizers.l2(L2), name="classifier")(x)
-    x = layers.Dropout(DROPOUT)(x)
+    x = layers.LayerNormalization()(x)
 
-    #x = layers.LayerNormalization()(x)
+    x = layers.Dense(F * NUM_ATT, 'swish', kernel_regularizer=regularizers.l2(L2), name="classifier")(x)
+    x = layers.Dropout(DROPOUT)(x)
 
     outputs = layers.Dense(1, 'sigmoid', name="output")(x)
 
