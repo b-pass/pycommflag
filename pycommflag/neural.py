@@ -30,8 +30,8 @@ SUMMARY_RATE = 1
 RATE = 29.97
 
 # training params
-MTYPE = 'wavenet'
-EPOCHS = 50
+MTYPE = 'wave'
+EPOCHS = 75
 BATCH_SIZE = 64
 TEST_PERC = 0.25
 PATIENCE = floor(EPOCHS * .2)
@@ -39,14 +39,14 @@ PATIENCE = floor(EPOCHS * .2)
 F         = 32 # TCN filter count
 K         = 5  # TCN kernel size
 DILATIONS = [1, 2, 4, 8] # TCN dilation schedule
-DROPOUT   = 0.2
-START_DROP= 0.1
-TCN_DROP  = 0.1
-L2        = 0.0001
+DROPOUT   = 0.4
+START_DROP= 0.2
+TCN_DROP  = 0.2
 NOISE     = 0.0
 
 def build_model(input_shape=(None, 121, 19)):
-    from keras import layers, regularizers, Input, Model
+
+    from keras import layers, Input, Model
 
     inputs = Input(shape=input_shape[-2:], dtype='float32', name="input")
 
@@ -72,14 +72,12 @@ def build_model(input_shape=(None, 121, 19)):
             filt = layers.Conv1D(F, K,
                                 padding="same",
                                 dilation_rate=dilation_rate,
-                                kernel_regularizer=regularizers.l2(L2),
                                 name=f"{name_prefix}_filter{j}")(x)
             filt = layers.Activation("tanh", name=f"{name_prefix}_filter{j}_act")(filt)
 
             gate = layers.Conv1D(F, K,
                                 padding="same",
                                 dilation_rate=dilation_rate,
-                                kernel_regularizer=regularizers.l2(L2),
                                 name=f"{name_prefix}_gate{j}")(x)
             gate = layers.Activation("sigmoid", name=f"{name_prefix}_gate{j}_act")(gate)
 
@@ -91,16 +89,14 @@ def build_model(input_shape=(None, 121, 19)):
         x = layers.LayerNormalization(name=f"{name_prefix}_post_norm")(x)
 
         # split separate projections for the skip path and the residual path
-        skip_out = layers.Conv1D(F, 1, kernel_regularizer=regularizers.l2(L2),
-                                name=f"{name_prefix}_skip1x1")(x)
+        skip_out = layers.Conv1D(F, 1, name=f"{name_prefix}_skip1x1")(x)
         #skip_out = layers.LayerNormalization(name=f"{name_prefix}_skip_norm")(skip_out)
         skips.append(skip_out)
 
         # On the FINAL iteration of this loop the below 2 parts are not used
         # keras will prune them later ... that is intentional
 
-        x = layers.Conv1D(F, 1, kernel_regularizer=regularizers.l2(L2),
-                                name=f"{name_prefix}_res1x1")(x)
+        x = layers.Conv1D(F, 1, name=f"{name_prefix}_res1x1")(x)
 
         x = layers.Add(name=f"{name_prefix}_res")([x, residual])
         x = layers.LayerNormalization(name=f"{name_prefix}_res_norm")(x)
@@ -110,7 +106,7 @@ def build_model(input_shape=(None, 121, 19)):
     x = layers.LayerNormalization()(x)
 
     # use a learned pooling method to focus on the most important timesteps
-    NUM_ATT = 2
+    NUM_ATT = 1
     attn = layers.Dense(NUM_ATT, use_bias=False, name="temporal_scores")(x)
     attn = layers.Softmax(axis=1, name="temporal_attention")(attn)
     x = layers.Dot(axes=1, name="attention_dot_product")([attn, x])
@@ -118,7 +114,7 @@ def build_model(input_shape=(None, 121, 19)):
 
     x = layers.LayerNormalization()(x)
 
-    x = layers.Dense(F * NUM_ATT, 'swish', kernel_regularizer=regularizers.l2(L2), name="classifier")(x)
+    x = layers.Dense(F * NUM_ATT, 'swish', name="classifier")(x)
     x = layers.Dropout(DROPOUT)(x)
 
     outputs = layers.Dense(1, 'sigmoid', name="output")(x)
@@ -388,24 +384,23 @@ def load_nonpersistent(flog:dict, for_training=False)->np.ndarray:
         elif tt == SceneType.COMMERCIAL.value:
             answers[si:ei] = 1.0
         elif tt != SceneType.SHOW.value:
-            weights[si:ei] = 0.9 # weight these areas as less important because they might be confusing
+            weights[si:ei] = 0.5 # weight these areas as less important because they might be confusing
     
     condensed = condense(frames, round(frame_rate/SUMMARY_RATE))
 
-    # up weight near boundaries.
-    #prev_t = condensed[1][-2]
-    #for i in range(2, len(condensed)-1):
-    #    if prev_t != condensed[i][-2]:
-    #        prev_t = condensed[i][-2]
-    #        if condensed[i-2][-1] >= 1.0:
-    #            condensed[i-2][-1] = 1.5
-    #        if condensed[i-1][-1] >= 1.0:
-    #            condensed[i-1][-1] = 2.0
-    #        if condensed[i][-1] >= 1.0:
-    #            condensed[i][-1] = 2.0
-    #        if condensed[i+1][-1] >= 1.0:
-    #            condensed[i+1][-1] = 1.5
-    
+    # massively up weight near boundaries.
+    prev_t = condensed[0][-2]
+    for i in range(1,len(condensed)):
+        if prev_t != condensed[i][-2]:
+            if SceneType.DO_NOT_USE.value not in [int(prev_t), int(condensed[i][-2])]:
+                for t in range(45):
+                    w = 1.0 + 6.0 * ((45 - t) / 45) ** 2
+                    if i >= t and condensed[i-t][-1] >= 1.0:
+                        condensed[i-t][-1] = max(condensed[i-t][-1], w)
+                    if i+t < len(condensed) and condensed[i+t][-1] >= 1.0:
+                        condensed[i+t][-1] = max(condensed[i+t][-1], w)
+            prev_t = condensed[i][-2]
+
     #for x in [0,1]:
     #    print(f'{x}) {np.count_nonzero(answers == x)}')
 
@@ -601,16 +596,17 @@ def train(opts:Any=None):
     else:
         model = build_model(data.shape)
         model.summary()
-        model.compile(optimizer="adam", 
+        model.compile(optimizer=keras.optimizers.AdamW(), 
                     loss=BinaryFocalCrossentropy(apply_class_balancing=True, alpha=0.67, gamma=2, label_smoothing=0.01), 
-                    metrics=['accuracy', Recall(), Precision()])
+                    metrics=['accuracy'],
+                    weighted_metrics=['accuracy', 'recall', 'precision'])
         model.save(model_path)
     
     gc.collect()
 
     cb = []
 
-    cb.append(callbacks.EarlyStopping(monitor='val_accuracy', patience=PATIENCE))
+    cb.append(callbacks.EarlyStopping(monitor='val_accuracy', patience=PATIENCE, restore_best_weights=True))
 
     def cosine_annealing_with_warmup(epoch, lr):
         WARMUP = 4
@@ -670,7 +666,7 @@ def train(opts:Any=None):
         print(f"test {name}: {value:.4f}")
 
     if tmetrics[1] >= 0.95:
-        name = f'{opts.models_dir if opts and opts.models_dir else "."}{os.sep}pycf-{tmetrics[1]:.04f}-{MTYPE}-{F}x{K}x{len(DILATIONS)}-sq-w{WINDOW_BEFORE}x{WINDOW_AFTER}-{int(time.time())}.keras'
+        name = f'{opts.models_dir if opts and opts.models_dir else "."}{os.sep}pycf-{tmetrics[1]:.04f}-{MTYPE}-{F}x{K}x{len(DILATIONS)}-{DROPOUT}-w{WINDOW_BEFORE}x{WINDOW_AFTER}-{int(time.time())}.keras'
         print()
         print('Saving as ' + name)
 
@@ -930,6 +926,8 @@ def eval(opts:Any):
     all_extra = {}
     y_pred = []
     y_true = []
+    y_dist = []
+    
     for mf in opts.eval:
         try:
             models[mf] = keras.models.load_model(mf)
@@ -970,32 +968,33 @@ def eval(opts:Any):
             log.exception(f"Unable to load {f}")
             continue
         
-        #etotal = np.zeros(100)
-        etotal = None
         for (mf, model) in models.items():
             try:
                 data,answers,_,times = load_data_sliding_window(load_nonpersistent(flog, False))
 
-                prediction = model.predict(make_data_generator(data), verbose=True)
-                y_true += answers.tolist()
-                y_pred += prediction.flatten().tolist()
-                
-                if etotal is not None:
-                    best = []
-                    best_count = duration
-                    for it in range(0, 100):
-                        thresh = it / 100.0
-                        result = post_predict(flog, prediction, times, opts, threshold=thresh)
-                        (missing,extra,_) = diff_tags(realtags, result)
-                        etotal[it] += missing+extra
-                        if missing+extra == best_count:
-                            best.append(thresh)
-                        elif missing+extra < best_count:
-                            best_count = missing+extra
-                            best = [thresh]
-                    #print(f"BEST THRESHOLD = {best[0]} to {best[-1]}")
+                def distances_to_nearest(times, tags):
+                    transitions = []
+                    for (t,(b,e)) in tags:
+                        if t != SceneType.DO_NOT_USE.value and t != SceneType.DO_NOT_USE:
+                            transitions += [b,e]
+                    transitions = np.array(transitions)
+                    idx = np.searchsorted(transitions, times)
+                    idx_left = np.clip(idx - 1, 0, len(transitions) - 1)
+                    idx_right = np.clip(idx, 0, len(transitions) - 1)
+                    dist_left = np.abs(times - transitions[idx_left])
+                    dist_right = np.abs(times - transitions[idx_right])
+                    return np.minimum(dist_left, dist_right)
 
+                distances = distances_to_nearest(times, realtags)
+                y_dist += distances.tolist()
+                y_true += answers.tolist()
+                
+                prediction = model.predict(make_data_generator(data), verbose=True)
+                
                 result = post_predict(flog, prediction, times, opts) #, threshold=best[0])
+
+                y_pred += prediction.flatten().tolist()
+
                 (missing,extra,_) = diff_tags(realtags, result)
                 acc = 100 - 100*(missing+extra)/duration
                 print(f'{f} @ {mf} -> Acc {round(acc,4)}% <- FN:{round(missing,3)} + FP:{round(extra,3)} = {round(missing+extra,3)} seconds WRONG')
@@ -1018,22 +1017,43 @@ def eval(opts:Any):
     print()
 
     if len(models) < 2:
-        import tensorflow
         from tensorflow.math import confusion_matrix
-        y_true = np.array(y_true, dtype='float32') >= 0.5
-        y_pred = np.array(y_pred, dtype='float32') >= 0.5
-        cm = confusion_matrix(y_true, y_pred, num_classes=2).numpy()
+
+        y_true = np.array(y_true, dtype='float32')
+        y_pred = np.array(y_pred, dtype='float32')
+        cm = confusion_matrix(y_true >= 0.5, 
+                              y_pred >= 0.5, 
+                              num_classes=2).numpy()
         print(cm)
         tn, fp, fn, tp = cm.ravel()
         precision = tp / (tp + fp) if (tp + fp) else 0.0
         recall = tp / (tp + fn) if (tp + fn) else 0.0
         print(f"  TP={tp} FP={fp} FN={fn} TN={tn} "
-            f"| precision={precision:.4f} recall={recall:.4f}")    
+            f"| precision={precision:.4f} recall={recall:.4f}")
+        
+        bin_edges = [0, 5, 10, 15, 30, 60, np.inf]
+        bin_labels = ["<5s", "5-10s", "10-15s", "15-30s", "30-60s", ">60s"]
+        bucket_idx = np.digitize(y_dist, bin_edges) - 1  # 0-indexed bucket per example
+        def auc_score(y_true, y_prob):
+            pos = y_prob[y_true == 1]
+            neg = y_prob[y_true == 0]
+            if len(pos) == 0 or len(neg) == 0:
+                return np.nan
+            # count pairs where positive score > negative score (ties count as 0.5)
+            diff = pos[:, None] - neg[None, :]
+            return (np.sum(diff > 0) + 0.5 * np.sum(diff == 0)) / (len(pos) * len(neg))
 
-    if etotal is not None:
-        best = 0
-        for i in range(100):
-            print(f"Threshold {i/100} error = {etotal[i]}")
-            if etotal[i] < etotal[best]:
-                best = i
-        print("BEST overall error rate at threshold", best/100)
+        print(f"{'bucket':<10} {'n':>7} {'accuracy':>10} {'auc':>8}")
+        for i, label in enumerate(bin_labels):
+            import gc
+            gc.collect()
+            mask = bucket_idx == i
+            n = mask.sum()
+            if n == 0:
+                print(f"{label:<10} {0:>7} {'--':>10} {'--':>8}")
+                continue
+            acc = (y_true[mask] == (y_pred[mask] >= 0.5).astype('float32')).mean()
+            auc = auc_score(y_true[mask], y_pred[mask])
+            auc_str = f"{auc:.3f}" if not np.isnan(auc) else "n/a"
+            print(f"{label:<10} {n:>7} {acc:>10.3f} {auc_str:>8}")
+
