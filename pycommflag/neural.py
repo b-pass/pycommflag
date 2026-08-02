@@ -30,7 +30,7 @@ SUMMARY_RATE = 1
 RATE = 29.97
 
 # training params
-MTYPE = 'wave'
+MTYPE = ''
 EPOCHS = 75
 BATCH_SIZE = 64
 TEST_PERC = 0.25
@@ -39,12 +39,14 @@ PATIENCE = floor(EPOCHS * .2)
 F         = 32 # TCN filter count
 K         = 5  # TCN kernel size
 DILATIONS = [1, 2, 4, 8] # TCN dilation schedule
-DROPOUT   = 0.4
+DROPOUT   = 0.35
 START_DROP= 0.2
-TCN_DROP  = 0.2
+TCN_DROP  = 0.35
 NOISE     = 0.0
 
 def build_model(input_shape=(None, 121, 19)):
+    global MTYPE
+    MTYPE = 'wave'
 
     from keras import layers, Input, Model
 
@@ -58,9 +60,10 @@ def build_model(input_shape=(None, 121, 19)):
     if NOISE > 0:
         x = layers.GaussianNoise(NOISE, name="input_noise")(x)
 
-    x = layers.Dense(F, name="input_projection")(x)
-    x = layers.LayerNormalization(name=f"input_normalization")(x)
-    x = layers.Activation("swish", name=f"input_activation")(x)
+    #x = layers.Dense(F, name="input_projection")(x)
+    #x = layers.LayerNormalization(name=f"input_normalization")(x)
+    #x = layers.Activation('relu', name=f"input_activation")(x)
+    x = layers.Conv1D(F, 1, name="projection")(x)
 
     skips = []
     for i, dilation_rate in enumerate(DILATIONS):
@@ -79,14 +82,14 @@ def build_model(input_shape=(None, 121, 19)):
                                 padding="same",
                                 dilation_rate=dilation_rate,
                                 name=f"{name_prefix}_gate{j}")(x)
-            gate = layers.Activation("sigmoid", name=f"{name_prefix}_gate{j}_act")(gate)
+            gate = layers.Activation('sigmoid', name=f"{name_prefix}_gate{j}_act")(gate)
 
             x = layers.Multiply(name=f"{name_prefix}_combine{j}")([filt, gate])
         
             #x = layers.LayerNormalization(name=f"{name_prefix}_norm{j}")(x)
             x = layers.SpatialDropout1D(TCN_DROP)(x)
 
-        x = layers.LayerNormalization(name=f"{name_prefix}_post_norm")(x)
+        #x = layers.LayerNormalization(name=f"{name_prefix}_post_norm")(x)
 
         # split separate projections for the skip path and the residual path
         skip_out = layers.Conv1D(F, 1, name=f"{name_prefix}_skip1x1")(x)
@@ -101,18 +104,22 @@ def build_model(input_shape=(None, 121, 19)):
         x = layers.Add(name=f"{name_prefix}_res")([x, residual])
         x = layers.LayerNormalization(name=f"{name_prefix}_res_norm")(x)
 
-    x = layers.Add(name="skips")(skips)    
+    x = layers.Add(name="skips")(skips)
+
+    attn = layers.MultiHeadAttention(num_heads=4, key_dim=16, dropout=DROPOUT)(x, x) 
+    attn = layers.Dropout(DROPOUT)(attn)
+    x = layers.Add(name="mha_residual")([x, attn])
 
     x = layers.LayerNormalization()(x)
 
     # use a learned pooling method to focus on the most important timesteps
-    NUM_ATT = 1
+    NUM_ATT = 2
     attn = layers.Dense(NUM_ATT, use_bias=False, name="temporal_scores")(x)
     attn = layers.Softmax(axis=1, name="temporal_attention")(attn)
     x = layers.Dot(axes=1, name="attention_dot_product")([attn, x])
     x = layers.Flatten()(x) #x = layers.Reshape((NUM_ATT * F,), name="attention_output_reshape")(x)
 
-    x = layers.LayerNormalization()(x)
+    #x = layers.LayerNormalization()(x)
 
     x = layers.Dense(F * NUM_ATT, 'swish', name="classifier")(x)
     x = layers.Dropout(DROPOUT)(x)
@@ -120,6 +127,89 @@ def build_model(input_shape=(None, 121, 19)):
     outputs = layers.Dense(1, 'sigmoid', name="output")(x)
 
     return Model(inputs, outputs)
+
+def OLD__build_model(input_shape=(121, 19)):
+    global MTYPE
+    MTYPE = 'tcn'
+    
+    from keras import layers, utils, Input, Model
+    random.seed(SEED)
+    utils.set_random_seed(SEED)
+
+    inputs = Input(shape=input_shape[-2:], dtype='float32', name="input")
+
+    x = layers.BatchNormalization()(inputs)
+
+    # some features are unreliable ...
+    x = layers.SpatialDropout1D(START_DROP)(x)
+
+    if NOISE > 0:
+        x = layers.GaussianNoise(NOISE, name="input_noise")(x)
+
+    #x = layers.Dense(F, 'relu', name="projection")(x)
+    x = layers.Conv1D(F, 1, name="projection")(x)
+
+    for i, dilation_rate in enumerate(DILATIONS, start=1):
+        name_prefix = f"tcn{i}"
+
+        residual = x
+
+        x = layers.Conv1D(F, K,
+                          padding="same",
+                          dilation_rate=dilation_rate,
+                          name=f"{name_prefix}_conv1")(x)
+        x = layers.BatchNormalization(name=f"{name_prefix}_ln1")(x)
+        x = layers.Activation('relu', name=f"{name_prefix}_act1")(x)
+        x = layers.SpatialDropout1D(TCN_DROP)(x)
+
+        x = layers.Conv1D(F, K,
+                          padding="same",
+                          dilation_rate=dilation_rate,
+                          name=f"{name_prefix}_conv2")(x)
+        x = layers.BatchNormalization(name=f"{name_prefix}_ln2")(x)
+        x = layers.Activation('relu', name=f"{name_prefix}_act2")(x)
+        x = layers.SpatialDropout1D(TCN_DROP)(x)
+        
+        se = layers.GlobalAveragePooling1D()(x)
+        se = layers.Dense(x.shape[-1]//4, 'relu', use_bias=False, name=f"{name_prefix}_squeeze")(se)
+        se = layers.Dense(x.shape[-1], 'sigmoid', use_bias=False, name=f"{name_prefix}_excite")(se)
+        se = layers.Reshape((1, x.shape[-1]))(se)
+        x = layers.Multiply(name=f"{name_prefix}_apply")([x, se])
+
+        x = layers.Add(name=f"{name_prefix}_res")([x, residual])
+
+    if False:
+        #positions = ops.arange(x.shape[1])
+        #positions = ops.expand_dims(positions, axis=0)
+        #emb = layers.Embedding(input_dim=x.shape[1], output_dim=x.shape[2], name="positional_embedding")(positions)
+        x_norm = layers.LayerNormalization()(x)
+        #x_norm = layers.Add(name="embed")([x_norm, emb])
+        attn = layers.MultiHeadAttention(num_heads=4, key_dim=16, dropout=DROPOUT)(x_norm, x_norm) 
+        attn = layers.Dropout(DROPOUT)(attn)
+        x = layers.Add(name="mha_residual")([x, attn])
+
+        # FFN
+        x_norm = layers.LayerNormalization()(x)
+        ffn = layers.Dense(F * 4, 'gelu')(x_norm)
+        ffn = layers.Dropout(DROPOUT)(ffn)
+        ffn = layers.Dense(F)(ffn)
+        ffn = layers.Dropout(DROPOUT)(ffn)
+        x = layers.Add()([x, ffn])
+
+    #x = layers.GlobalAveragePooling1D()(x)
+    # use light attention to focus on a few slices instead of forcing just [60] or pooling
+    attn = layers.Dense(1, use_bias=False, name="temporal_scores")(x)
+    attn = layers.Softmax(axis=1, name="temporal_attention")(attn)
+    x = layers.Dot(axes=1, name="att_dott")([attn, x])
+    x = layers.Flatten()(x)
+
+    x = layers.Dense(32, 'relu', name="classifier")(x)
+    x = layers.Dropout(DROPOUT)(x)
+
+    outputs = layers.Dense(1, activation='sigmoid', name="output")(x)
+
+    return Model(inputs, outputs)
+
 
 def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]], 
                  blanks: List[Tuple[bool, Tuple[float, float]]], 
@@ -191,8 +281,8 @@ def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]],
             continue
 
         # Different max distances based on tag type
-        max_distance = 10 if tag_type in {SceneType.SHOW, SceneType.SHOW.value, 
-                                        SceneType.COMMERCIAL, SceneType.COMMERCIAL.value} else 2
+        common_tag_types = (SceneType.SHOW, SceneType.SHOW.value, SceneType.COMMERCIAL, SceneType.COMMERCIAL.value)
+        max_distance = 8 if tag_type in common_tag_types else 3
         
         # First try to align with blank frames
         new_start = find_nearest_blank(start_time, blanks, max_distance)
@@ -200,13 +290,13 @@ def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]],
         
         # If still at original positions, try aligning with diff boundaries
         if new_start == start_time:
-            new_start = find_highest_diff_boundary(start_time, 2, diffs)
+            new_start = find_highest_diff_boundary(start_time, max_distance/2, diffs)
         #    if new_start != start_time:
         #        print(f"MOVED tag start {tag_type} from {start_time} {new_start}")
         #else:
         #    print(f"ALIGNED tag start {tag_type} from {start_time} {new_start}")
         if new_end == end_time:
-            new_end = find_highest_diff_boundary(end_time, 2, diffs)
+            new_end = find_highest_diff_boundary(end_time, max_distance/2, diffs)
         #    if new_end != end_time:
         #        print(f"MOVED tag end {tag_type} from {end_time} {new_end}")
         #else:
@@ -215,7 +305,8 @@ def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]],
         # Only keep valid tags
         if new_start < new_end:
             filtered_tags.append((tag_type, (new_start, new_end)))
-    
+        else:
+            filtered_tags.append((tag_type, (start_time, end_time)))
     return filtered_tags
 
 def condense(frames: np.ndarray, step: int) -> np.ndarray:
@@ -393,8 +484,8 @@ def load_nonpersistent(flog:dict, for_training=False)->np.ndarray:
     for i in range(1,len(condensed)):
         if prev_t != condensed[i][-2]:
             if SceneType.DO_NOT_USE.value not in [int(prev_t), int(condensed[i][-2])]:
-                for t in range(45):
-                    w = 1.0 + 6.0 * ((45 - t) / 45) ** 2
+                for t in range(30):
+                    w = 1.0 + 9.0 * ((30 - t) / 30) ** 2
                     if i >= t and condensed[i-t][-1] >= 1.0:
                         condensed[i-t][-1] = max(condensed[i-t][-1], w)
                     if i+t < len(condensed) and condensed[i+t][-1] >= 1.0:
@@ -1031,8 +1122,8 @@ def eval(opts:Any):
         print(f"  TP={tp} FP={fp} FN={fn} TN={tn} "
             f"| precision={precision:.4f} recall={recall:.4f}")
         
-        bin_edges = [0, 5, 10, 15, 30, 60, np.inf]
-        bin_labels = ["<5s", "5-10s", "10-15s", "15-30s", "30-60s", ">60s"]
+        bin_edges = [0, 1,2,3,4, 5, 10, 15, 30, 45, 60, np.inf]
+        bin_labels = ["1", "2", "3", "4", "5s", "5-10s", "10-15s", "15-30s", "30-45s", "45-60s", "60+s"]
         bucket_idx = np.digitize(y_dist, bin_edges) - 1  # 0-indexed bucket per example
         def auc_score(y_true, y_prob):
             pos = y_prob[y_true == 1]
