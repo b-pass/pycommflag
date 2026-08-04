@@ -23,6 +23,34 @@ from . import neural
 
 SEED = 121711
 
+# array indexes
+NORMTIME = 0
+LOGO = 1
+BLANK = 2
+DIFF = 3
+FVOL = 4
+RVOL = 5
+SILENCE = 6
+SPEECH = 7
+MUSIC = 8
+NOISE = 9
+LOGO_RUN = 10
+PERCTIME = 11
+
+GENERATED_FEATURES_START = 12
+FVOL_MAX = 12
+FVOL_STDDEV = 13
+RVOL_MAX = 14
+RVOL_STDDEV = 15
+LOGO_RUN_MIN = 16
+DIFF_90TH = 17
+DIFF_MAX = 18
+
+FEATURE_WIDTH = 19
+TIMESTAMPS = 19
+ANSWERS = 20
+WEIGHTS = 21
+
 # data params, both for train and for inference
 WINDOW_BEFORE = 60
 WINDOW_AFTER = 60
@@ -42,7 +70,6 @@ DILATIONS = [1, 2, 4, 8] # TCN dilation schedule
 DROPOUT   = 0.3
 START_DROP= 0.2
 TCN_DROP  = 0.35
-NOISE     = 0.0
 
 def build_model(input_shape=(None, 121, 19)):
     global MTYPE
@@ -56,10 +83,6 @@ def build_model(input_shape=(None, 121, 19)):
     x = layers.SpatialDropout1D(START_DROP)(inputs)
 
     #x = layers.BatchNormalization()(x)
-
-    if NOISE > 0:
-        x = layers.GaussianNoise(NOISE, name="input_noise")(x)
-
     x = layers.Conv1D(F, 1, activation='relu', name="projection")(x)
     x = layers.LayerNormalization(name="proj_norm")(x)
 
@@ -112,102 +135,25 @@ def build_model(input_shape=(None, 121, 19)):
 
     # use a learned pooling method to focus on the most important timesteps
     NUM_ATT = 2
+
     attn = layers.Dense(NUM_ATT, use_bias=False, name="temporal_scores")(x)
     attn = layers.Softmax(axis=1, name="temporal_attention")(attn)
-    x = layers.Dot(axes=1, name="attention_dot_product")([attn, x])
-    x = layers.Flatten()(x) #x = layers.Reshape((NUM_ATT * F,), name="attention_output_reshape")(x)
-
+    attn = layers.Dot(axes=1, name="attention_dot_product")([attn, x])
+    x = layers.Concatenate(name="concat")( [
+        layers.Flatten()(attn), 
+        x[:,input_shape[-2]//2-1,:],
+        x[:,input_shape[-2]//2,:],
+        x[:,input_shape[-2]//2+1,:]
+    ] )
+    
     #x = layers.LayerNormalization()(x)
 
-    x = layers.Dense(F, 'swish', name="classifier")(x)
+    x = layers.Dense(F * 2, 'swish', name="classifier")(x)
     x = layers.Dropout(DROPOUT)(x)
 
     outputs = layers.Dense(1, 'sigmoid', name="output")(x)
 
     return Model(inputs, outputs)
-
-def OLD__build_model(input_shape=(121, 19)):
-    global MTYPE
-    MTYPE = 'tcn'
-    
-    from keras import layers, utils, Input, Model
-    random.seed(SEED)
-    utils.set_random_seed(SEED)
-
-    inputs = Input(shape=input_shape[-2:], dtype='float32', name="input")
-
-    x = layers.BatchNormalization()(inputs)
-
-    # some features are unreliable ...
-    x = layers.SpatialDropout1D(START_DROP)(x)
-
-    if NOISE > 0:
-        x = layers.GaussianNoise(NOISE, name="input_noise")(x)
-
-    #x = layers.Dense(F, 'relu', name="projection")(x)
-    x = layers.Conv1D(F, 1, name="projection")(x)
-
-    for i, dilation_rate in enumerate(DILATIONS, start=1):
-        name_prefix = f"tcn{i}"
-
-        residual = x
-
-        x = layers.Conv1D(F, K,
-                          padding="same",
-                          dilation_rate=dilation_rate,
-                          name=f"{name_prefix}_conv1")(x)
-        x = layers.BatchNormalization(name=f"{name_prefix}_ln1")(x)
-        x = layers.Activation('relu', name=f"{name_prefix}_act1")(x)
-        x = layers.SpatialDropout1D(TCN_DROP)(x)
-
-        x = layers.Conv1D(F, K,
-                          padding="same",
-                          dilation_rate=dilation_rate,
-                          name=f"{name_prefix}_conv2")(x)
-        x = layers.BatchNormalization(name=f"{name_prefix}_ln2")(x)
-        x = layers.Activation('relu', name=f"{name_prefix}_act2")(x)
-        x = layers.SpatialDropout1D(TCN_DROP)(x)
-        
-        se = layers.GlobalAveragePooling1D()(x)
-        se = layers.Dense(x.shape[-1]//4, 'relu', use_bias=False, name=f"{name_prefix}_squeeze")(se)
-        se = layers.Dense(x.shape[-1], 'sigmoid', use_bias=False, name=f"{name_prefix}_excite")(se)
-        se = layers.Reshape((1, x.shape[-1]))(se)
-        x = layers.Multiply(name=f"{name_prefix}_apply")([x, se])
-
-        x = layers.Add(name=f"{name_prefix}_res")([x, residual])
-
-    if False:
-        #positions = ops.arange(x.shape[1])
-        #positions = ops.expand_dims(positions, axis=0)
-        #emb = layers.Embedding(input_dim=x.shape[1], output_dim=x.shape[2], name="positional_embedding")(positions)
-        x_norm = layers.LayerNormalization()(x)
-        #x_norm = layers.Add(name="embed")([x_norm, emb])
-        attn = layers.MultiHeadAttention(num_heads=4, key_dim=16, dropout=DROPOUT)(x_norm, x_norm) 
-        attn = layers.Dropout(DROPOUT)(attn)
-        x = layers.Add(name="mha_residual")([x, attn])
-
-        # FFN
-        x_norm = layers.LayerNormalization()(x)
-        ffn = layers.Dense(F * 4, 'gelu')(x_norm)
-        ffn = layers.Dropout(DROPOUT)(ffn)
-        ffn = layers.Dense(F)(ffn)
-        ffn = layers.Dropout(DROPOUT)(ffn)
-        x = layers.Add()([x, ffn])
-
-    #x = layers.GlobalAveragePooling1D()(x)
-    # use light attention to focus on a few slices instead of forcing just [60] or pooling
-    attn = layers.Dense(1, use_bias=False, name="temporal_scores")(x)
-    attn = layers.Softmax(axis=1, name="temporal_attention")(attn)
-    x = layers.Dot(axes=1, name="att_dott")([attn, x])
-    x = layers.Flatten()(x)
-
-    x = layers.Dense(32, 'relu', name="classifier")(x)
-    x = layers.Dropout(DROPOUT)(x)
-
-    outputs = layers.Dense(1, activation='sigmoid', name="output")(x)
-
-    return Model(inputs, outputs)
-
 
 def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]], 
                  blanks: List[Tuple[bool, Tuple[float, float]]], 
@@ -307,33 +253,39 @@ def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]],
             filtered_tags.append((tag_type, (start_time, end_time)))
     return filtered_tags
 
-def condense(frames: np.ndarray, step: int) -> np.ndarray:
+def condense(frames: np.ndarray, timestamps: np.ndarray, answers: np.ndarray, weights: np.ndarray, step: int) -> np.ndarray:
     """
     Summarize video features by aggregating the specified step size.
     """
-    if step <= 1:
-        return frames
-
-    def doit(a):
+    def doit(a, atimestamps, aanswers, aweights):
         res = []
-        res.append(np.percentile(a[:, :, 3], 90, axis=1)) # diff 90th
-        res.append(np.max(a[:, :, 3], axis=1)) # diff max
-        for f in [4,5]: # fvol, rvol
+
+        res.append(a[:, a.shape[1]//2, NORMTIME]) # middle relative timestamp
+        res.append(np.average(a[:, :, LOGO], axis=1))
+        res.append(np.average(a[:, :, BLANK], axis=1))
+        res.append(np.count_nonzero(a[:, :, DIFF] >= 0.5, axis=1) / a.shape[1])  # Diff count above 0.5
+        for x in (FVOL,RVOL,SILENCE,SPEECH,MUSIC,NOISE):
+            res.append(np.average(a[:, :, x], axis=1))
+        res.append(a[:, a.shape[1]-1, LOGO_RUN]) # end of the logo run feature
+        res.append(a[:, a.shape[1]//2, PERCTIME]) # middle percentage timestamp
+
+        assert(len(res) == GENERATED_FEATURES_START)
+        
+        for f in (FVOL,RVOL) :
             res.append(np.max(a[:, :, f], axis=1)) # vol max
             res.append(np.std(a[:, :, f], axis=1)) # vol std dev
+        res.append(np.min(a[:, :, LOGO_RUN], axis=1)) # min of the logo run feature
+        res.append(np.percentile(a[:, :, DIFF], 90, axis=1)) # diff 90th
+        res.append(np.max(a[:, :, DIFF], axis=1)) # diff max
+
+        assert(len(res) == FEATURE_WIDTH)
+
+        res.append(atimestamps[:, a.shape[1]//2]) # center timestamp
+        res.append(np.max(aanswers, axis=1)) # answer
+        res.append(np.min(aweights, axis=1)) # weight
         
-        # min of the logo run feature
-        res.append(np.min(a[:,:, -5], axis=1))
-
-        # average things except those calculated above
-        res = [np.average(a[:, :, 0:6], axis=1)] + [x.reshape(x.shape[0], 1) for x in res] + [np.average(a[:, :, 6:], axis=1)]
-
-        res[0][:, 0] = a[:, a.shape[1]//2, 0] # Use the middle timestamp
-        res[0][:, 3] = np.count_nonzero(a[:, :, 3] >= 0.5, axis=1) / a.shape[1]  # Diff count above 0.5
-        res[-1][:, -5] = a[:, a.shape[1]-1, -5] # Use the end nlogo run count
+        #res = [np.average(a[:, :, 0:6], axis=1)] + [x.reshape(x.shape[0], 1) for x in res] + [np.average(a[:, :, 6:], axis=1)]
         #res[-1][:, -2] = (np.count_nonzero(a[:, :, -2] >= 0.5, axis=1) >= a.shape[1]/2).astype('float32')
-        res[-1][:, -2] = np.max(a[:, :, -2], axis=1) 
-        res[-1][:, -1] = np.min(a[:, :, -1], axis=1)
         
         return np.concatenate([x.reshape((x.shape[0], 1)) if len(x.shape) == 1 else x for x in res], axis=1)
     
@@ -341,13 +293,23 @@ def condense(frames: np.ndarray, step: int) -> np.ndarray:
     remaining = n_frames % step
     if n_frames >= step:
         # Reshape the array to group frames by step size
-        condensed = doit( frames[:(n_frames//step)*step].reshape(-1, step, frames.shape[1]) )
+        condensed = doit( 
+            frames[:(n_frames//step)*step].reshape(-1, step, frames.shape[1]),
+            timestamps[:(n_frames//step)*step].reshape(-1, step, 1),
+            answers[:(n_frames//step)*step].reshape(-1, step, 1),
+            weights[:(n_frames//step)*step].reshape(-1, step, 1),
+        )
     else:
         condensed = None
     
     if remaining > 0:
         # Do the final, partial condensing
-        partial = doit( frames[-remaining:].reshape(-1, remaining, frames.shape[1]) )
+        partial = doit( 
+            frames[-remaining:].reshape(-1, remaining, frames.shape[1]),
+            timestamps[-remaining:].reshape(-1, remaining, 1),
+            answers[-remaining:].reshape(-1, remaining, 1),
+            weights[-remaining:].reshape(-1, remaining, 1),
+        )
 
         if condensed is None:
             return partial
@@ -424,49 +386,37 @@ def load_nonpersistent(flog:dict, for_training=False)->np.ndarray:
     frames = np.array(frames, dtype='float32')
 
     if not have_logo:
-        frames[:, 1] = 0
+        frames[:, LOGO] = 0
 
     # change the diff column to be normalized [0,30] -> [0,1]
-    frames[:,3] = np.clip(frames[:,3] / 30, 0, 1.0)
+    frames[:,DIFF] = np.clip(frames[:,DIFF] / 30, 0, 1.0)
 
-    # add a column for time since logo [-5]
+    # add a column for time since logo
     run = np.zeros((len(frames),1), dtype='float32')
     nlogo_dist = 0
     for n in range(len(frames)):
-        if frames[n][1] > 0.5:
+        if frames[n][LOGO] > 0.5:
             nlogo_dist = 0
         else:
             nlogo_dist += 1
             run[n][0] = min(nlogo_dist/(frame_rate * 300), 1.0) 
     frames = np.append(frames, run, axis=1)
 
-    # add a column for time percentage [-4]
-    frames = np.append(frames, (frames[:,0]/endtime)[:,np.newaxis], axis=1)
-
-    # add a column for the real timestamps [-3]
-    frames = np.append(frames, frames[:,0].reshape((-1,1)), axis=1)
-
+    # save off the times
+    timestamps = frames[:,NORMTIME].reshape((-1,1)).copy()
+    # add a column for time percentage
+    frames = np.append(frames, (frames[:,NORMTIME]/endtime)[:,np.newaxis], axis=1)
     # change the first column to be normalized timestamps (30 minute segments)
-    frames[:,0] = (frames[:,0] % 1800.0) / 1800.0
+    frames[:,NORMTIME] = (frames[:,NORMTIME] % 1800.0) / 1800.0
 
-    # add a column for answers [-2]
-    frames = np.append(frames, np.zeros((frames.shape[0],1), dtype=np.float32), axis=1)
-
-    # add a column for weights [-1]
-    frames = np.append(frames, np.ones((frames.shape[0],1), dtype=np.float32), axis=1)
-
-    wbefore = round(WINDOW_BEFORE * SUMMARY_RATE)
-    wafter = round(WINDOW_AFTER * SUMMARY_RATE)
-
-    timestamps = frames[:, -3]
-    answers = frames[:, -2]
-    weights = frames[:, -1]
+    answers = np.zeros((frames.shape[0],1), dtype=np.float32)
+    weights = np.ones((frames.shape[0],1), dtype=np.float32)
 
     for (tt,(st,et)) in tags:
         if type(tt) is not int: tt = tt.value
 
-        si = np.searchsorted(timestamps, st)
-        ei = np.searchsorted(timestamps, et)
+        si = np.searchsorted(timestamps[:,0], st)
+        ei = np.searchsorted(timestamps[:,0], et)
 
         if tt == SceneType.DO_NOT_USE.value:
             weights[si:ei] = 0 # ignore this entire section
@@ -475,28 +425,28 @@ def load_nonpersistent(flog:dict, for_training=False)->np.ndarray:
         elif tt != SceneType.SHOW.value:
             weights[si:ei] = 0.5 # weight these areas as less important because they might be confusing
     
-    condensed = condense(frames, round(frame_rate/SUMMARY_RATE))
+    condensed = condense(frames, timestamps, answers, weights, round(frame_rate/SUMMARY_RATE))
 
     # massively up weight near boundaries.
-    prev_t = condensed[0][-2]
+    prev_t = condensed[0][ANSWERS]
+    def upweight(t):
+        return 1.0 + 9.0 * ((60 - t) / 60) ** 2
     for i in range(1,len(condensed)):
-        if prev_t != condensed[i][-2]:
-            if SceneType.DO_NOT_USE.value not in [int(prev_t), int(condensed[i][-2])]:
-                for t in range(30):
-                    w = 1.0 + 9.0 * ((30 - t) / 30) ** 2
-                    if i >= t and condensed[i-t][-1] >= 1.0:
-                        condensed[i-t][-1] = max(condensed[i-t][-1], w)
-                    if i+t < len(condensed) and condensed[i+t][-1] >= 1.0:
-                        condensed[i+t][-1] = max(condensed[i+t][-1], w)
-            prev_t = condensed[i][-2]
+        if prev_t != condensed[i][ANSWERS]:
+            for t in range(WINDOW_BEFORE):
+                if i >= t and condensed[i-t][WEIGHTS] >= 1.0:
+                    condensed[i-t][WEIGHTS] = max(condensed[i-t][WEIGHTS], upweight(t))
+            for t in range(WINDOW_AFTER):
+                if i+t < len(condensed) and condensed[i+t][WEIGHTS] >= 1.0:
+                    condensed[i+t][WEIGHTS] = max(condensed[i+t][WEIGHTS], upweight(t))
+            prev_t = condensed[i][ANSWERS]
 
     #for x in [0,1]:
     #    print(f'{x}) {np.count_nonzero(answers == x)}')
-
     condensed = np.concatenate((
-        np.tile(condensed[0], (wbefore,1)),
+        np.tile(condensed[0], (round(WINDOW_BEFORE * SUMMARY_RATE),1)),
         condensed,
-        np.tile(condensed[-1], (wafter,1)),
+        np.tile(condensed[-1], (round(WINDOW_AFTER * SUMMARY_RATE),1)),
     ))
 
     return condensed
@@ -515,6 +465,8 @@ def load_persistent(flogname:str,for_training=True):
     if not os.path.exists(fname + '.data.npy'):
         condensed = load_nonpersistent(processor.read_feature_log(flogname), for_training)
         np.save(fname+'.data.npy', condensed)
+        condensed = None
+        gc.collect()
     
     condensed = np.load(fname+'.data.npy', mmap_mode='r')
     return condensed
@@ -567,10 +519,10 @@ def load_data_sliding_window(condensed:np.ndarray)->tuple[np.ndarray,np.ndarray,
     wbefore = round(WINDOW_BEFORE * SUMMARY_RATE)
     wafter = round(WINDOW_AFTER * SUMMARY_RATE)
 
-    timestamps = condensed[wbefore:-wafter,-3]
-    answers = condensed[wbefore:-wafter,-2]
-    weights = condensed[wbefore:-wafter,-1]
-    condensed = condensed[:, :-3]
+    timestamps = condensed[wbefore:-wafter, TIMESTAMPS]
+    answers = condensed[wbefore:-wafter, ANSWERS]
+    weights = condensed[wbefore:-wafter, WEIGHTS]
+    condensed = condensed[:, :FEATURE_WIDTH]
     
     from numpy.lib.stride_tricks import sliding_window_view
     frames = sliding_window_view(condensed, (wbefore+1+wafter, condensed.shape[1],)).squeeze()
@@ -695,7 +647,7 @@ def train(opts:Any=None):
 
     cb = []
 
-    cb.append(callbacks.EarlyStopping(monitor='val_accuracy', patience=PATIENCE, restore_best_weights=True))
+    cb.append(callbacks.EarlyStopping(monitor='val_weighted_accuracy', mode="max", patience=PATIENCE, restore_best_weights=True))
 
     def cosine_annealing_with_warmup(epoch, lr):
         WARMUP = 4
@@ -717,7 +669,7 @@ def train(opts:Any=None):
             self.last_epoch = epoch
             return super().on_epoch_end(epoch, logs)
 
-    ecp = EpochModelCheckpoint(model_path, monitor='val_accuracy', verbose=1, save_best_only=True)
+    ecp = EpochModelCheckpoint(model_path, monitor='val_weighted_accuracy', mode="max", verbose=1, save_best_only=True)
     cb.append(ecp)
 
     def handler(signum, frame):
@@ -1120,8 +1072,8 @@ def eval(opts:Any):
         print(f"  TP={tp} FP={fp} FN={fn} TN={tn} "
             f"| precision={precision:.4f} recall={recall:.4f}")
         
-        bin_edges = [0, 1,2,3,4, 5, 10, 15, 30, 45, 60, np.inf]
-        bin_labels = ["1", "2", "3", "4", "5s", "5-10s", "10-15s", "15-30s", "30-45s", "45-60s", "60+s"]
+        bin_edges = [0,2,3,4, 5, 10, 15, 30, 45, 60, np.inf]
+        bin_labels = ["0-1s", "3s", "4s", "5s", "5-10s", "10-15s", "15-30s", "30-45s", "45-60s", "60+s"]
         bucket_idx = np.digitize(y_dist, bin_edges) - 1  # 0-indexed bucket per example
         def auc_score(y_true, y_prob):
             pos = y_prob[y_true == 1]
