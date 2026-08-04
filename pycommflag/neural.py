@@ -39,7 +39,7 @@ PATIENCE = floor(EPOCHS * .2)
 F         = 32 # TCN filter count
 K         = 5  # TCN kernel size
 DILATIONS = [1, 2, 4, 8] # TCN dilation schedule
-DROPOUT   = 0.35
+DROPOUT   = 0.3
 START_DROP= 0.2
 TCN_DROP  = 0.35
 NOISE     = 0.0
@@ -60,10 +60,8 @@ def build_model(input_shape=(None, 121, 19)):
     if NOISE > 0:
         x = layers.GaussianNoise(NOISE, name="input_noise")(x)
 
-    #x = layers.Dense(F, name="input_projection")(x)
-    #x = layers.LayerNormalization(name=f"input_normalization")(x)
-    #x = layers.Activation('relu', name=f"input_activation")(x)
-    x = layers.Conv1D(F, 1, name="projection")(x)
+    x = layers.Conv1D(F, 1, activation='relu', name="projection")(x)
+    x = layers.LayerNormalization(name="proj_norm")(x)
 
     skips = []
     for i, dilation_rate in enumerate(DILATIONS):
@@ -86,10 +84,9 @@ def build_model(input_shape=(None, 121, 19)):
 
             x = layers.Multiply(name=f"{name_prefix}_combine{j}")([filt, gate])
         
-            #x = layers.LayerNormalization(name=f"{name_prefix}_norm{j}")(x)
             x = layers.SpatialDropout1D(TCN_DROP)(x)
 
-        #x = layers.LayerNormalization(name=f"{name_prefix}_post_norm")(x)
+        x = layers.LayerNormalization(name=f"{name_prefix}_post_norm")(x)
 
         # split separate projections for the skip path and the residual path
         skip_out = layers.Conv1D(F, 1, name=f"{name_prefix}_skip1x1")(x)
@@ -106,11 +103,12 @@ def build_model(input_shape=(None, 121, 19)):
 
     x = layers.Add(name="skips")(skips)
 
-    attn = layers.MultiHeadAttention(num_heads=4, key_dim=16, dropout=DROPOUT)(x, x) 
-    attn = layers.Dropout(DROPOUT)(attn)
-    x = layers.Add(name="mha_residual")([x, attn])
-
-    x = layers.LayerNormalization()(x)
+    x = layers.LayerNormalization(name="post_norm")(x)
+    
+    #attn = layers.MultiHeadAttention(num_heads=4, key_dim=16, dropout=DROPOUT)(x, x) 
+    #attn = layers.Dropout(DROPOUT)(attn)
+    #x = layers.Add(name="mha_residual")([x, attn])
+    #x = layers.LayerNormalization()(x)
 
     # use a learned pooling method to focus on the most important timesteps
     NUM_ATT = 2
@@ -121,7 +119,7 @@ def build_model(input_shape=(None, 121, 19)):
 
     #x = layers.LayerNormalization()(x)
 
-    x = layers.Dense(F * NUM_ATT, 'swish', name="classifier")(x)
+    x = layers.Dense(F, 'swish', name="classifier")(x)
     x = layers.Dropout(DROPOUT)(x)
 
     outputs = layers.Dense(1, 'sigmoid', name="output")(x)
