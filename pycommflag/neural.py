@@ -67,9 +67,9 @@ PATIENCE = floor(EPOCHS * .2)
 F         = 32 # TCN filter count
 K         = 5  # TCN kernel size
 DILATIONS = [1, 2, 4, 8] # TCN dilation schedule
-DROPOUT   = 0.3
+DROPOUT   = 0.35
 START_DROP= 0.2
-TCN_DROP  = 0.35
+TCN_DROP  = 0.3
 
 def build_model(input_shape=(None, 121, 19)):
     global MTYPE
@@ -84,7 +84,7 @@ def build_model(input_shape=(None, 121, 19)):
 
     #x = layers.BatchNormalization()(x)
     x = layers.Conv1D(F, 1, activation='relu', name="projection")(x)
-    x = layers.LayerNormalization(name="proj_norm")(x)
+    #x = layers.LayerNormalization(name="proj_norm")(x)
 
     skips = []
     for i, dilation_rate in enumerate(DILATIONS):
@@ -142,13 +142,13 @@ def build_model(input_shape=(None, 121, 19)):
     x = layers.Concatenate(name="concat")( [
         layers.Flatten()(attn), 
         x[:,input_shape[-2]//2-1,:],
-        x[:,input_shape[-2]//2,:],
+        #x[:,input_shape[-2]//2,:],
         x[:,input_shape[-2]//2+1,:]
     ] )
     
     #x = layers.LayerNormalization()(x)
 
-    x = layers.Dense(F * 2, 'swish', name="classifier")(x)
+    x = layers.Dense(F, 'swish', name="classifier")(x)
     x = layers.Dropout(DROPOUT)(x)
 
     outputs = layers.Dense(1, 'sigmoid', name="output")(x)
@@ -400,12 +400,16 @@ def load_nonpersistent(flog:dict, for_training=False)->np.ndarray:
         else:
             nlogo_dist += 1
             run[n][0] = min(nlogo_dist/(frame_rate * 300), 1.0) 
+    assert(frames.shape[-1] == LOGO_RUN)
     frames = np.append(frames, run, axis=1)
 
     # save off the times
-    timestamps = frames[:,NORMTIME].reshape((-1,1)).copy()
+    timestamps = frames[:,NORMTIME].copy()
+
     # add a column for time percentage
+    assert(frames.shape[-1] == PERCTIME)
     frames = np.append(frames, (frames[:,NORMTIME]/endtime)[:,np.newaxis], axis=1)
+
     # change the first column to be normalized timestamps (30 minute segments)
     frames[:,NORMTIME] = (frames[:,NORMTIME] % 1800.0) / 1800.0
 
@@ -415,15 +419,15 @@ def load_nonpersistent(flog:dict, for_training=False)->np.ndarray:
     for (tt,(st,et)) in tags:
         if type(tt) is not int: tt = tt.value
 
-        si = np.searchsorted(timestamps[:,0], st)
-        ei = np.searchsorted(timestamps[:,0], et)
+        si = np.searchsorted(timestamps, st)
+        ei = np.searchsorted(timestamps, et)
 
         if tt == SceneType.DO_NOT_USE.value:
             weights[si:ei] = 0 # ignore this entire section
         elif tt == SceneType.COMMERCIAL.value:
             answers[si:ei] = 1.0
         elif tt != SceneType.SHOW.value:
-            weights[si:ei] = 0.5 # weight these areas as less important because they might be confusing
+            weights[si:ei] = 0.75 # weight these areas as less important because they might be confusing
     
     condensed = condense(frames, timestamps, answers, weights, round(frame_rate/SUMMARY_RATE))
 
