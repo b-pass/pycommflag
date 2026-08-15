@@ -225,25 +225,29 @@ class Player:
                         raise
                     self._resync(self.vpts)
                 else:
-                    self.container.seek(self.vpts, stream=vs, any_frame=True, backward=(fail%2 == 0))
+                    try:
+                        self.container.seek(self.vpts, stream=vs, any_frame=True, backward=(fail%2 == 0))
+                    except av.error.PermissionError as e:
+                        log.exception("seek permission error, bailing")
+                        break
                 iter = self.container.decode(**self.streams)
                 continue
-            
-            if fail:
-                if fix_audio:
-                    fix_audio = False
-                    if audio_stream is not None:
-                        self.streams['audio'] = audio_stream
-                        audio_stream = None
-                        iter = self.container.decode(**self.streams)
-                if self.graph:
-                    self._create_graph()
-                log.info(f"Resync'd to {float(self.vpts*vs.time_base)} after {fail} skipped/dropped/corrupt/whatever frames")
-                fail = 0
             
             if type(frame) is av.AudioFrame:
                 self._queue_audio(frame)
             elif type(frame) is av.VideoFrame:
+                if fail:
+                    if fix_audio:
+                        fix_audio = False
+                        if audio_stream is not None:
+                            self.streams['audio'] = audio_stream
+                            audio_stream = None
+                            iter = self.container.decode(**self.streams)
+                    if self.graph:
+                        self._create_graph()
+                    log.info(f"Resync'd to {float(self.vpts*vs.time_base)} after {fail} skipped/dropped/corrupt/whatever frames")
+                    fail = 0
+                
                 if self.graph:
                     self.graph.push(frame)
                     try:

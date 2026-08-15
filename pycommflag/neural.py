@@ -35,21 +35,23 @@ SPEECH = 7
 MUSIC = 8
 NOISE = 9
 LOGO_RUN = 10
-PERCTIME = 11
+HAVE_LOGO = 11
+HAVE_RVOL = 12
+PERCTIME = 13
 
-GENERATED_FEATURES_START = 12
-FVOL_MAX = 12
-FVOL_STDDEV = 13
-RVOL_MAX = 14
-RVOL_STDDEV = 15
-LOGO_RUN_MIN = 16
-DIFF_90TH = 17
-DIFF_MAX = 18
+GENERATED_FEATURES_START = 14
+FVOL_MAX = 14
+FVOL_STDDEV = 15
+RVOL_MAX = 16
+RVOL_STDDEV = 17
+LOGO_RUN_MIN = 18
+DIFF_90TH = 19
+DIFF_MAX = 20
 
-FEATURE_WIDTH = 19
-TIMESTAMPS = 19
-ANSWERS = 20
-WEIGHTS = 21
+FEATURE_WIDTH = 21
+TIMESTAMPS = 21
+ANSWERS = 22
+WEIGHTS = 23
 
 # data params, both for train and for inference
 WINDOW_BEFORE = 60
@@ -59,19 +61,21 @@ RATE = 29.97
 
 # training params
 MTYPE = ''
-EPOCHS = 75
+EPOCHS = 50
 BATCH_SIZE = 64
 TEST_PERC = 0.25
 PATIENCE = floor(EPOCHS * .2)
 
 F         = 32 # TCN filter count
-K         = 5  # TCN kernel size
-DILATIONS = [1, 2, 4, 8] # TCN dilation schedule
-DROPOUT   = 0.35
+K         = 3  # TCN kernel size
+DILATIONS = [1, 2, 4, 8, 16] # TCN dilation schedule
+DROPOUT   = 0.3
 START_DROP= 0.2
-TCN_DROP  = 0.3
+TCN_DROP  = 0.2
+POOL_HEADS= 4
 
-def build_model(input_shape=(None, 121, 19)):
+def build_model(input_shape=(None, 121, 21)):
+    return build_model_BEST(input_shape)
     global MTYPE
     MTYPE = 'wave'
 
@@ -134,9 +138,7 @@ def build_model(input_shape=(None, 121, 19)):
     #x = layers.LayerNormalization()(x)
 
     # use a learned pooling method to focus on the most important timesteps
-    NUM_ATT = 2
-
-    attn = layers.Dense(NUM_ATT, use_bias=False, name="temporal_scores")(x)
+    attn = layers.Dense(POOL_HEADS, use_bias=False, name="temporal_scores")(x)
     attn = layers.Softmax(axis=1, name="temporal_attention")(attn)
     attn = layers.Dot(axes=1, name="attention_dot_product")([attn, x])
     x = layers.Concatenate(name="concat")( [
@@ -154,6 +156,98 @@ def build_model(input_shape=(None, 121, 19)):
     outputs = layers.Dense(1, 'sigmoid', name="output")(x)
 
     return Model(inputs, outputs)
+
+def build_model_BEST(input_shape=(121, 21)):
+    # training params
+    global MTYPE
+    MTYPE = 'tcn'
+
+    from keras import layers, utils, Input, Model
+    random.seed(SEED)
+    utils.set_random_seed(SEED)
+
+    inputs = Input(shape=input_shape[-2:], dtype='float32', name="input")
+
+    # some features are unreliable ...
+    x = layers.SpatialDropout1D(START_DROP)(inputs)
+
+    x = layers.Dense(F, name="projection")(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+
+    # --- TCN Blocks ---
+    for i, dilation_rate in enumerate(DILATIONS, start=1):
+        name_prefix = f"tcn{i}"
+
+        residual = x
+        x = layers.Conv1D(F, K,
+                          padding="same",
+                          dilation_rate=dilation_rate,
+                          name=f"{name_prefix}_conv1")(x)
+        x = layers.BatchNormalization(name=f"{name_prefix}_ln1")(x)
+        x = layers.Activation("swish", name=f"{name_prefix}_act1")(x)
+        x = layers.SpatialDropout1D(TCN_DROP)(x) # Add this to both Conv units in the block
+
+        x = layers.Conv1D(F, K,
+                          padding="same",
+                          dilation_rate=dilation_rate,
+                          name=f"{name_prefix}_conv2")(x)
+        x = layers.BatchNormalization(name=f"{name_prefix}_ln2")(x)
+        x = layers.Activation("swish", name=f"{name_prefix}_act2")(x)
+        x = layers.SpatialDropout1D(TCN_DROP)(x) # Add this to both Conv units in the block
+        
+        # Squeeze
+        se = layers.GlobalAveragePooling1D()(x)
+        # Excite
+        se = layers.Dense(x.shape[-1]//4, activation='relu', use_bias=False)(se)
+        se = layers.Dense(x.shape[-1], activation='sigmoid', use_bias=False)(se)
+        # Apply
+        se = layers.Reshape((1, x.shape[-1]))(se)
+        x = layers.Multiply()([x, se])
+
+        #if residual.shape[-1] != F:
+        #    residual = layers.Conv1D(F, 1, padding="same",
+        #                             name=f"{name_prefix}_res_proj")(residual)
+
+        x = layers.Add(name=f"{name_prefix}_res")([x, residual])
+
+    #attn = layers.MultiHeadAttention(num_heads=2, key_dim=16, dropout=.1)(x, x) 
+    #x = layers.Add(name="mha_residual")([x, attn])
+
+    # use light attention to focus on a few slices instead of forcing just [60]
+    # middle step [60] included in both sides intentionally since the center is important
+    # since we are attempting to find a boundary between two things at point[60], we split
+    # the pooling into two halves with their own weights and attentions in order to find
+    # signal on each independently, and then we let a final dense sort it out.
+    left = x[:, :61, : ]
+    right = x[:, 60:, : ]
+    poolt = []
+
+    for side in (left, right):
+        # Compute attention logits for all pool heads simultaneously
+        x = layers.Conv1D(POOL_HEADS, 1, use_bias=False)(side)
+        x = layers.Softmax(axis=1)(x) 
+        # We transpose so we can multiply (batch, POOL_HEADS, 61) x (batch, 61, F)
+        # Resulting shape: (batch, POOL_HEADS, F)
+        x = layers.Permute((2, 1))(x)
+        x = layers.Dot(axes=(2, 1))([x, side])
+        # now make it (batch, POOL_HEADS*F)
+        x = layers.Flatten()(x)
+        x = layers.Dense(16, 'relu')(x)
+        x = layers.Dropout(DROPOUT)(x)
+        poolt.append(x)
+    
+    diff = layers.Subtract()(poolt)
+
+    x = layers.Concatenate()(poolt + [diff])
+
+    x = layers.Dense(16, 'relu', name="classifier")(x) 
+    x = layers.Dropout(DROPOUT)(x)
+    
+    outputs = layers.Dense(1, 'sigmoid', name="output")(x)
+
+    return Model(inputs, outputs)
+
 
 def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]], 
                  blanks: List[Tuple[bool, Tuple[float, float]]], 
@@ -219,9 +313,16 @@ def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]],
 
     # Process each tag
     filtered_tags = []
+    prev_end = 0
     for tag_type, (start_time, end_time) in tags:
+        if start_time < prev_end:
+            start_time = prev_end
+            if end_time < start_time:
+                continue
+        
         if tag_type in (SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value):
-            filtered_tags.append((tag_type, (start_time, end_time)))
+            filtered_tags.append((tag_type, (max(start_time,prev_end), end_time)))
+            prev_end = end_time
             continue
 
         # Different max distances based on tag type
@@ -235,22 +336,32 @@ def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]],
         # If still at original positions, try aligning with diff boundaries
         if new_start == start_time:
             new_start = find_highest_diff_boundary(start_time, max_distance/2, diffs)
+            if new_start < prev_end:
+                new_start = prev_end
         #    if new_start != start_time:
         #        print(f"MOVED tag start {tag_type} from {start_time} {new_start}")
         #else:
         #    print(f"ALIGNED tag start {tag_type} from {start_time} {new_start}")
         if new_end == end_time:
             new_end = find_highest_diff_boundary(end_time, max_distance/2, diffs)
+            if new_end < prev_end:
+                new_end = prev_end
         #    if new_end != end_time:
         #        print(f"MOVED tag end {tag_type} from {end_time} {new_end}")
         #else:
         #    print(f"ALIGNED tag end {tag_type} from {end_time} {new_end}")
         
+        # invalid after fine tuning, revert to original
+        #if new_start > new_end:
+        #    new_start = max(start_time, prev_end)
+        #    new_end = max(end_time, new_start)
         # Only keep valid tags
         if new_start < new_end:
             filtered_tags.append((tag_type, (new_start, new_end)))
-        else:
-            filtered_tags.append((tag_type, (start_time, end_time)))
+            prev_end = new_end
+
+    #print(tags)
+    #print(filtered_tags)
     return filtered_tags
 
 def condense(frames: np.ndarray, timestamps: np.ndarray, answers: np.ndarray, weights: np.ndarray, step: int) -> np.ndarray:
@@ -266,7 +377,8 @@ def condense(frames: np.ndarray, timestamps: np.ndarray, answers: np.ndarray, we
         res.append(np.count_nonzero(a[:, :, DIFF] >= 0.5, axis=1) / a.shape[1])  # Diff count above 0.5
         for x in (FVOL,RVOL,SILENCE,SPEECH,MUSIC,NOISE):
             res.append(np.average(a[:, :, x], axis=1))
-        res.append(a[:, a.shape[1]-1, LOGO_RUN]) # end of the logo run feature
+        for x in (LOGO_RUN, HAVE_LOGO, HAVE_RVOL):
+            res.append(a[:, a.shape[1]-1, x]) # end of the logo run feature
         res.append(a[:, a.shape[1]//2, PERCTIME]) # middle percentage timestamp
 
         assert(len(res) == GENERATED_FEATURES_START)
@@ -402,6 +514,14 @@ def load_nonpersistent(flog:dict, for_training=False)->np.ndarray:
             run[n][0] = min(nlogo_dist/(frame_rate * 300), 1.0) 
     assert(frames.shape[-1] == LOGO_RUN)
     frames = np.append(frames, run, axis=1)
+    assert(frames.shape[-1] == HAVE_LOGO)
+    pres = (np.ones if have_logo else np.zeros)((len(frames),1), dtype='float32')
+    frames = np.append(frames, pres, axis=1)
+
+    assert(frames.shape[-1] == HAVE_RVOL)
+    have_rvol = np.count_nonzero(frames[:, RVOL] > 0.001) >= frame_rate
+    pres = (np.ones if have_rvol else np.zeros)((len(frames),1), dtype='float32')
+    frames = np.append(frames, pres, axis=1)
 
     # save off the times
     timestamps = frames[:,NORMTIME].copy()
@@ -641,7 +761,7 @@ def train(opts:Any=None):
     else:
         model = build_model(data.shape)
         model.summary()
-        model.compile(optimizer=keras.optimizers.AdamW(), 
+        model.compile(optimizer=keras.optimizers.AdamW(weight_decay=0.005), 
                     loss=BinaryFocalCrossentropy(apply_class_balancing=True, alpha=0.67, gamma=2, label_smoothing=0.01), 
                     metrics=['accuracy'],
                     weighted_metrics=['accuracy', 'recall', 'precision'])
@@ -663,10 +783,10 @@ def train(opts:Any=None):
             return MAX_LR * (epoch + 1) / WARMUP
         
         progress = min(1.0, (epoch - WARMUP) / (TOTAL - WARMUP))
-        return MIN_LR + (MAX_LR - MIN_LR) * 0.5 * (1 + np.cos(np.pi * progress))
+        return min(lr, MIN_LR + (MAX_LR - MIN_LR) * 0.5 * (1 + np.cos(np.pi * progress)))
     
     cb.append(callbacks.LearningRateScheduler(cosine_annealing_with_warmup))
-    #cb.append(callbacks.ReduceLROnPlateau(monitor='val_accuracy', patience=PATIENCE-1))
+    cb.append(callbacks.ReduceLROnPlateau(monitor='val_accuracy', patience=PATIENCE-3, factor=0.75))
     
     class EpochModelCheckpoint(callbacks.ModelCheckpoint):
         def on_epoch_end(self, epoch, logs=None):
@@ -698,20 +818,20 @@ def train(opts:Any=None):
 
     model.compile(optimizer="adam", loss='binary_crossentropy',
                   metrics=['accuracy', Precision(), Recall(), TrueNegatives(), TruePositives(), FalseNegatives(), FalsePositives()])
-    names = ['loss', 'accuracy', 'precision', 'recall', 'tn', 'tp', 'fn', 'fp']
 
-    dmetrics = model.evaluate(data, verbose=0)
+    dmetrics = model.evaluate(data, verbose=0, return_dict=True)
     print()
-    for name, value in zip(names, dmetrics):
-        print(f"data {name}: {value:.4f}")
+    for name, value in dmetrics.items():
+        print(f"train {name}: {value:.4f}")
     
-    tmetrics = model.evaluate(test, verbose=0)
+    tmetrics = model.evaluate(test, verbose=0, return_dict=True)
     print()
-    for name, value in zip(names, tmetrics):
-        print(f"test {name}: {value:.4f}")
+    for name, value in tmetrics.items():
+        print(f"val {name}: {value:.4f}")
 
-    if tmetrics[1] >= 0.95:
-        name = f'{opts.models_dir if opts and opts.models_dir else "."}{os.sep}pycf-{tmetrics[1]:.04f}-{MTYPE}-{F}x{K}x{len(DILATIONS)}-{DROPOUT}-w{WINDOW_BEFORE}x{WINDOW_AFTER}-{int(time.time())}.keras'
+    tacc = tmetrics["accuracy"]
+    if tacc >= 0.95:
+        name = f'{opts.models_dir if opts and opts.models_dir else "."}{os.sep}pycf-{tacc:.04f}-{MTYPE}-{F}x{K}x{len(DILATIONS)}+{POOL_HEADS}-{DROPOUT}-w{WINDOW_BEFORE}x{WINDOW_AFTER}-{int(time.time())}.keras'
         print()
         print('Saving as ' + name)
 
@@ -911,8 +1031,10 @@ def diff_tags(realtags, result) -> tuple[float,float,list]:
     orig = split_upon(realtags, result)
     result = split_upon(result, realtags)
 
+    #print(realtags)
     #print(orig)
     #print(result)
+    #print()
 
     missing = 0
     extra = 0
