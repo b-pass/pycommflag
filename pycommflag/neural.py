@@ -262,7 +262,7 @@ def build_model_BLAH(input_shape=(121, 21)):
     return Model(inputs, outputs)
 
 def build_model_BEST(input_shape=(121, 21)):
-    global MTYPE, F, K, DILATIONS, DROPOUT, START_DROP, NUM_LAYERS, TCN_DROP
+    global MTYPE, F, K, DILATIONS, DROPOUT, START_DROP, NUM_LAYERS, TCN_DROP, POOL_HEADS
 
     F        = 32 # TCN filter count
     K        = 5  # TCN kernel size
@@ -271,6 +271,7 @@ def build_model_BEST(input_shape=(121, 21)):
     DROPOUT   = 0.4
     START_DROP= 0.2
     TCN_DROP = 0.1
+    POOL_HEADS = 2
 
     from keras import layers, regularizers, utils, Input, Model
     random.seed(SEED)
@@ -325,13 +326,17 @@ def build_model_BEST(input_shape=(121, 21)):
     #x = layers.Add(name="mha_residual")([x, attn])
 
     # use light attention to focus on a few slices instead of forcing just [60]
-    attn = layers.Dense(1, use_bias=False)(x) 
+    attn = layers.Dense(1, use_bias=False)(x) #attn = layers.Conv1D(1, 1, use_bias=False)(x)
     attn = layers.Softmax(axis=1, name="attn")(attn)
-    x = layers.Dot(axes=1)([x,attn])
-    x = layers.Flatten()(x)
+    attn = layers.Dot(axes=1)([x,attn])
+    attn = layers.Flatten()(attn)
 
-    x = layers.Dense(64, name="classifier")(x)
-    x = layers.Activation("relu")(x)
+    maxp = layers.GlobalMaxPooling1D()(x)
+    avgp = layers.GlobalAveragePooling1D()(x)
+
+    x = layers.Concatenate()([attn, maxp, avgp])
+
+    x = layers.Dense(96, "relu", name="classifier")(x)
     x = layers.Dropout(DROPOUT)(x)
 
     outputs = layers.Dense(1, activation="sigmoid", name="output")(x)
