@@ -61,217 +61,21 @@ RATE = 29.97
 
 # training params
 MTYPE = ''
-EPOCHS = 50
+EPOCHS = 75
 BATCH_SIZE = 64
 TEST_PERC = 0.25
 PATIENCE = floor(EPOCHS * .2)
 
-F         = 32 # TCN filter count
-K         = 7  # TCN kernel size
-NUM_LAYERS = 5
+F         = 48 # TCN filter count
+K         = 5  # TCN kernel size
+DILATIONS = [1, 2, 4, 8] # TCN dilation schedule
 DROPOUT   = 0.4
-START_DROP= 0.1
-TCN_DROP  = 0.2
-POOL_HEADS= 4
+START_DROP= 0.3
+TCN_DROP  = 0.1
 
-def build_model(input_shape=(None, 121, 21)):
-    return build_model_BEST(input_shape)
-
-    # training params
-    global MTYPE
-    MTYPE = 'sides'
-
-    from keras import layers, utils, Input, Model
-    random.seed(SEED)
-    utils.set_random_seed(SEED)
-
-    inputs = Input(shape=input_shape[-2:], dtype='float32', name="input")
-
-    # some features are unreliable ...
-    x = layers.SpatialDropout1D(START_DROP)(inputs)
-
-    x = layers.Dense(F, "relu", name="projection")(x)
-    #x = layers.SpatialDropout1D(TCN_DROP//2)(x)
-
-    # middle step [60] included in both sides intentionally since the center is important
-    # since we are attempting to find a boundary between two things at point[60], we split
-    # the pooling into two halves with their own weights and attentions 
-    left = x[:, :60, : ]
-    right = x[:, 60:120, : ]
-    for i in range(NUM_LAYERS):
-        blocks = [
-            layers.Conv1D(F, K, padding="same", name=f"b{i}_conv1"),
-            layers.LayerNormalization(name=f"b{i}_norm1"),
-            layers.Activation("swish", name=f"b{i}_act1"),
-            layers.SpatialDropout1D(TCN_DROP, name=f"b{i}_sd1"), # Add this to both Conv units in the block
-
-            layers.Conv1D(F, K, padding="same", name=f"b{i}_conv2"),
-            layers.LayerNormalization(name=f"b{i}_norm2"),
-            layers.Activation("swish", name=f"b{i}_act2"),
-            layers.SpatialDropout1D(TCN_DROP, name=f"b{i}_sd2"), # Add this to both Conv units in the block
-        ]
-        
-        x = left
-        for b in blocks:
-            x = b(x)
-        x = layers.Add(name=f"left_residual_b{i}")([x, left])
-        if i+1 < NUM_LAYERS and x.shape[-2] > 1:
-            x = layers.AveragePooling1D(2, padding="same", name=f"left_pool{i}")(x)
-        left = x
-
-        x = right
-        for b in blocks:
-            x = b(x)
-        x = layers.Add(name=f"right_residual_b{i}")([x, right])
-        if i+1 < NUM_LAYERS and x.shape[-2] > 1:
-            x = layers.AveragePooling1D(2, padding="same", name=f"right_pool{i}")(x)
-        right = x
-
-        if x.shape[-2] <= 1:
-            break
-
-    def pool(side):
-        if side.shape[-2] <= 1:
-            return layers.Flatten()(side)
-        return layers.Concatenate()([
-            layers.GlobalAveragePooling1D()(side),
-            layers.GlobalMaxPooling1D()(side),
-        ])
-        # Compute attention logits for all pool heads simultaneously
-        x = layers.Conv1D(POOL_HEADS, 1, use_bias=False)(side)
-        x = layers.Softmax(axis=1)(x) 
-        # We transpose so we can multiply (batch, POOL_HEADS, 61) x (batch, 61, F)
-        # Resulting shape: (batch, POOL_HEADS, F)
-        x = layers.Permute((2, 1))(x)
-        x = layers.Dot(axes=(2, 1))([x, side])
-        # now make it (batch, POOL_HEADS*F)
-        x = layers.Flatten()(x)
-        x = layers.Dense(32, 'relu')(x)
-        x = layers.Dropout(DROPOUT)(x)
-        return x
-
-    left = pool(left)
-    right = pool(right)
-
-    diff = layers.Subtract()([left, right])
-    mult = layers.Multiply()([left, right])
-
-    x = layers.Concatenate()([left, diff , mult, right])
-
-    x = layers.Dense(32, 'relu', name="reclassifier")(x) 
-    x = layers.Dropout(DROPOUT)(x)
-    
-    outputs = layers.Dense(1, 'sigmoid', name="output")(x)
-
-    return Model(inputs, outputs)
-
-def build_model_BLAH(input_shape=(121, 21)):
-    # training params
+def build_model(input_shape=(121, 21)):
     global MTYPE
     MTYPE = 'tcn'
-
-    from keras import layers, utils, Input, Model
-    random.seed(SEED)
-    utils.set_random_seed(SEED)
-
-    inputs = Input(shape=input_shape[-2:], dtype='float32', name="input")
-
-    # some features are unreliable ...
-    x = layers.SpatialDropout1D(START_DROP)(inputs)
-
-    x = layers.Dense(F, "relu", name="projection")(x)
-    x = layers.SpatialDropout1D(TCN_DROP//2)(x)
-
-    # --- TCN Blocks ---
-    for i, dilation_rate in enumerate(DILATIONS, start=1):
-        name_prefix = f"tcn{i}"
-
-        residual = x
-        x = layers.Conv1D(F, K,
-                          padding="same",
-                          dilation_rate=dilation_rate,
-                          name=f"{name_prefix}_conv1")(x)
-        x = layers.LayerNormalization(name=f"{name_prefix}_ln1")(x)
-        x = layers.Activation("swish", name=f"{name_prefix}_act1")(x)
-        x = layers.SpatialDropout1D(TCN_DROP)(x) # Add this to both Conv units in the block
-
-        x = layers.Conv1D(F, K,
-                          padding="same",
-                          dilation_rate=dilation_rate,
-                          name=f"{name_prefix}_conv2")(x)
-        x = layers.LayerNormalization(name=f"{name_prefix}_ln2")(x)
-        x = layers.Activation("swish", name=f"{name_prefix}_act2")(x)
-        x = layers.SpatialDropout1D(TCN_DROP)(x) # Add this to both Conv units in the block
-        
-        # Squeeze
-        se = layers.GlobalAveragePooling1D()(x)
-        # Excite
-        se = layers.Dense(x.shape[-1]//4, activation='relu', use_bias=False)(se)
-        se = layers.Dense(x.shape[-1], activation='sigmoid', use_bias=False)(se)
-        # Apply
-        se = layers.Reshape((1, x.shape[-1]))(se)
-        x = layers.Multiply()([x, se])
-
-        #if residual.shape[-1] != F:
-        #    residual = layers.Conv1D(F, 1, padding="same",
-        #                             name=f"{name_prefix}_res_proj")(residual)
-
-        x = layers.Add(name=f"{name_prefix}_res")([x, residual])
-        x = layers.LayerNormalization(name=f"{name_prefix}_res_norm")(x)
-
-    #attn = layers.MultiHeadAttention(num_heads=2, key_dim=16, dropout=.1)(x, x) 
-    #x = layers.Add(name="mha_residual")([x, attn])
-
-    # use light attention to focus on a few slices instead of forcing just [60]
-    # middle step [60] included in both sides intentionally since the center is important
-    # since we are attempting to find a boundary between two things at point[60], we split
-    # the pooling into two halves with their own weights and attentions in order to find
-    # signal on each independently, and then we let a final dense sort it out.
-    left = x[:, :61, : ]
-    right = x[:, 60:, : ]
-    x = None
-    poolt = []
-
-    for side in (left, right):
-        # Compute attention logits for all pool heads simultaneously
-        x = layers.Conv1D(POOL_HEADS, 1, use_bias=False)(side)
-        x = layers.Softmax(axis=1)(x) 
-        # We transpose so we can multiply (batch, POOL_HEADS, 61) x (batch, 61, F)
-        # Resulting shape: (batch, POOL_HEADS, F)
-        x = layers.Permute((2, 1))(x)
-        x = layers.Dot(axes=(2, 1))([x, side])
-        # now make it (batch, POOL_HEADS*F)
-        x = layers.Flatten()(x)
-        x = layers.Dense(16, 'relu')(x)
-        x = layers.Dropout(DROPOUT)(x)
-        x = layers.Dense(8, 'relu')(x)
-        x = layers.Dropout(DROPOUT)(x)
-        #x = layers.Dense(1, 'relu')(x)
-        poolt.append(x)
-    
-    diff = layers.Subtract()(poolt)
-    mult = layers.Multiply()(poolt)
-
-    x = layers.Concatenate()(poolt + [diff , mult])
-
-    x = layers.Dense(32, 'relu', name="reclassifier")(x) 
-    x = layers.Dropout(DROPOUT)(x)
-    
-    outputs = layers.Dense(1, 'sigmoid', name="output")(x)
-
-    return Model(inputs, outputs)
-
-def build_model_BEST(input_shape=(121, 21)):
-    global MTYPE, F, K, DILATIONS, DROPOUT, START_DROP, NUM_LAYERS, TCN_DROP, POOL_HEADS
-
-    F        = 32 # TCN filter count
-    K        = 5  # TCN kernel size
-    DILATIONS = [1, 2, 4, 8] # TCN dilation schedule
-    NUM_LAYERS = len(DILATIONS)
-    DROPOUT   = 0.4
-    START_DROP= 0.2
-    TCN_DROP = 0.1
-    POOL_HEADS = 2
 
     from keras import layers, regularizers, utils, Input, Model
     random.seed(SEED)
@@ -322,21 +126,17 @@ def build_model_BEST(input_shape=(121, 21)):
 
         x = layers.Add(name=f"{name_prefix}_res")([x, residual])
 
-    #attn = layers.MultiHeadAttention(num_heads=2, key_dim=16, dropout=.1)(x, x) 
-    #x = layers.Add(name="mha_residual")([x, attn])
-
+    maxp = layers.GlobalMaxPooling1D()(x)
+    avgp = layers.GlobalAveragePooling1D()(x)
     # use light attention to focus on a few slices instead of forcing just [60]
     attn = layers.Dense(1, use_bias=False)(x) #attn = layers.Conv1D(1, 1, use_bias=False)(x)
     attn = layers.Softmax(axis=1, name="attn")(attn)
-    attn = layers.Dot(axes=1)([x,attn])
-    attn = layers.Flatten()(attn)
+    x = layers.Dot(axes=1)([x,attn])
+    x = layers.Flatten()(x)
 
-    maxp = layers.GlobalMaxPooling1D()(x)
-    avgp = layers.GlobalAveragePooling1D()(x)
+    x = layers.Concatenate()([x, maxp, avgp])
 
-    x = layers.Concatenate()([attn, maxp, avgp])
-
-    x = layers.Dense(96, "relu", name="classifier")(x)
+    x = layers.Dense(4*F, "relu", name="classifier")(x)
     x = layers.Dropout(DROPOUT)(x)
 
     outputs = layers.Dense(1, activation="sigmoid", name="output")(x)
@@ -865,7 +665,7 @@ def train(opts:Any=None):
     else:
         model = build_model(data.shape)
         model.summary()
-        model.compile(optimizer=keras.optimizers.AdamW(weight_decay=0.004), 
+        model.compile(optimizer=keras.optimizers.AdamW(weight_decay=0.010), 
                     loss=BinaryFocalCrossentropy(apply_class_balancing=True, alpha=0.67, gamma=2, label_smoothing=0.01), 
                     metrics=['accuracy'],
                     weighted_metrics=['accuracy', 'recall', 'precision'])
@@ -935,7 +735,7 @@ def train(opts:Any=None):
 
     tacc = tmetrics["accuracy"]
     if tacc >= 0.95:
-        name = f'{opts.models_dir if opts and opts.models_dir else "."}{os.sep}pycf-{tacc:.04f}-{MTYPE}-{F}x{K}x{NUM_LAYERS}+{POOL_HEADS}-{DROPOUT}-w{WINDOW_BEFORE}x{WINDOW_AFTER}-{int(time.time())}.keras'
+        name = f'{opts.models_dir if opts and opts.models_dir else "."}{os.sep}pycf-{tacc:.04f}-{MTYPE}-{F}x{K}x{len(DILATIONS)}-{DROPOUT}-w{WINDOW_BEFORE}x{WINDOW_AFTER}-{int(time.time())}.keras'
         print()
         print('Saving as ' + name)
 
@@ -1204,6 +1004,9 @@ def eval(opts:Any):
             models[mf] = keras.models.load_model(mf)
             print(mf)
             models[mf].summary()
+            for layer in models[mf].layers:
+                if isinstance(layer, (keras.layers.Dropout, keras.layers.SpatialDropout1D)):
+                    print(f"Layer Name: {layer.name} | Dropout Rate: {layer.rate}")
             all_missing[mf] = 0
             all_extra[mf] = 0
         except Exception as e:
