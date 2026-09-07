@@ -202,6 +202,8 @@ class Player:
                 break
             except IndexError:
                 break
+            except av.error.EOFError:
+                break
             except av.error.PatchWelcomeError as wtf:
                 log.exception("unrecoverable AV error")
                 os._exit(134)
