@@ -61,7 +61,7 @@ RATE = 29.97
 
 # training params
 MTYPE = ''
-EPOCHS = 75
+EPOCHS = 50
 BATCH_SIZE = 64
 TEST_PERC = 0.25
 PATIENCE = floor(EPOCHS * .2)
@@ -69,9 +69,9 @@ PATIENCE = floor(EPOCHS * .2)
 F         = 48 # TCN filter count
 K         = 5  # TCN kernel size
 DILATIONS = [1, 2, 4, 8] # TCN dilation schedule
-DROPOUT   = 0.4
-START_DROP= 0.3
-TCN_DROP  = 0.1
+DROPOUT   = 0.25
+START_DROP= 0.15
+TCN_DROP  = 0.25
 
 def build_model(input_shape=(121, 21)):
     global MTYPE
@@ -289,7 +289,7 @@ def condense(frames: np.ndarray, timestamps: np.ndarray, answers: np.ndarray, we
 
         res.append(atimestamps[:, a.shape[1]//2]) # center timestamp
         res.append(np.max(aanswers, axis=1)) # answer
-        res.append(np.min(aweights, axis=1)) # weight
+        res.append(np.where( (aweights < 0.1).any(axis=1), 0, np.max(aweights, axis=1) )) # weight (unless there's a zero in there)
         
         #res = [np.average(a[:, :, 0:6], axis=1)] + [x.reshape(x.shape[0], 1) for x in res] + [np.average(a[:, :, 6:], axis=1)]
         #res[-1][:, -2] = (np.count_nonzero(a[:, :, -2] >= 0.5, axis=1) >= a.shape[1]/2).astype('float32')
@@ -323,7 +323,7 @@ def condense(frames: np.ndarray, timestamps: np.ndarray, answers: np.ndarray, we
         return np.vstack((condensed, partial))
     return condensed
 
-def load_nonpersistent(flog:dict, for_training=False)->np.ndarray:
+def load_nonpersistent(flog:dict, for_training=False, no_logo=False, no_blanks=False)->np.ndarray:
     version = flog.get('file_version', 10)
     frame_rate = flog.get('frame_rate', 29.97)
     endtime = flog.get('duration', 0)
@@ -332,12 +332,19 @@ def load_nonpersistent(flog:dict, for_training=False)->np.ndarray:
         return None
 
     have_logo = not not flog.get('logo', None)
+    if no_logo:
+        if not have_logo:
+            return None
+        else:
+            have_logo = False
 
     tags = flog.get('tags', [])
     
     frames_header = flog['frames_header']
-    assert('time' in frames_header[0])
-    assert('diff' in frames_header[3])
+    assert('time' in frames_header[NORMTIME])
+    assert('logo' in frames_header[LOGO])
+    assert('bla' in frames_header[BLANK])
+    assert('diff' in frames_header[DIFF])
 
     if tags and for_training:
         spans = processor.read_feature_spans(flog, 'blank', 'diff')
@@ -392,9 +399,12 @@ def load_nonpersistent(flog:dict, for_training=False)->np.ndarray:
     # ok now we can numpy....
     frames = np.array(frames, dtype='float32')
 
-    if not have_logo:
+    if not have_logo or no_logo:
         frames[:, LOGO] = 0
 
+    if no_blanks:
+        frames[:, BLANK] = 0
+    
     # change the diff column to be normalized [0,30] -> [0,1]
     frames[:,DIFF] = np.clip(frames[:,DIFF] / 30, 0, 1.0)
 
@@ -443,31 +453,35 @@ def load_nonpersistent(flog:dict, for_training=False)->np.ndarray:
             answers[si:ei] = 1.0
         elif tt != SceneType.SHOW.value:
             weights[si:ei] = 0.75 # weight these areas as less important because they might be confusing
-    
-    condensed = condense(frames, timestamps, answers, weights, round(frame_rate/SUMMARY_RATE))
 
     # massively up weight near boundaries. however, _adjust_tags makes this only really matter outside of 5
     # within 5, it can be wrong ... so we only upweight the closest ones to the boundary
     # the others that are a little farther are not upweighted at all because they are in "dont care" territory
-    prev_t = condensed[0][ANSWERS]
-    valid_tags = (SceneType.SHOW.value, SceneType.SHOW, SceneType.COMMERCIAL.value, SceneType.COMMERCIAL)
-    def upweight(t):
-        return 1 + 4 * ((((60 - t) / 60) ** 2))
-    for i in range(1,len(condensed)):
-        next_t = condensed[i][ANSWERS]
-        if prev_t != next_t:
-            if next_t in valid_tags and prev_t in valid_tags:
-                for t in range(5,WINDOW_BEFORE):
-                    if i >= t and condensed[i-t][WEIGHTS] >= 1.0:
-                        condensed[i-t][WEIGHTS] = max(condensed[i-t][WEIGHTS], upweight(t))
-                for t in range(5,WINDOW_AFTER):
-                    if i+t < len(condensed) and condensed[i+t][WEIGHTS] >= 1.0:
-                        condensed[i+t][WEIGHTS] = max(condensed[i+t][WEIGHTS], upweight(t))
+    for (tt,(st,et)) in tags:
+        window = int(round(max(WINDOW_BEFORE,WINDOW_AFTER)*frame_rate))
+        def upweight(t):
+            #if t < frame_rate*3.5:
+            #    return 1.1
+            #else:
+                return 1 + 1 * ((((window - t) / float(window)) ** 2))
+        
+        if tt in [SceneType.COMMERCIAL, SceneType.SHOW, SceneType.COMMERCIAL.value, SceneType.SHOW.value]:
+            si = np.searchsorted(timestamps, st)
+            ei = np.searchsorted(timestamps, et)
+            for i in (si,ei):
+                for t in range(0, window):
+                    w = upweight(t)
+                    if i-t >= 0 and i-t < len(weights) and weights[i-t] >= 1.0:
+                        weights[i-t] = max(weights[i-t], w)
+                    if i+t < len(weights) and weights[i+t] >= 1.0:
+                        weights[i+t] = max(weights[i+t], w)
+    
+    #print("pre condense weights",len(weights),np.count_nonzero(weights),np.count_nonzero(weights == 0),np.count_nonzero(weights > 1.0))
 
-                condensed[i-1][WEIGHTS] = max(condensed[i-1][WEIGHTS], upweight(0))
-                condensed[i][WEIGHTS] = max(condensed[i][WEIGHTS], upweight(0))
-                
-            prev_t = next_t
+    condensed = condense(frames, timestamps, answers, weights, round(frame_rate/SUMMARY_RATE))
+
+    #cw = condensed[:,WEIGHTS]
+    #print("post condense weights",len(cw),np.count_nonzero(cw),np.count_nonzero(cw < 0), np.count_nonzero(cw == 0),np.count_nonzero(cw > 1))
 
     #for x in [0,1]:
     #    print(f'{x}) {np.count_nonzero(answers == x)}')
@@ -475,11 +489,11 @@ def load_nonpersistent(flog:dict, for_training=False)->np.ndarray:
         np.tile(condensed[0], (round(WINDOW_BEFORE * SUMMARY_RATE),1)),
         condensed,
         np.tile(condensed[-1], (round(WINDOW_AFTER * SUMMARY_RATE),1)),
-    ))
+    ), dtype='float32')
 
     return condensed
 
-def load_persistent(flogname:str,for_training=True):
+def load_persistent(flogname:str,extrname=''):
     fname = flogname
     if fname.endswith('.npy'):
         fname = fname[:-4]
@@ -490,38 +504,60 @@ def load_persistent(flogname:str,for_training=True):
     if fname.endswith('.data'):
         fname = fname[:-5]
     
-    if not os.path.exists(fname + '.data.npy'):
-        condensed = load_nonpersistent(processor.read_feature_log(flogname), for_training)
+    if not os.path.exists(fname + extrname + '.data.npy'):
+        flog = processor.read_feature_log(flogname)
+        condensed = load_nonpersistent(flog, True)
         np.save(fname+'.data.npy', condensed)
         condensed = None
         gc.collect()
-    
-    condensed = np.load(fname+'.data.npy', mmap_mode='r')
-    return condensed
+
+        condensed = load_nonpersistent(flog, True, no_logo=True, no_blanks=False)
+        if condensed is not None:
+            np.save(fname+'.nologo.data.npy', condensed)
+            condensed = None
+            gc.collect()
+        
+        #condensed = load_nonpersistent(flog, True, no_logo=False, no_blanks=True)
+        #np.save(fname+'.noblanks.data.npy', condensed)
+        #condensed = None
+        #gc.collect()
+
+        #condensed = load_nonpersistent(flog, True, no_logo=True, no_blanks=True)
+        #np.save(fname+'.nothing.data.npy', condensed)
+        #condensed = None
+        #gc.collect()
+
+    try:
+        return np.load(fname + extrname +'.data.npy', mmap_mode='r')
+    except FileNotFoundError as e:
+        print(e)
+        return None
 
 def make_data_generator(*args, **kwargs):
     from keras.utils import Sequence
     class DataGenerator(Sequence):
         def __init__(self, data, answers=None, weights=None):
             super().__init__()
-            self.data = np.array(data, dtype='float32')
-            self.answers = np.array(answers, dtype='float32') if answers else None
-            self.weights = np.array(weights, dtype='float32') if weights else None
+            #self.data = np.array(data, dtype='float32')
+            #self.answers = np.array(answers, dtype='float32') if answers else None
+            #self.weights = np.array(weights, dtype='float32') if weights else None
+            self.data = data
+            self.answers = answers
+            self.weights = weights
+
             self.len = ceil(len(self.data) / BATCH_SIZE)
             self.shape = (self.len, BATCH_SIZE, len(data[0]), len(data[0][0]))
-            self.shuf = np.arange(len(self.data), dtype='int')
             self.do_shuf = False
         
         def __len__(self):
             return self.len
         
         def __getitem__(self, index):
-            indexes = self.shuf[index*BATCH_SIZE:(index+1)*BATCH_SIZE]
-            d = self.data[indexes]
+            d = np.asarray(self.data[index*BATCH_SIZE:(index+1)*BATCH_SIZE], dtype='float32')
             if self.answers is not None:
-                a = self.answers[indexes]
+                a = np.asarray(self.answers[index*BATCH_SIZE:(index+1)*BATCH_SIZE], dtype='float32')
                 if self.weights is not None:
-                    w = self.weights[indexes]
+                    w = np.asarray(self.weights[index*BATCH_SIZE:(index+1)*BATCH_SIZE], dtype='float32')
                     return d,a,w
                 else:
                     return d,a
@@ -536,11 +572,14 @@ def make_data_generator(*args, **kwargs):
         def shuffle(self):
             #print("Doing the data generator shufflehussle")
             self.do_shuf = True
-            self.shuf = np.random.permutation(len(self.data))
+            shuf = np.random.permutation(len(self.data))
+            self.data = [self.data[i] for i in shuf]
+            if self.answers is not None: self.answers = [self.answers[i] for i in shuf]
+            if self.weights is not None: self.weights = [self.weights[i] for i in shuf]
 
     return DataGenerator(*args, **kwargs)
 
-def load_data_sliding_window(condensed:np.ndarray)->tuple[np.ndarray,np.ndarray,np.ndarray,np.ndarray]:
+def load_data_sliding_window(condensed:np.ndarray, trim=False)->tuple[np.ndarray,np.ndarray,np.ndarray,np.ndarray]:
     if condensed is None:
         return ([],[],[],[])
     
@@ -555,12 +594,20 @@ def load_data_sliding_window(condensed:np.ndarray)->tuple[np.ndarray,np.ndarray,
     from numpy.lib.stride_tricks import sliding_window_view
     frames = sliding_window_view(condensed, (wbefore+1+wafter, condensed.shape[1],)).squeeze()
 
-    #print(len(self.frames), len(self.timestamps))
+    if trim:
+        #print(len(weights),np.count_nonzero(weights),np.count_nonzero(weights < 0), np.count_nonzero(weights == 0),np.count_nonzero(weights > 0))
+        #print("After trim count",np.count_nonzero(weights > 1.0))
+        frames = frames[weights > 1.0]
+        timestamps = timestamps[weights > 1.0]
+        answers = answers[weights > 1.0]
+        weights = weights[weights > 1.0]
+    else:
+        assert(np.shares_memory(condensed, frames))
+        assert(len(frames) == len(timestamps))
+        assert(len(frames) == len(answers))
+        assert(len(frames) == len(weights))
 
-    assert(np.shares_memory(condensed, frames))
-    assert(len(frames) == len(timestamps))
-    assert(len(frames) == len(answers))
-    assert(len(frames) == len(weights))
+    #print(len(self.frames), len(self.timestamps))
 
     return frames, answers, weights, timestamps
 
@@ -591,27 +638,34 @@ def load_data(opts, do_not_test=False) -> tuple:
     tlen = 0
     test = ([],[],[])
 
+    variants = ['.nologo',] #['.nologo', '.noblanks', '.nothing']
+
     for f in datafiles:
         if os.path.isdir(f) or f.endswith('.npy'):
             continue
-        print("Loading",f)
-        stuff = load_data_sliding_window(load_persistent(f))
-        if stuff is not None:
-            dlen += len(stuff[0])
-            for x in range(3):
-                for i in range(len(stuff[x])):
-                    data[x].append(stuff[x][i])
-    
+        for e in [''] + variants:
+            print("Loading", f, e, end='')
+            stuff = load_data_sliding_window(load_persistent(f, e), e != '')
+            if stuff is not None:
+                dlen += len(stuff[0])
+                for x in range(3):
+                    for i in range(len(stuff[x])):
+                        data[x].append(stuff[x][i])
+            print('...', len(stuff[0]) if stuff is not None else 0)
+        
     for f in testfiles:
         if os.path.isdir(f) or f.endswith('.npy'):
             continue
-        print("Loading test",f)
+        # we don't load fake variants in test mode because they are fake!
+        print("Loading test", f, end='')
         stuff = load_data_sliding_window(load_persistent(f))
         if stuff is not None:
             tlen += len(stuff[0])
             for x in range(3):
                 for i in range(len(stuff[x])):
                     test[x].append(stuff[x][i])
+        print('...', len(stuff[0]) if stuff is not None else 0)
+            
     stuff = None
 
     if False: #if not do_not_test:
@@ -666,7 +720,7 @@ def train(opts:Any=None):
         model = build_model(data.shape)
         model.summary()
         model.compile(optimizer=keras.optimizers.AdamW(weight_decay=0.010), 
-                    loss=BinaryFocalCrossentropy(apply_class_balancing=True, alpha=0.67, gamma=2, label_smoothing=0.01), 
+                    loss=BinaryFocalCrossentropy(apply_class_balancing=True, alpha=0.667, gamma=2, label_smoothing=0.01), 
                     metrics=['accuracy'],
                     weighted_metrics=['accuracy', 'recall', 'precision'])
         model.save(model_path)
@@ -1131,3 +1185,24 @@ def eval(opts:Any):
             auc_str = f"{auc:.3f}" if not np.isnan(auc) else "n/a"
             print(f"{label:<10} {n:>7} {acc:>10.3f} {auc_str:>8}")
 
+        from sklearn.metrics import precision_recall_curve, f1_score, fbeta_score
+
+        # 1. Get predicted probabilities on a held-out validation set (not the one you train on)
+        probs = y_pred
+
+        # 2. Compute precision/recall at every possible threshold
+        precisions, recalls, thresholds = precision_recall_curve(y_true, probs)
+        # note: thresholds has len(precisions)-1 entries, precision_recall_curve appends
+        # a final (1,0) point with no corresponding threshold — drop it when zipping
+        precisions, recalls = precisions[:-1], recalls[:-1]
+
+        # 3. Pick threshold by whatever criterion matches your actual goal:
+
+        # (a) balance precision and recall exactly
+        idx = np.argmin(np.abs(precisions - recalls))
+
+        # (b) maximize F1 (equal weight to precision/recall)
+        idx = np.argmax( 2 * precisions * recalls / (precisions + recalls + 1e-12) )
+
+        best_threshold = thresholds[idx]
+        print(f"threshold={best_threshold:.4f} precision={precisions[idx]:.4f} recall={recalls[idx]:.4f}")
