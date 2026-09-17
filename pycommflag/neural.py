@@ -69,7 +69,7 @@ PATIENCE = floor(EPOCHS * .2)
 F         = 48 # TCN filter count
 K         = 5  # TCN kernel size
 DILATIONS = [1, 2, 4, 8] # TCN dilation schedule
-DROPOUT   = 0.25
+DROPOUT   = 0.3
 START_DROP= 0.15
 TCN_DROP  = 0.25
 
@@ -136,7 +136,7 @@ def build_model(input_shape=(121, 21)):
 
     x = layers.Concatenate()([x, maxp, avgp])
 
-    x = layers.Dense(4*F, "relu", name="classifier")(x)
+    x = layers.Dense(5*F, "relu", name="classifier")(x)
     x = layers.Dropout(DROPOUT)(x)
 
     outputs = layers.Dense(1, activation="sigmoid", name="output")(x)
