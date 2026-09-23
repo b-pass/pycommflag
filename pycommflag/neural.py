@@ -38,20 +38,22 @@ LOGO_RUN = 10
 HAVE_LOGO = 11
 HAVE_RVOL = 12
 PERCTIME = 13
+BLANK_SINCE = 14
+BLANK_UNTIL = 15
 
-GENERATED_FEATURES_START = 14
-FVOL_MAX = 14
-FVOL_STDDEV = 15
-RVOL_MAX = 16
-RVOL_STDDEV = 17
-LOGO_RUN_MIN = 18
-DIFF_90TH = 19
-DIFF_MAX = 20
+GENERATED_FEATURES_START = 16
+FVOL_MAX = 16
+FVOL_STDDEV = 17
+RVOL_MAX = 18
+RVOL_STDDEV = 19
+LOGO_RUN_MIN = 20
+DIFF_90TH = 21
+DIFF_MAX = 22
 
-FEATURE_WIDTH = 21
-TIMESTAMPS = 21
-ANSWERS = 22
-WEIGHTS = 23
+FEATURE_WIDTH = 23
+TIMESTAMPS = 23
+ANSWERS = 24
+WEIGHTS = 25
 
 # data params, both for train and for inference
 WINDOW_BEFORE = 60
@@ -71,9 +73,9 @@ K         = 5  # TCN kernel size
 DILATIONS = [1, 2, 4, 8] # TCN dilation schedule
 DROPOUT   = 0.25
 START_DROP= 0.15
-TCN_DROP  = 0.25
+TCN_DROP  = 0.2
 
-def build_model(input_shape=(121, 21)):
+def build_model(input_shape=(121, 23)):
     global MTYPE
     MTYPE = 'tcn'
 
@@ -84,9 +86,10 @@ def build_model(input_shape=(121, 21)):
     inputs = Input(shape=input_shape[-2:], dtype='float32', name="input")
 
     # some features are unreliable ...
-    x = layers.SpatialDropout1D(START_DROP)(inputs)
+    x = layers.BatchNormalization(center=False, scale=False, name="input_norm")(inputs)
+    x = layers.SpatialDropout1D(START_DROP)(x)
 
-    x = layers.Dense(F, name="projection")(x)
+    x = layers.Dense(F, use_bias=False, name="projection")(x)
     x = layers.BatchNormalization()(x)
     x = layers.Activation("relu")(x)
 
@@ -98,6 +101,7 @@ def build_model(input_shape=(121, 21)):
         x = layers.Conv1D(F, K,
                           padding="same",
                           dilation_rate=dilation_rate,
+                          use_bias=False,
                           name=f"{name_prefix}_conv1")(x)
         x = layers.BatchNormalization(name=f"{name_prefix}_ln1")(x)
         x = layers.Activation("swish", name=f"{name_prefix}_act1")(x)
@@ -106,6 +110,7 @@ def build_model(input_shape=(121, 21)):
         x = layers.Conv1D(F, K,
                           padding="same",
                           dilation_rate=dilation_rate,
+                          use_bias=False,
                           name=f"{name_prefix}_conv2")(x)
         x = layers.BatchNormalization(name=f"{name_prefix}_ln2")(x)
         x = layers.Activation("swish", name=f"{name_prefix}_act2")(x)
@@ -126,15 +131,16 @@ def build_model(input_shape=(121, 21)):
 
         x = layers.Add(name=f"{name_prefix}_res")([x, residual])
 
+    orig = x
     maxp = layers.GlobalMaxPooling1D()(x)
     avgp = layers.GlobalAveragePooling1D()(x)
-    # use light attention to focus on a few slices instead of forcing just [60]
-    attn = layers.Dense(1, use_bias=False)(x) #attn = layers.Conv1D(1, 1, use_bias=False)(x)
+    # use light attention to focus on a few important slices
+    attn = layers.Dense(1, use_bias=False)(x)
     attn = layers.Softmax(axis=1, name="attn")(attn)
     x = layers.Dot(axes=1)([x,attn])
     x = layers.Flatten()(x)
 
-    x = layers.Concatenate()([x, maxp, avgp])
+    x = layers.Concatenate()([x, maxp, avgp, orig[:,60,:]])
 
     x = layers.Dense(4*F, "relu", name="classifier")(x)
     x = layers.Dropout(DROPOUT)(x)
@@ -233,6 +239,8 @@ def condense(frames: np.ndarray, timestamps: np.ndarray, answers: np.ndarray, we
         for x in (LOGO_RUN, HAVE_LOGO, HAVE_RVOL):
             res.append(a[:, a.shape[1]-1, x]) # end of the logo run feature
         res.append(a[:, a.shape[1]//2, PERCTIME]) # middle percentage timestamp
+        for x in (BLANK_SINCE, BLANK_UNTIL):
+            res.append(a[:, a.shape[1]//2, x]) # blank distance, from this sample's own centre
 
         assert(len(res) == GENERATED_FEATURES_START)
         
@@ -246,7 +254,11 @@ def condense(frames: np.ndarray, timestamps: np.ndarray, answers: np.ndarray, we
         assert(len(res) == FEATURE_WIDTH)
 
         res.append(atimestamps[:, a.shape[1]//2]) # center timestamp
-        res.append(np.max(aanswers, axis=1)) # answer
+        # the answer belongs to the centre frame, the same one the timestamp above refers to.
+        # np.max() here instead used to label the whole second commercial if ANY frame in it
+        # was, which widened every break outward by up to a second and put a label on the
+        # sample that contradicted its own timestamp.
+        res.append(aanswers[:, a.shape[1]//2]) # answer
         res.append(np.where( (aweights < 0.1).any(axis=1), 0, np.max(aweights, axis=1) )) # weight (unless there's a zero in there)
         
         #res = [np.average(a[:, :, 0:6], axis=1)] + [x.reshape(x.shape[0], 1) for x in res] + [np.average(a[:, :, 6:], axis=1)]
@@ -399,6 +411,24 @@ def load_nonpersistent(flog:dict, for_training=False, no_logo=False, no_blanks=F
     assert(frames.shape[-1] == PERCTIME)
     frames = np.append(frames, (frames[:,NORMTIME]/endtime)[:,np.newaxis], axis=1)
 
+    # add columns for the time to the nearest blank frame, looking back and looking forward.
+    # A blank run is the canonical break marker, but averaged over a second it is a 2-frame
+    # blip worth 0.07 in the BLANK column, which is far too faint to be much use.  The same
+    # information as a distance is one of the strongest signals in the log.
+    assert(frames.shape[-1] == BLANK_SINCE)
+    btimes = timestamps[frames[:, BLANK] > 0.5]
+    if len(btimes):
+        j = np.searchsorted(btimes, timestamps, 'right')
+        since = np.where(j > 0, timestamps - btimes[np.clip(j-1, 0, len(btimes)-1)], 300.0)
+        k = np.searchsorted(btimes, timestamps, 'left')
+        until = np.where(k < len(btimes), btimes[np.clip(k, 0, len(btimes)-1)] - timestamps, 300.0)
+    else:
+        # no blanks at all (or --no-blanks), so everything is maximally far from one
+        since = until = np.full(len(frames), 300.0, dtype='float32')
+    for d in (since, until):
+        frames = np.append(frames, np.clip(d/300.0, 0, 1.0).astype('float32')[:,np.newaxis], axis=1)
+    assert(frames.shape[-1] == GENERATED_FEATURES_START)
+
     # change the first column to be normalized timestamps (30 minute segments)
     frames[:,NORMTIME] = (frames[:,NORMTIME] % 1800.0) / 1800.0
 
@@ -498,10 +528,19 @@ def load_persistent(flogname:str,extrname=''):
         #gc.collect()
 
     try:
-        return np.load(fname + extrname +'.data.npy', mmap_mode='r')
+        d = np.load(fname + extrname +'.data.npy', mmap_mode='r')
     except FileNotFoundError as e:
         print(e)
         return None
+
+    # a cache written against an older feature layout has the right dtype and the wrong
+    # columns, so it would read back as plausible garbage instead of failing.  Refuse it.
+    if d.shape[-1] != WEIGHTS+1:
+        print(f"{fname + extrname}.data.npy has {d.shape[-1]} columns, expected {WEIGHTS+1} "
+              f"(stale feature layout) -- delete the .data.npy files and let them rebuild")
+        return None
+
+    return d
 
 def make_data_generator(*args, **kwargs):
     from keras.utils import Sequence
@@ -1027,16 +1066,7 @@ def eval(opts:Any):
     total_time = 0
     all_missing = {}
     all_extra = {}
-    # the same thing again with the break length limits lifted.  post_predict deletes any
-    # break under break_min_len and truncates any over break_max_len, so a recording whose
-    # real breaks fall outside that window is scored wrong no matter what the model said.
-    # Keeping both numbers means the tuning knobs cannot quietly flatter or penalise a model.
-    import copy
-    unclamped = copy.copy(opts)
-    unclamped.break_min_len = 0
-    unclamped.break_max_len = float('inf')
-    all_missing_nc = {}
-    all_extra_nc = {}
+    
     y_pred = []
     y_true = []
     y_dist = []
@@ -1051,8 +1081,6 @@ def eval(opts:Any):
                     print(f"Layer Name: {layer.name} | Dropout Rate: {layer.rate}")
             all_missing[mf] = 0
             all_extra[mf] = 0
-            all_missing_nc[mf] = 0
-            all_extra_nc[mf] = 0
         except Exception as e:
             log.exception(f"Unable to load MODEL {mf}")
 
@@ -1118,15 +1146,7 @@ def eval(opts:Any):
                 all_missing[mf] += missing
                 all_extra[mf] += extra
 
-                # score the same prediction again without the length limits, so the number
-                # reflects the model rather than post_predict's tuning knobs
-                (m_nc,e_nc,_) = diff_tags(realtags, post_predict(flog, prediction, times, unclamped, spans=spans))
-                all_missing_nc[mf] += m_nc
-                all_extra_nc[mf] += e_nc
-                clamped = (missing+extra) - (m_nc+e_nc)
-
-                print(f'{f} @ {mf} -> Acc {round(acc,4)}% <- FN:{round(missing,3)} + FP:{round(extra,3)} = {round(missing+extra,3)} seconds WRONG'
-                      + (f'  [{round(clamped,3)}s of that is the break_min/max clamps]' if abs(clamped) > 0.5 else ''))
+                print(f'{f} @ {mf} -> Acc {round(acc,4)}% <- FN:{round(missing,3)} + FP:{round(extra,3)} = {round(missing+extra,3)} seconds WRONG')
                 #print(f,mf,model.evaluate(dataset_cat if model.output_shape[-1] > 1 else dataset_bin))
             except Exception as e:
                 log.exception(f"Unable to load MODEL {mf}")
@@ -1141,11 +1161,6 @@ def eval(opts:Any):
         acc = '%.5f %%' % ((total_time - total_wrong) * 100.0 / total_time,)
         print(f'{mf}: \t-{all_missing[mf]} \t+{all_extra[mf]} \t{total_wrong} \t{acc}')
 
-        # ... and the same model with break_min_len/break_max_len taken out of the picture
-        wrong_nc = all_extra_nc[mf] + all_missing_nc[mf]
-        acc_nc = '%.5f %%' % ((total_time - wrong_nc) * 100.0 / total_time,)
-        print(f'{" "*(len(mf)-8)}no-clamp: \t-{all_missing_nc[mf]} \t+{all_extra_nc[mf]} \t{wrong_nc} \t{acc_nc}'
-              f'\t({total_wrong - wrong_nc:+.1f}s from the clamps)')
     print()
     print()
 
