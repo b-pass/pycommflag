@@ -317,10 +317,16 @@ def load_nonpersistent(flog:dict, for_training=False, no_logo=False, no_blanks=F
             else:
                 i += 1
         
+        # a trailing DO_NOT_USE section gets cut off below, so "near the end of the recording"
+        # has to be measured against where the usable content really stops
+        useful_end = endtime
+        if tags[-1][0] in (SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value) and tags[-1][1][1]+10 >= endtime:
+            useful_end = min(endtime, tags[-1][1][0])
+
         i = 0
         while i < len(tags):
             clen = tags[i][1][1] - tags[i][1][0]
-            if clen < 10 and not (tags[i][1][1]+clen+10 >= endtime or tags[i][0] in [SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value]):
+            if clen < 10 and not (tags[i][1][1]+clen+10 >= useful_end or tags[i][0] in [SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value]):
                 # delete the tiny segment
                 del tags[i]
             else:
@@ -363,8 +369,8 @@ def load_nonpersistent(flog:dict, for_training=False, no_logo=False, no_blanks=F
     if no_blanks:
         frames[:, BLANK] = 0
     
-    # change the diff column to be normalized [0,30] -> [0,1]
-    frames[:,DIFF] = np.clip(frames[:,DIFF] / 30, 0, 1.0)
+    # change the diff column to be normalized [0,40+] -> [0,1]
+    frames[:,DIFF] = np.clip(frames[:,DIFF] / 40, 0, 1.0)
 
     # add a column for time since logo
     run = np.zeros((len(frames),1), dtype='float32')
@@ -400,7 +406,7 @@ def load_nonpersistent(flog:dict, for_training=False, no_logo=False, no_blanks=F
     weights = np.ones((frames.shape[0],1), dtype=np.float32)
 
     for (tt,(st,et)) in tags:
-        if type(tt) is not int: tt = tt.value
+        if isinstance(tt, SceneType): tt = tt.value
 
         si = np.searchsorted(timestamps, st)
         ei = np.searchsorted(timestamps, et)
