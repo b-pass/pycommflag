@@ -9,3 +9,7 @@ cf_*.json
 perf.data*
 data/
 models/
+data
+models
+.claude
+.vscode
