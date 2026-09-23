@@ -1138,18 +1138,24 @@ def eval(opts:Any):
         bin_labels = ["0-1s", "3s", "4s", "5s", "5-10s", "10-15s", "15-30s", "30-45s", "45-60s", "60+s"]
         bucket_idx = np.digitize(y_dist, bin_edges) - 1  # 0-indexed bucket per example
         def auc_score(y_true, y_prob):
-            pos = y_prob[y_true == 1]
-            neg = y_prob[y_true == 0]
-            if len(pos) == 0 or len(neg) == 0:
+            npos = int((y_true == 1).sum())
+            nneg = int((y_true == 0).sum())
+            if npos == 0 or nneg == 0:
                 return np.nan
-            # count pairs where positive score > negative score (ties count as 0.5)
-            diff = pos[:, None] - neg[None, :]
-            return (np.sum(diff > 0) + 0.5 * np.sum(diff == 0)) / (len(pos) * len(neg))
+            # Same statistic (Mann-Whitney U) from ranks instead of counting pairs one by one.
+            # The pairwise matrix this replaces was len(pos)*len(neg) -- 11.5 billion cells,
+            # ~54GB, for the 60+s bucket alone -- where ranks need a few arrays of len(y_prob).
+            order = np.argsort(y_prob, kind='mergesort')
+            s = y_prob[order]
+            start = np.concatenate(([0], np.flatnonzero(np.diff(s)) + 1))
+            end = np.concatenate((start[1:], [len(s)]))
+            # equal scores share their averaged rank, which is what counting them 0.5 did
+            ranks = np.empty(len(s), dtype='float64')
+            ranks[order] = np.repeat((start + end + 1) / 2.0, end - start)
+            return (ranks[y_true == 1].sum() - npos*(npos+1)/2) / (npos*nneg)
 
         print(f"{'bucket':<10} {'n':>7} {'accuracy':>10} {'auc':>8}")
         for i, label in enumerate(bin_labels):
-            import gc
-            gc.collect()
             mask = bucket_idx == i
             n = mask.sum()
             if n == 0:
