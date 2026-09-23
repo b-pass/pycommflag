@@ -841,7 +841,7 @@ def predict(feature_log:str|TextIO|dict, opts:Any, write_log=None)->list:
     
     return results
 
-def post_predict(flog:dict, prediction, times, opts:Any, threshold=0.5):
+def post_predict(flog:dict, prediction, times, opts:Any, threshold=0.5, spans=None):
     duration = flog.get('duration', 0)
 
     results = [(0,(0,0))]
@@ -873,8 +873,11 @@ def post_predict(flog:dict, prediction, times, opts:Any, threshold=0.5):
         else:
             i += 1
 
-    spans = processor.read_feature_spans(flog, 'diff', 'blank')
-    
+    # callers that already have these (eval) can hand them over; scanning every frame again
+    # is the expensive part of this function
+    if spans is None:
+        spans = processor.read_feature_spans(flog, 'diff', 'blank')
+
     results = _adjust_tags(results, spans.get('blank', []), spans.get('diff', []))
     i = 1
     while i < len(results):
@@ -1024,10 +1027,20 @@ def eval(opts:Any):
     total_time = 0
     all_missing = {}
     all_extra = {}
+    # the same thing again with the break length limits lifted.  post_predict deletes any
+    # break under break_min_len and truncates any over break_max_len, so a recording whose
+    # real breaks fall outside that window is scored wrong no matter what the model said.
+    # Keeping both numbers means the tuning knobs cannot quietly flatter or penalise a model.
+    import copy
+    unclamped = copy.copy(opts)
+    unclamped.break_min_len = 0
+    unclamped.break_max_len = float('inf')
+    all_missing_nc = {}
+    all_extra_nc = {}
     y_pred = []
     y_true = []
     y_dist = []
-    
+
     for mf in opts.eval:
         try:
             models[mf] = keras.models.load_model(mf)
@@ -1038,6 +1051,8 @@ def eval(opts:Any):
                     print(f"Layer Name: {layer.name} | Dropout Rate: {layer.rate}")
             all_missing[mf] = 0
             all_extra[mf] = 0
+            all_missing_nc[mf] = 0
+            all_extra_nc[mf] = 0
         except Exception as e:
             log.exception(f"Unable to load MODEL {mf}")
 
@@ -1094,15 +1109,24 @@ def eval(opts:Any):
                 
                 prediction = model.predict(make_data_generator(data), verbose=True)
                 
-                result = post_predict(flog, prediction, times, opts) #, threshold=best[0])
+                result = post_predict(flog, prediction, times, opts, spans=spans) #, threshold=best[0])
 
                 y_pred += prediction.flatten().tolist()
 
                 (missing,extra,_) = diff_tags(realtags, result)
                 acc = 100 - 100*(missing+extra)/duration
-                print(f'{f} @ {mf} -> Acc {round(acc,4)}% <- FN:{round(missing,3)} + FP:{round(extra,3)} = {round(missing+extra,3)} seconds WRONG')
                 all_missing[mf] += missing
                 all_extra[mf] += extra
+
+                # score the same prediction again without the length limits, so the number
+                # reflects the model rather than post_predict's tuning knobs
+                (m_nc,e_nc,_) = diff_tags(realtags, post_predict(flog, prediction, times, unclamped, spans=spans))
+                all_missing_nc[mf] += m_nc
+                all_extra_nc[mf] += e_nc
+                clamped = (missing+extra) - (m_nc+e_nc)
+
+                print(f'{f} @ {mf} -> Acc {round(acc,4)}% <- FN:{round(missing,3)} + FP:{round(extra,3)} = {round(missing+extra,3)} seconds WRONG'
+                      + (f'  [{round(clamped,3)}s of that is the break_min/max clamps]' if abs(clamped) > 0.5 else ''))
                 #print(f,mf,model.evaluate(dataset_cat if model.output_shape[-1] > 1 else dataset_bin))
             except Exception as e:
                 log.exception(f"Unable to load MODEL {mf}")
@@ -1116,6 +1140,12 @@ def eval(opts:Any):
         total_wrong = all_extra[mf] + all_missing[mf]
         acc = '%.5f %%' % ((total_time - total_wrong) * 100.0 / total_time,)
         print(f'{mf}: \t-{all_missing[mf]} \t+{all_extra[mf]} \t{total_wrong} \t{acc}')
+
+        # ... and the same model with break_min_len/break_max_len taken out of the picture
+        wrong_nc = all_extra_nc[mf] + all_missing_nc[mf]
+        acc_nc = '%.5f %%' % ((total_time - wrong_nc) * 100.0 / total_time,)
+        print(f'{" "*(len(mf)-8)}no-clamp: \t-{all_missing_nc[mf]} \t+{all_extra_nc[mf]} \t{wrong_nc} \t{acc_nc}'
+              f'\t({total_wrong - wrong_nc:+.1f}s from the clamps)')
     print()
     print()
 
