@@ -14,6 +14,9 @@ from .player import Player
 from .extern import ina_foss
 from .feature_span import *
 
+# the per-frame diff magnitude (frames[3]) above which we call it a scene change
+DIFF_THRESHOLD = 15.0
+
 def read_feature_log(feature_log_file:str|TextIO|dict) -> dict:
     if type(feature_log_file) is dict:
         return feature_log_file
@@ -481,12 +484,12 @@ def read_feature_spans(log:str|TextIO|dict, *spans) -> dict[str, list]:
     else:
         blankf = None
     
+    # per-frame magnitudes, not a span; callers apply DIFF_THRESHOLD themselves
     if 'diff' in spans:
-        difff = FeatureSpan()
-        difff.start(0,True)
+        diffs = []
     else:
-        difff = None
-    
+        diffs = None
+
     lasttime = 0
     lab = AudioSegmentLabel.SILENCE
 
@@ -502,8 +505,8 @@ def read_feature_spans(log:str|TextIO|dict, *spans) -> dict[str, list]:
             logof.add(lasttime,f[1])
         if blankf is not None:
             blankf.add(lasttime, f[2])
-        if difff is not None:
-            difff.add(lasttime, f[3] >= 15.0 or f[2])
+        if diffs is not None:
+            diffs.append((lasttime, f[3]))
         if volume is not None:
             volume.append((lasttime, f[4], f[5]))
         
@@ -519,9 +522,8 @@ def read_feature_spans(log:str|TextIO|dict, *spans) -> dict[str, list]:
     if blankf is not None:
         blankf.end(lasttime)
         result['blank'] = blankf.to_list()
-    if difff is not None:
-        difff.end(lasttime)
-        result['diff'] = difff.to_list()
+    if diffs is not None:
+        result['diff'] = diffs
     if audiof is not None:
         audiof.end(lasttime)
         result['audio'] = audiof.to_list()
