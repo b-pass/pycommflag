@@ -95,7 +95,7 @@ def run(opts) -> None|int:
             try:
                 old = flog.get('tags', [])
                 result = predict(flog, opts)
-                (missing,extra,all) = diff_tags(old, result)
+                (missing,extra,all) = diff_tags(old,result)
 
                 chng = ''
                 for (t,b,e) in all:

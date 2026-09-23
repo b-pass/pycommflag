@@ -69,7 +69,7 @@ PATIENCE = floor(EPOCHS * .2)
 F         = 48 # TCN filter count
 K         = 5  # TCN kernel size
 DILATIONS = [1, 2, 4, 8] # TCN dilation schedule
-DROPOUT   = 0.3
+DROPOUT   = 0.25
 START_DROP= 0.15
 TCN_DROP  = 0.25
 
@@ -136,7 +136,7 @@ def build_model(input_shape=(121, 21)):
 
     x = layers.Concatenate()([x, maxp, avgp])
 
-    x = layers.Dense(5*F, "relu", name="classifier")(x)
+    x = layers.Dense(4*F, "relu", name="classifier")(x)
     x = layers.Dropout(DROPOUT)(x)
 
     outputs = layers.Dense(1, activation="sigmoid", name="output")(x)
@@ -144,119 +144,77 @@ def build_model(input_shape=(121, 21)):
     return Model(inputs, outputs)
 
 
-def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]], 
-                 blanks: List[Tuple[bool, Tuple[float, float]]], 
-                 diffs: List[Tuple[float, Tuple[float, float]]]) \
+def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]],
+                 blanks: List[Tuple[bool, Tuple[float, float]]],
+                 diffvals: List[Tuple[float, float]]) \
         -> List[Tuple[int, Tuple[float, float]]]:
     """
     Adjust tag boundaries to align with scene transitions using blank frames and diff values.
     This is because the training data is supplied by humans, and might be off a couple frames.
-    Using this allows us to repeatably programmatically fine-tune tag locations whether 
+    Using this allows us to repeatably programmatically fine-tune tag locations whether
     supplied by humans or AI.
 
     Args:
         tags: List of (tag_type, (start_time, end_time))
         blanks: List of (is_blank, (start_time, end_time))
-        diffs: List of (diff_value, (start_time, end_time))
-    
+        diffvals: List of (time, diff_magnitude), one entry per frame
+
     Returns:
         Adjusted tags list with updated boundaries
     """
 
-    def find_highest_diff_boundary(target_time: float, 
-                                 search_window: float, 
-                                 diffs: List[Tuple[float, Tuple[float, float]]]) -> float:
-        # Find diffs within window
-        window_start = target_time - search_window
-        window_end = target_time + search_window
-        best = 0
-        when = None
+    # sorted candidate times, so each boundary is a binary search rather than a rescan
+    blank_mids = np.asarray([s + (e-s)/2 for is_blank,(s,e) in blanks if is_blank], dtype='float64')
+    diff_times = np.asarray([t for t,_ in diffvals], dtype='float64')
+    diff_mags = np.asarray([v for _,v in diffvals], dtype='float32')
 
-        for (val, (s,e)) in diffs:
-            time = s + (e-s)/2
-            if time < window_start or not val:
-                continue
-            if time > window_end:
-                break
-            if val > best:
-                best = val
-                when = time
-        
-        return when if when is not None else target_time
+    def align(when: float, max_distance: float) -> float:
+        # a nearby blank frame wins; being sorted, the closest one brackets `when`
+        i = np.searchsorted(blank_mids, when)
+        near = [m for m in blank_mids[max(i-1,0):i+1] if abs(m - when) < max_distance]
+        if near:
+            return float(min(near, key=lambda m: abs(m - when)))
 
-    def find_nearest_blank(target_time: float, 
-                         blanks: List[Tuple[bool, Tuple[float, float]]], 
-                         max_distance: float) -> float:
+        # no blank, so fall back to the frame with the largest visual change, which is the
+        # actual cut.  Windows holding no real cut are left alone, or we snap onto noise.
+        lo = np.searchsorted(diff_times, when - max_distance/2, 'left')
+        hi = np.searchsorted(diff_times, when + max_distance/2, 'right')
+        if hi > lo:
+            k = lo + int(np.argmax(diff_mags[lo:hi]))
+            if diff_mags[k] >= processor.DIFF_THRESHOLD:
+                return float(diff_times[k])
 
-        best = None
-        dist = max_distance
-        
-        for is_blank, (start, end) in blanks:
-            if not is_blank:
-                continue
+        return when
 
-            when = start + (end - start)/2
-            
-            if when > target_time + max_distance:
-                break
-
-            if abs(when - target_time) < dist:
-                dist = abs(when - target_time)
-                best = when
-        
-        return best if best is not None else target_time
-
-    # Process each tag
     filtered_tags = []
     prev_end = 0
     for tag_type, (start_time, end_time) in tags:
-        if start_time < prev_end:
-            start_time = prev_end
-            if end_time < start_time:
-                continue
-        
-        if tag_type in (SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value):
-            filtered_tags.append((tag_type, (max(start_time,prev_end), end_time)))
+        # tags may hold either SceneType members or their int values
+        tt = tag_type.value if isinstance(tag_type, SceneType) else tag_type
+
+        # tags never overlap, so one can only start where the previous ended
+        start_time = max(start_time, prev_end)
+        if end_time < start_time:
+            continue
+
+        if tt == SceneType.DO_NOT_USE.value:
+            filtered_tags.append((tag_type, (start_time, end_time)))
             prev_end = end_time
             continue
 
-        # Different max distances based on tag type
-        common_tag_types = (SceneType.SHOW, SceneType.SHOW.value, SceneType.COMMERCIAL, SceneType.COMMERCIAL.value)
-        max_distance = 5 if tag_type in common_tag_types else 2
-        
-        # First try to align with blank frames
-        new_start = find_nearest_blank(start_time, blanks, max_distance)
-        new_end = find_nearest_blank(end_time, blanks, max_distance)
-        
-        # If still at original positions, try aligning with diff boundaries
-        if new_start == start_time:
-            new_start = find_highest_diff_boundary(start_time, max_distance/2, diffs)
-            if new_start < prev_end:
-                new_start = prev_end
-        #    if new_start != start_time:
-        #        print(f"MOVED tag start {tag_type} from {start_time} {new_start}")
-        #else:
-        #    print(f"ALIGNED tag start {tag_type} from {start_time} {new_start}")
-        if new_end == end_time:
-            new_end = find_highest_diff_boundary(end_time, max_distance/2, diffs)
-            if new_end < prev_end:
-                new_end = prev_end
-        #    if new_end != end_time:
-        #        print(f"MOVED tag end {tag_type} from {end_time} {new_end}")
-        #else:
-        #    print(f"ALIGNED tag end {tag_type} from {end_time} {new_end}")
-        
-        # invalid after fine tuning, revert to original
-        #if new_start > new_end:
-        #    new_start = max(start_time, prev_end)
-        #    new_end = max(end_time, new_start)
-        # Only keep valid tags
+        # human show/commercial boundaries are looser than the rest, so search further
+        max_distance = 5 if tt in (SceneType.SHOW.value, SceneType.COMMERCIAL.value) else 2
+
+        # clamped, because alignment must not back up into the previous tag
+        new_start = max(align(start_time, max_distance), prev_end)
+        new_end = max(align(end_time, max_distance), prev_end)
+
+        # if both ends landed on the same blank, or they crossed, then there was never
+        # enough of a tag here to align in the first place, so drop it
         if new_start < new_end:
             filtered_tags.append((tag_type, (new_start, new_end)))
             prev_end = new_end
 
-    #print(tags)
-    #print(filtered_tags)
     return filtered_tags
 
 def condense(frames: np.ndarray, timestamps: np.ndarray, answers: np.ndarray, weights: np.ndarray, step: int) -> np.ndarray:
@@ -387,7 +345,7 @@ def load_nonpersistent(flog:dict, for_training=False, no_logo=False, no_blanks=F
     
     if tags and tags[0][0] in (SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value) and tags[0][1][0] <= 5:
         b = 0
-        while frames[b][0] < tags[0][1][1]:
+        while b < len(frames) and frames[b][0] < tags[0][1][1]:
             b += 1
         if b:
             del frames[:b]
@@ -507,6 +465,12 @@ def load_persistent(flogname:str,extrname=''):
     if not os.path.exists(fname + extrname + '.data.npy'):
         flog = processor.read_feature_log(flogname)
         condensed = load_nonpersistent(flog, True)
+        if condensed is None:
+            # nothing usable here (too short, etc).  Saving the None would write an
+            # object-dtype .npy which can never be memory-mapped back in, and the
+            # exists() check above would then stop us ever regenerating it.
+            print(f"{flogname} produced no usable data, skipping")
+            return None
         np.save(fname+'.data.npy', condensed)
         condensed = None
         gc.collect()
@@ -685,8 +649,8 @@ def load_data(opts, do_not_test=False) -> tuple:
     data = make_data_generator(*data)
     data.shuffle()
 
-    test = make_data_generator(*test) if test else None
-    
+    test = make_data_generator(*test) if test and test[0] else None
+
     return data,test
 
 def train(opts:Any=None):
@@ -956,14 +920,23 @@ def post_predict(flog:dict, prediction, times, opts:Any, threshold=0.5):
 def diff_tags(realtags, result) -> tuple[float,float,list]:
     # we create a list of tag pairs where they always exactly line up with boundaries in another list
     # this means we don't have to handle overlaps or tags spanning multiple other tags
+
+    # DO_NOT_USE regions have to come out of BOTH sides, using every DNU span from either list.
+    # Taking them from whichever list happens to be `splitlist` only filters one side, which
+    # leaves the two lists misaligned and trips the assert below.
+    dnu = sorted([(b,e) for (t,(b,e)) in list(realtags) + list(result)
+                  if t in (SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value)])
+
     def split_upon(inlist, splitlist):
+        # split on the other list's commercials and on every DNU span, so both sides end up
+        # with exactly the same boundaries
+        splits = sorted([(b,e) for (t,(b,e)) in splitlist
+                         if t in (SceneType.COMMERCIAL, SceneType.COMMERCIAL.value)] + dnu)
         sres = []
         for it,(ib,ie) in inlist:
             if it not in [SceneType.COMMERCIAL, SceneType.COMMERCIAL.value]:
                 continue
-            for st,(sb,se) in splitlist:
-                if st not in [SceneType.COMMERCIAL, SceneType.COMMERCIAL.value,SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value]:
-                    continue
+            for sb,se in splits:
                 if ib < sb and sb < ie:
                     sres.append( (ib,sb) )
                     ib = sb
@@ -974,14 +947,10 @@ def diff_tags(realtags, result) -> tuple[float,float,list]:
                     break
             if ib + 1/30 <= ie:
                 sres.append( (ib, ie) )
-        
-        for st,(sb,se) in splitlist:
-            if st in [SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value]:
-                for i in range(len(sres)):
-                    rb,re = sres[i]
-                    if rb < se and re > sb:
-                        del sres[i]
-                        break
+
+        # drop every segment overlapping a DNU span, not just the first one per span
+        sres = [(rb,re) for (rb,re) in sres
+                if not any(rb < se and re > sb for (sb,se) in dnu)]
 
         #print("SPLIT", inlist, "into", sres)
         return sres
@@ -1185,24 +1154,10 @@ def eval(opts:Any):
             auc_str = f"{auc:.3f}" if not np.isnan(auc) else "n/a"
             print(f"{label:<10} {n:>7} {acc:>10.3f} {auc_str:>8}")
 
-        from sklearn.metrics import precision_recall_curve, f1_score, fbeta_score
-
-        # 1. Get predicted probabilities on a held-out validation set (not the one you train on)
-        probs = y_pred
-
-        # 2. Compute precision/recall at every possible threshold
-        precisions, recalls, thresholds = precision_recall_curve(y_true, probs)
-        # note: thresholds has len(precisions)-1 entries, precision_recall_curve appends
-        # a final (1,0) point with no corresponding threshold — drop it when zipping
-        precisions, recalls = precisions[:-1], recalls[:-1]
-
-        # 3. Pick threshold by whatever criterion matches your actual goal:
-
-        # (a) balance precision and recall exactly
-        idx = np.argmin(np.abs(precisions - recalls))
-
-        # (b) maximize F1 (equal weight to precision/recall)
-        idx = np.argmax( 2 * precisions * recalls / (precisions + recalls + 1e-12) )
-
-        best_threshold = thresholds[idx]
-        print(f"threshold={best_threshold:.4f} precision={precisions[idx]:.4f} recall={recalls[idx]:.4f}")
+        #from sklearn.metrics import precision_recall_curve, f1_score, fbeta_score
+        #probs = y_pred
+        #precisions, recalls, thresholds = precision_recall_curve(y_true, probs)
+        #precisions, recalls = precisions[:-1], recalls[:-1]
+        ##idx = np.argmin(np.abs(precisions - recalls))
+        #idx = np.argmax( 2 * precisions * recalls / (precisions + recalls + 1e-12) )
+        #print(f"threshold={thresholds[idx]:.4f} precision={precisions[idx]:.4f} recall={recalls[idx]:.4f}")
