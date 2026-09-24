@@ -74,6 +74,22 @@ def get_filename(opts)->str|None:
     log.error(f"No mythtv recording found for {chanid}_{starttime}")
     return None
 
+# Returns (frame rate, duration in seconds); rate is None if the file can't be probed.
+def _probe_video(filename)->tuple[float|None,float]:
+    try:
+        with av.open(filename) as container:
+            try:
+                for f in container.decode(video=0):
+                    break
+            except Exception:
+                pass
+            duration = container.duration / av.time_base if container.duration else 0
+            rate = container.streams.video[0].average_rate
+            return (float(rate) if rate else None, duration)
+    except Exception:
+        log.exception(f"Could not probe '{filename}'")
+        return (None, 0)
+
 def get_breaks(chanid, starttime)->list[tuple[float,float]]:
     marks = []
     filename = None
@@ -87,24 +103,19 @@ def get_breaks(chanid, starttime)->list[tuple[float,float]]:
         if not filename:
             return []
         
-        rate = 29.97
-        with av.open(filename) as container:
-            try:
-                for f in container.decode(video=0):
-                    break
-            except:
-                pass
-            #duration = container.duration / av.time_base
-            rate = container.streams.video[0].average_rate
+        rate = _probe_video(filename)[0]
+        if not rate:
+            log.error(f"No frame rate for '{filename}', cannot convert mythtv marks to times")
+            return []
         
         c.execute("SELECT mark, type FROM recordedmarkup "\
                   "WHERE chanid = %s AND starttime = %s AND (type = 4 OR type = 5) "\
                   "ORDER BY mark ASC",
                   (chanid, starttime))
         for (m,t) in c.fetchall():
-            guess = 0
+            guess = None
             with conn.cursor() as tc:
-                tc.execute("SELECT `offset`,mark AS o FROM recordedseek "\
+                tc.execute("SELECT `offset`,mark FROM recordedseek "\
                            "WHERE chanid = %s and starttime = %s AND type = 33 "\
                            "ORDER BY ABS(CAST(mark AS SIGNED) - "+str(int(m))+") ASC "\
                            "LIMIT 1",
@@ -112,8 +123,8 @@ def get_breaks(chanid, starttime)->list[tuple[float,float]]:
                 for (o,om) in tc.fetchall():
                     guess = float(o)/1000 + (int(m) - int(om))/rate
                     break
-            if not guess and m >= 30:
-                guess = m/rate
+            if guess is None:
+                guess = int(m)/rate
             marks.append((guess,t))
         
         if not marks:
@@ -126,6 +137,27 @@ def get_breaks(chanid, starttime)->list[tuple[float,float]]:
         else:
             result[-1] = (result[-1][0], v)
     return result
+
+# MythTV stores commbreaks as frame numbers in its DB
+# Which is from like 1999
+# But we're using times instead.
+# MythTV stores the time associated with each keyframe in the DB as type 33.
+# So we find the frame number of the timestamp closest to the one we want and 
+# then use the frame rate to skip to the exact frame number we have flagged.
+# Recordings with no type 33 seek table at all just get the frame rate applied.
+def _frame_for_time(cursor, chanid, starttime, when, rate)->int:
+    cursor.execute("SELECT `offset`,mark FROM recordedseek "\
+                   "WHERE chanid = %s AND starttime = %s AND type = 33 "\
+                   "ORDER BY ABS(CAST(`offset` AS SIGNED) - "+str(int(when*1000))+") ASC "\
+                   "LIMIT 1",
+                   (chanid, starttime))
+    row = cursor.fetchone()
+    if row is None:
+        frame = round(when * rate)
+    else:
+        (o,m) = row
+        frame = int(m) + round((when - float(o)/1000) * rate)
+    return frame if frame > 0 else 0
 
 def set_breaks(opts, marks, flog=None)->bool:
     chanid = opts.chanid
@@ -146,55 +178,30 @@ def set_breaks(opts, marks, flog=None)->bool:
 
         nbreaks = 0
         rate = None
+        duration = 0
         if flog:
             rate = flog.get("frame_rate", None)
             duration = flog.get("duration", 0)
         if not rate:
-            with av.open(filename) as container:
-                try:
-                    for f in container.decode(video=0):
-                        break
-                except:
-                    pass
-                duration = container.duration / av.time_base
-                rate = container.streams.video[0].average_rate
+            (rate, duration) = _probe_video(filename)
+        if not rate:
+            log.error(f"No frame rate for '{filename}', cannot convert marks to frame numbers")
+            return False
+        rate = float(rate)
         
         c.execute("DELETE FROM recordedmarkup "\
-                  "WHERE chanid = %s AND starttime = %s AND (type = 2 OR type = 4 OR type = 5) ",
+                  "WHERE chanid = %s AND starttime = %s AND (type = 4 OR type = 5) ",
                   (chanid, starttime))
         
-        intro = None
-        cred_done = False
         for (st,(b,e)) in marks:
-            if type(st) is int:
-                st = SceneType(st)
+            if not isinstance(st, SceneType):
+                st = SceneType(int(st))
             if st == SceneType.DO_NOT_USE:
                 continue
             #print(st,b,e)
 
-            # MythTV stores commbreaks as frame numbers in its DB
-            # Which is from like 1999
-            # But we're using times instead.
-            # MythTV stores the time associated with each keyframe in the DB as type 33.
-            # So we find the frame number of the timestamp closest to the one we want and 
-            # then use the frame rate to skip to the exact frame number we have flagged.
-
-            c.execute("SELECT `offset`,mark FROM recordedseek "\
-                      "WHERE chanid = %s AND starttime = %s AND type = 33 "\
-                      "ORDER BY ABS(CAST(`offset` AS SIGNED) - "+str(int(b*1000))+") ASC "\
-                      "LIMIT 1",
-                      (chanid, starttime))
-            (o,m) = c.fetchone()
-            fb = int(m) + round((b - float(o)/1000) * rate)
-            if fb < 0: fb = 0
-
-            c.execute("SELECT `offset`,mark FROM recordedseek "\
-                      "WHERE chanid = %s AND starttime = %s AND type = 33 "\
-                      "ORDER BY ABS(CAST(`offset` AS SIGNED) - "+str(int(e*1000))+") ASC "\
-                      "LIMIT 1",
-                      (chanid, starttime))
-            (o,m) = c.fetchone()
-            fe = int(m) + round((e - o/1000) * rate)
+            fb = _frame_for_time(c, chanid, starttime, b, rate)
+            fe = _frame_for_time(c, chanid, starttime, e, rate)
             
             if fb >= fe: # sanity
                 continue
@@ -206,23 +213,8 @@ def set_breaks(opts, marks, flog=None)->bool:
                     c.execute("INSERT INTO recordedmarkup (chanid,starttime,mark,type) "\
                             "VALUES(%s,%s,%s,4),(%s,%s,%s,5);",
                             (chanid, starttime, fb, chanid, starttime, fe))
-                except Exception as e:
+                except Exception:
                     log.exception("error adding break segment")
-            elif st == SceneType.INTRO:
-                intro = (chanid, starttime,fe)
-            elif st == SceneType.CREDITS and not cred_done:
-                cred_done = True
-                log.debug(f".... {st} {fe} (B)")
-                c.execute("INSERT INTO recordedmarkup (chanid,starttime,mark,type) "\
-                          "VALUES(%s,%s,%s,2)",
-                          (chanid, starttime, fe))
-            else:
-                pass
-        
-        if intro is not None:
-            log.debug(f".... {SceneType.INTRO} {intro[2]} (B)")
-            c.execute("INSERT INTO recordedmarkup (chanid,starttime,mark,type) "\
-                        "VALUES(%s,%s,%s,2)", intro)
         
         c.execute("UPDATE recorded SET commflagged = %s "\
                   "WHERE chanid = %s AND starttime = %s", (1 if nbreaks else 0, chanid, starttime))
