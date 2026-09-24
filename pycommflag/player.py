@@ -234,88 +234,39 @@ class Player:
         return x
 
     def frames(self) -> iter:
-        good = 0
-        fail = 0
-        stuck = 0
+        rec = None
         last_pts = None
-        ovtp = self.vpts
+        good = 0
         packets = self.container.decode(**self.streams)
-        fix_audio = False
-        audio_stream = None
         while True:
             try:
                 frame = next(packets)
                 if frame is None: continue
-            except StopIteration:
-                break
-            except IndexError:
-                log.exception("IndexError during decode, ending iteration early")
-                break
-            except av.error.EOFError:
-                break
-            except av.error.PatchWelcomeError as wtf:
-                log.exception("unrecoverable AV error")
-                os._exit(134)
-            except (av.error.InvalidDataError,av.error.UndefinedError) as e:
-                fail += 1
-                vs = self._video_stream()
-                self.vpts += math.ceil( (1.0/self.frame_rate)/vs.time_base )
-                if fail%100 == 0:
-                    log.debug(f"InvalidDataError during decode -- seeking ahead #{fail}, from {ovtp} to {self.vpts}")
-                    if fail >= 500 and not fix_audio and 'audio' in self.streams:
-                        self.trouble = True
-                        fix_audio = True
-                        audio_stream = self.streams.pop('audio')
-                    if fail >= 2000:
-                        log.exception(f"Repeated InvalidDataError, skipped {fail} frames but found nothing good")
-                        if good >= self.frame_rate * 600:
-                            # put audio back before we go, the caller will keep using this Player
-                            if audio_stream is not None:
-                                self.streams['audio'] = audio_stream
-                            return
-                        else:
-                            os._exit(134)
-                    self._resync(self.vpts)
-                else:
-                    try:
-                        self.container.seek(self.vpts, stream=vs, any_frame=True, backward=(fail%2 == 0))
-                    except av.error.PermissionError as e:
-                        log.exception("seek permission error, bailing")
-                        break
+            except Exception as e:
+                rec, action = _Recovery.handle(rec, self, e, good, max_fail=2000, drop_audio_at=500)
+                if action is None:
+                    raise
+                if action is _Recovery.STOP:
+                    break
                 packets = self.container.decode(**self.streams)
                 continue
-            
+
             if type(frame) is av.AudioFrame:
                 self._queue_audio(frame)
             elif type(frame) is av.VideoFrame:
-                # NEVER go backwards, whether or not we are currently recovering. Seeking into
-                # a corrupt patch makes the decoder hand back one frame from AHEAD of the seek
-                # target and then replay a span from behind it. Letting that replay through
-                # drags self.vpts back to the pts that just failed, so the next error seeks to
-                # the same place, gets the same replay, and the whole thing cycles forever at
-                # zero net progress -- while feeding the caller duplicate frames. Dropping the
-                # replay keeps vpts ahead of the bad patch, so the next seek clears it.
-                src_pts = frame.pts
-                if src_pts is not None and last_pts is not None and src_pts <= last_pts:
-                    stuck += 1
-                    if stuck % 500 == 0:
-                        log.warning(f"dropped {stuck} out-of-order/replayed frames around pts {src_pts}")
-                    continue
-                if src_pts is not None:
-                    last_pts = src_pts
-                if fail:
-                    if fix_audio:
-                        fix_audio = False
-                        if audio_stream is not None:
-                            self.streams['audio'] = audio_stream
-                            audio_stream = None
-                            packets = self.container.decode(**self.streams)
+                if frame.pts is not None:
+                    if last_pts is not None and frame.pts <= last_pts:
+                        continue # require monotonic pts
+                    last_pts = frame.pts
+                
+                if rec is not None:
+                    if rec.restore_audio():
+                        packets = self.container.decode(**self.streams)
                     if self.graph:
                         self._create_graph()
-                    log.info(f"Resync'd to {float(self.vpts*self.vtime_base)} after {fail} skipped/dropped/corrupt/whatever frames")
-                    fail = 0
-                    stuck = 0
-                
+                    rec.done()
+                    rec = None
+
                 if self.graph:
                     self.graph.push(frame)
                     try:
@@ -328,9 +279,9 @@ class Player:
                     self.vpts = frame.pts
                 good += 1
                 yield frame
-        
+
         return #raise StopIteration()
-    
+
     def frames_stride(self, skip) -> iter:
         if self.graph or 'audio' in self.streams:
             count = 0
@@ -339,11 +290,9 @@ class Player:
                     yield frame
                 count += 1
             return
-        
-        fail = 0
-        stuck = 0
+
+        rec = None
         last_pts = None
-        ovtp = self.vpts
         packets = self.container.demux(**self.streams)
         to_skip = 0
         while True:
@@ -356,54 +305,126 @@ class Player:
                     to_skip -= len(pkt.decode()) if pkt.is_keyframe else 1
                     continue
                 frames = pkt.decode()
-                #print("decoded",len(frames),to_skip,skip)
                 if not frames:
                     continue
                 # countdown rather than a modulo so a multi-frame packet can't step over
                 # the next sample point and make the stride uneven
                 to_skip = skip - len(frames)
                 frame = frames[0]
-            except StopIteration:
-                break
-            except av.error.EOFError:
-                break
-            except av.error.PatchWelcomeError as wtf:
-                log.exception("unrecoverable AV error")
-                os._exit(134)
-            except (av.error.InvalidDataError,av.error.UndefinedError) as e:
-                fail += 1
-                vs = self._video_stream()
-                self.vpts += math.ceil( (1.0/self.frame_rate)/vs.time_base )
-                if fail%100 == 0:
-                    #log.debug(f"InvalidDataError during decode -- seeking ahead #{fail}, from {ovtp} to {self.vpts}")
-                    if fail >= 500:
-                        log.exception(f"Repeated InvalidDataError, skipped {fail} frames but found nothing good")
-                        return
-                    self._resync(self.vpts)
-                else:
-                    try:
-                        self.container.seek(self.vpts, stream=vs, any_frame=True, backward=(fail%2 == 0))
-                    except av.error.PermissionError as e:
-                        log.exception("seek permission error, bailing")
-                        break
+            except Exception as e:
+                rec, action = _Recovery.handle(rec, self, e, max_fail=500)
+                if action is None:
+                    raise
+                if action is _Recovery.STOP:
+                    break
                 packets = self.container.demux(**self.streams)
                 continue
-            
-            # same no-progress trap as frames(), and same unconditional fix
-            if frame.pts is not None and last_pts is not None and frame.pts <= last_pts:
-                stuck += 1
-                if stuck % 500 == 0:
-                    log.warning(f"dropped {stuck} out-of-order/replayed packets around pts {frame.pts}")
-                continue
-            if fail:
-                log.info(f"Resync'd to {float(self.vpts*self.vtime_base)} after {fail} skipped/dropped/corrupt/whatever packets")
-                fail = 0
-                stuck = 0
-        
+
+            if frame.pts is not None:
+                if last_pts is not None and frame.pts <= last_pts:
+                    to_skip = 0
+                    continue # require monotonic pts
+                last_pts = frame.pts
+
+            if rec is not None:
+                rec.done()
+                rec = None
+
             if type(frame) is av.VideoFrame:
                 if frame.pts is not None:
                     self.vpts = frame.pts
-                    last_pts = frame.pts
                 yield frame
-        
+
         return #raise StopIteration()
+
+class _Recovery:
+    """
+    Shared decode/demux error recovery for Player.frames() and Player.frames_stride().
+
+    One of these exists only while decoding is broken. The callers keep it in a variable that
+    is None the rest of the time, so `rec is not None` IS the "we are in the failure path"
+    flag -- there is no separate counter to consult. handle() creates it on the first failure
+    and clears it on give-up; the caller clears it once a usable item comes back.
+    """
+
+    STOP = 'stop'          # iteration is over, break out
+    REBUILD = 'rebuild'    # repositioned; rebuild the iterator and keep going
+
+    def __init__(self, player, max_fail, drop_audio_at=None):
+        self.p = player
+        self.max_fail = max_fail           # give up after this many consecutive failures
+        self.drop_audio_at = drop_audio_at # try without audio past this many (None = never)
+        self.count = 0                     # failures in THIS episode; drives the escalation
+        self.start_vpts = player.vpts
+        self._audio_stream = None
+
+    @classmethod
+    def handle(cls, rec, player, e, good=None, **opts):
+        """Classify an exception off a libav iterator and act on it.
+
+        `rec` is the caller's current recovery or None. Returns (rec, action):
+          action is None    -> not ours, the caller should bare-`raise`
+          action is STOP    -> iteration is over, break (returned rec is None)
+          action is REBUILD -> repositioned, rebuild the iterator and continue
+        """
+        if isinstance(e, (StopIteration, av.error.EOFError)):
+            action = cls.STOP
+        elif isinstance(e, IndexError):
+            log.exception(f"IndexError during decode, ending iteration early")
+            action = cls.STOP
+        elif isinstance(e, av.error.PatchWelcomeError):
+            log.exception("unrecoverable AV error")
+            os._exit(134)
+        elif isinstance(e, (av.error.InvalidDataError, av.error.UndefinedError)):
+            if rec is None:
+                rec = cls(player, **opts)
+            action = rec._reposition(good)
+        else:
+            return rec, None
+        if action is cls.STOP and rec is not None:
+            # we are leaving mid-recovery, put audio back for whoever uses this Player next
+            rec.restore_audio()
+            rec = None
+        return rec, action
+
+    def _reposition(self, good):
+        """Step past one frame of damage, escalating if this keeps happening."""
+        p = self.p
+        self.count += 1
+        vs = p._video_stream()
+        p.vpts += math.ceil( (1.0/p.frame_rate)/vs.time_base )
+        if self.count % 100 == 0:
+            log.debug(f"InvalidDataError during decode -- seeking ahead #{self.count}, "
+                      f"from {self.start_vpts} to {p.vpts}")
+            # most InvalidDataErrors seem to come from audio, so try without it for a while
+            if self.drop_audio_at is not None and self.count >= self.drop_audio_at \
+                    and self._audio_stream is None and 'audio' in p.streams:
+                p.trouble = True
+                self._audio_stream = p.streams.pop('audio')
+            if self.count >= self.max_fail:
+                log.error(f"Repeated InvalidDataError, skipped {self.count} things but found nothing good")
+                # good is None when the caller has no frame count to judge by (frames_stride):
+                # give up quietly rather than taking the whole process down
+                if good is not None and good < p.frame_rate * 300:
+                    os._exit(134)
+                return self.STOP
+            p._resync(p.vpts)
+        else:
+            try:
+                p.container.seek(p.vpts, stream=vs, any_frame=True, backward=(self.count % 2 == 0))
+            except av.error.PermissionError:
+                log.exception("seek permission error, bailing")
+                return self.STOP
+        return self.REBUILD
+
+    def restore_audio(self):
+        """Put the audio stream back if we dropped it. True means rebuild the iterator."""
+        if self._audio_stream is None:
+            return False
+        self.p.streams['audio'] = self._audio_stream
+        self._audio_stream = None
+        return True
+
+    def done(self):
+        """A usable item finally arrived; log it. The caller then drops this object."""
+        log.info(f"Resync'd to {float(self.p.vpts*self.p.vtime_base)} after {self.count} skipped/dropped/corrupt/whatever frames/packets")
