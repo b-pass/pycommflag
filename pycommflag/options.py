@@ -1,5 +1,6 @@
 import argparse
 import os
+from enum import Enum
 
 # todo: automatically gz/ungz the feaature logs
 
@@ -36,7 +37,6 @@ def get_options():
                     help="How many video frames per-second to use across the full length of video to find the logo")
     #logo.add_argument('--check-blanks', dest="blanks_check_logo", action="store_true",
     #                help="Include logo area when checking for blank frames (tends towards not marking frames blank if they have logo)")
-    parser.add_argument_group(logo)
 
     ml = parser.add_argument_group('Machine Learning')
     ml.add_argument('-t', '--train', dest="train", action='store_true', 
@@ -51,7 +51,6 @@ def get_options():
                   help="Path to model to use for inference/prediction")
     ml.add_argument('--eval', dest="eval", nargs='+',
                   help="List of model files to evaluate against the supplied data")
-    parser.add_argument_group(ml)
     
     mcf = parser.add_argument_group('MythTV Options', description="Commandline compatibility with mythcommflag")
     mcf.add_argument('--chanid', dest='chanid', type=int, 
@@ -73,7 +72,6 @@ def get_options():
     #                help="Write flagging output to mythtv database even though --chanid and --starttime were not specified")
     #mcf.add_argument('--no-mythtv-out', dest="no_mythtv_output", action="store_true",
     #                help="Do NOT write flagging output to mythtv database even though --chanid and --starttime were specified")
-    parser.add_argument_group(mcf)
 
     tune = parser.add_argument_group('Fine Tuning')
     tune.add_argument('--break-max-len', dest="break_max_len", type=int, default=335,
@@ -82,9 +80,38 @@ def get_options():
                       help="Shortest allowed commercial break (in seconds)")
     tune.add_argument('--show-min-len', dest="show_min_len", type=int, default=59,
                       help="Shortest allowed show segment (in seconds)")
-    parser.add_argument_group(tune)
 
     return parser
+
+class Mode(str, Enum):
+    """What the program was actually asked to do.
+
+    Derived from the flags rather than parsed directly: mythcommflag compatibility
+    means everything has to stay a flat option, so there are no subparsers.
+    """
+    PASSTHROUGH = 'passthrough'  # --rebuild/--queue, which just exec mythcommflag
+    TRAIN = 'train'
+    REPROCESS = 'reprocess'
+    EVAL = 'eval'
+    GUI = 'gui'
+    FLAG = 'flag'                # the default: extract features and predict
+
+
+def resolve_mode(cfg) -> Mode:
+    # order matters; these flags are not mutually exclusive and this is the
+    # precedence the dispatcher has always used
+    if cfg.rebuild or cfg.queue:
+        return Mode.PASSTHROUGH
+    if cfg.train:
+        return Mode.TRAIN
+    if cfg.reprocess:
+        return Mode.REPROCESS
+    if cfg.eval:
+        return Mode.EVAL
+    if cfg.gui:
+        return Mode.GUI
+    return Mode.FLAG
+
 
 def parse_yaml(filename:str):
     class Options(dict):
@@ -107,6 +134,8 @@ def parse_argv():
     if cfg.yaml:
         for (k,v) in parse_yaml(cfg.yaml).items():
             setattr(cfg, k, v)
+
+    cfg.mode = resolve_mode(cfg)
 
     log.basicConfig(encoding='utf-8', 
                     level=log.getLevelName((cfg.loglevel or 'debug').upper()),
