@@ -14,9 +14,6 @@ from .player import Player
 from .extern import ina_foss
 from .feature_span import *
 
-# the per-frame diff magnitude (frames[3]) above which we call it a scene change
-DIFF_THRESHOLD = 15.0
-
 def read_feature_log(feature_log_file:str|TextIO|dict) -> dict:
     if type(feature_log_file) is dict:
         return feature_log_file
@@ -45,12 +42,14 @@ def write_feature_log(flog:dict, log_file:str|TextIO):
             return json.JSONEncoder.default(self, obj)
         
     if type(log_file) is str:
+        log_path = log_file
         if log_file.endswith('.gz'):
             import gzip
             log_file = gzip.open(log_file, 'wt')
         else:
             log_file = open(log_file, 'w+')
-        try: os.chmod(log_file, 0o666)
+        # chmod the path, not the handle we just rebound over it
+        try: os.chmod(log_path, 0o666)
         except: pass
     else:
         log_file.seek(0)
@@ -94,12 +93,14 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
         player.seek(0)
     
     if type(feature_log) is str:
+        log_path = feature_log
         if feature_log.endswith('.gz'):
             import gzip
             feature_log = gzip.open(feature_log, 'wt')
         else:
             feature_log = open(feature_log, 'w+')
-        try: os.chmod(feature_log, 0o666)
+        # chmod the path, not the handle we just rebound over it
+        try: os.chmod(log_path, 0o666)
         except: pass
     else:
         feature_log.seek(0)
@@ -107,10 +108,13 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
 
     feature_log.write('{ "file_version":10')
 
-    if opts.chanid: feature_log.write(f',\n"chanid":"{opts.chanid}"')
-    if opts.starttime: feature_log.write(f',\n"starttime":"{opts.starttime}"')
+    # these go through json.dumps because a " or \ in the value would otherwise
+    # produce a log that cannot be read back -- and we would not find out until after
+    # the whole extraction had run.
+    if opts.chanid: feature_log.write(f',\n"chanid":{json.dumps(str(opts.chanid))}')
+    if opts.starttime: feature_log.write(f',\n"starttime":{json.dumps(str(opts.starttime))}')
     try:
-        feature_log.write(f',\n"filename":"{os.path.realpath(opts.filename)}"')
+        feature_log.write(f',\n"filename":{json.dumps(os.path.realpath(opts.filename))}')
     except:
         pass
 
@@ -197,6 +201,11 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
     
     # normalize with the max volume of the whole recording
     vscale = np.max(np.array(audioProc.rms)[..., 1:3])
+    if not vscale > 0:
+        # no audio stream, or the whole recording is digital silence; dividing by this
+        # would put a NaN in every frame (which json writes out as a bare NaN literal)
+        log.warning('No audio volume in this recording; leaving the volume features at zero')
+        vscale = 1.0
     vit = iter(audioProc.rms)
     volume = next(vit, (player.duration,0,0))
 
@@ -309,17 +318,20 @@ class VideoProc(Thread):
         return ["time","logo_present","is_blank","diff"]
 
 def mean_axis1(fcolor:np.ndarray, dtype='uint8')->np.ndarray:
-    # the below code is equivalent to:
-    #    return fcolor.mean(axis=(1),dtype='float32').astype(dtype)
-    # but is almost TEN TIMES faster!
-    
-    # pick out the individual color channels by skipping by 3, and then average them
-    cr = fcolor[...,0::3].mean(axis=(1), dtype='uint32')
-    cg = fcolor[...,1::3].mean(axis=(1), dtype='uint32')
-    cb = fcolor[...,2::3].mean(axis=(1), dtype='uint32')
-    
+    # Per-row, per-channel mean of an (H, W, 3) rgb24 frame -> (H, 3), in R,G,B order.
+    # Equivalent to
+    #    fcolor.mean(axis=(1),dtype='float32').astype(dtype)
+    # but ~10x faster, because it accumulates in uint32 instead of float32.
+    # (Both truncate, and a float32 sum of W values <=255 is exact for any real frame
+    # width, so the two agree bit for bit -- not just approximately.)
+
+    # pick out the individual color channel planes and average each one down its row
+    cr = fcolor[...,0].mean(axis=1, dtype='uint32')
+    cg = fcolor[...,1].mean(axis=1, dtype='uint32')
+    cb = fcolor[...,2].mean(axis=1, dtype='uint32')
+
     # and now convert those stacks back into a 720x3
-    return np.stack((cb,cg,cr), axis=1).astype(dtype)
+    return np.stack((cr,cg,cb), axis=1).astype(dtype)
 
 class AudioProc(Thread):
     def __init__(self, volume_window=.05, work_rate=60.0):
@@ -484,7 +496,6 @@ def read_feature_spans(log:str|TextIO|dict, *spans) -> dict[str, list]:
     else:
         blankf = None
     
-    # per-frame magnitudes, not a span; callers apply DIFF_THRESHOLD themselves
     if 'diff' in spans:
         diffs = []
     else:

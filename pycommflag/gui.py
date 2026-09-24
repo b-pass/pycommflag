@@ -29,7 +29,7 @@ class Window(tk.Tk):
         # 'diff' arrives as per-frame magnitudes; the map row and the |< Diff / Diff >| buttons
         # want scene change marks, so threshold it into that shape here
         self.spans['diff'] = [(True, (t, t)) for (t, v) in self.spans.get('diff', [])
-                              if v >= processor.DIFF_THRESHOLD]
+                              if v >= neural.DIFF_THRESHOLD]
         self.raw = neural.raw_predict(flog, opts)
         tags = processor.read_tags(flog)
         if not tags or opts.reprocess:
