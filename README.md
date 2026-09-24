@@ -29,14 +29,16 @@ sorry, I am lazy and didn't make a setup.py yet.
 
 1. Clone the repo (or download a release)
 2. Put it somewhere
-3. Install the required python dependencies listed in `requirements.txt`
+3. Install the required python dependencies (Python 3.10+) listed in `requirements.txt`, either system-wide or into a virtualenv at `/path/to/pycommflag/venv` (`run.sh` activates it automatically)
 4. Put the installation in your PATH, such as by running `sudo ln -s /absolute/path/to/pycommflag/run.sh /usr/bin/pycommflag` to create a `pycommflag` command
 
 # Running
 
 ## Flagging commercials
 
-This repository includes an ML model trained on over 60 hand-curated recordings from a variety of channels (broadcast and cable) available in the United States in 2024.  You can download this model (`model.h5`) from github and place it in `/path/to/pycommflag/models/model.h5`.
+This repository includes an ML model trained on over 60 hand-curated recordings from a variety of channels (broadcast and cable) available in the United States in 2024.  You can download this model from github and place it in `/path/to/pycommflag/models/` as `model.keras` (older `model.h5` files are also accepted; `model.keras` is used first if both exist).  You can also point at a specific model with `--model /path/to/model.keras`.
+
+The first run will also download the inaSpeechSegmenter audio model (into `~/.keras/datasets/inaSpeechSegmenter`), so it needs network access once.
 
 Then simply run `pycommflag -f /path/to/video` and pycommflag will run.  Typical runtimes take about 15 minutes to flag a 1 hour recording.  But this will vary greatly depending on the hardware running pycommflag and on the codec of the recording.
 
@@ -66,7 +68,7 @@ Once you change this any schedule you have set to run commercial flagging will r
 
 If pycommflag gets a commercial wrong, the best way to fix it is to hand-curate a set of training data to train your own pycommflag model from your recordings.
 
-When you run pycommflag *without* the `--no-logs` command, it will generate a "feature log" in `/tmp` which contains everything about the recording that pycommflag discovered, and also the result of the pycommflag flagging.  You hand-curate a training set by running `pycommflag -g /tmp/something-to-curate.json`.  This will open a tk GUI that will show you the video, features pycommflag found, and options for changing the flagging that pycommflag has figured out.
+When you run pycommflag *without* the `--no-log` option, it will generate a "feature log" in `/tmp` which contains everything about the recording that pycommflag discovered, and also the result of the pycommflag flagging.  You hand-curate a training set by running `pycommflag -g /tmp/something-to-curate.json`.  This will open a tk GUI that will show you the video, features pycommflag found, and options for changing the flagging that pycommflag has figured out.
 
 (TODO: screen shots? button-by-button walk through?)
 
@@ -74,9 +76,13 @@ When you are done, press "Save and Exit" and pycommflag will update the json fil
 
 ## Training
 
-To train your own model, simply run `pycommflag -t --data /path/to/datafiles/*json`.  pycommflag will train a new model on your data.  Keep an eye on "val_categorical_accuracy", this is the most important measure of the success of the training process.  Anything less than 0.98 (98%) is a bad result. Also "val_categorical_accuracy" should be higher than "categorical_accuracy", if it is not then you do not have enough training data.
+To train your own model, run `pycommflag -t --data /path/to/training/*.json TEST /path/to/validation/*.json`.  Files listed after the literal word `TEST` are held out as the validation set; you need some there, since validation accuracy drives early stopping and picks the best epoch.  Keep an eye on "val_weighted_accuracy" during training, this is the most important measure of the success of the training process.  If the "val" accuracy is much lower than the training accuracy, you do not have enough (or varied enough) training data.
 
-After training is complete, pycommflag will save the results in `/path/to/pycommflag/models/` as `pycf.*stuff*.h5`.  The "stuff" includes the val_categorical_accuracy so you can see which training runs have produced useful output models.  When you have a model that you want to use for `pycommflag` flagging, you can either specify it on the commandline or move/link it to `model.h5` in the directory.
+The first time a feature log is used for training, pycommflag caches the pre-processed data next to it as `*.data.npy` and `*.nologo.data.npy`.  Delete these if you change the feature log (e.g. re-curate it in the GUI) or the feature code, otherwise the stale cache will be used.
+
+After training is complete, pycommflag evaluates the best epoch and, if its validation accuracy is at least 0.95, saves it in `/path/to/pycommflag/models/` (or `--models DIR`) as `pycf-*stuff*.keras`.  The "stuff" starts with the validation accuracy so you can see which training runs have produced useful output models.  When you have a model that you want to use for `pycommflag` flagging, you can either specify it on the commandline with `--model` or move/link it to `model.keras` in the models directory.
+
+To compare models, run `pycommflag --eval model1.keras model2.keras --data /path/to/curated/*.json`.
 
 ## Reprocessing
 
@@ -100,7 +106,7 @@ Features:
 - RMS audio peek (rolling 0.5s window) of the "main" and "surround" channels
 - And also the presence of all-black frames
 
-Each of these features is available for every frame of the video, and each frame and those around it are fed to a small recurrent neural network (LSTM).
+Each of these features is recorded for every frame of the video.  For inference they are condensed into one-second summaries, and a window of 60 seconds before and after each second is fed to a small temporal convolutional network (dilated 1D convolutions), which outputs the probability that the second is a commercial.  That is then smoothed into breaks using the `--break-min-len`, `--break-max-len`, and `--show-min-len` limits.
 
 Frame logs save these in a convienient json format, which is (usually) much less than 1% the size of the original video file.  That makes these files easy to keep around for training and experimentation.
 
