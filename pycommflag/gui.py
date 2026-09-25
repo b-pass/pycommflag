@@ -336,8 +336,9 @@ class Window(tk.Tk):
             if n == 2:
                 # stolen from processor
                 cmax = np.max(fcolor[int(fcolor.shape[0]*3/8):int(fcolor.shape[0]*5/8),int(fcolor.shape[1]*3/8):int(fcolor.shape[1]*5/8)])
-                bchk = logo_finder.subtract(fcolor, self.logo)
-                med = np.median(bchk, (0,1))
+                keep = logo_finder.keep_mask(fcolor.shape, self.logo)
+                bchk = fcolor if keep is None else fcolor[keep]
+                med = np.median(bchk, (0,1) if keep is None else 0)
                 frame_blank = max(med) < 26 and np.std(med) <= 3.1 and np.std(bchk) < 8
                 info += f'c-Max: {cmax} | Max: {max(med)}\nStdMed: {round(np.std(med),2)} | StdAll: {round(np.std(bchk),2)}\n'
                 info += ('Blank' if frame_blank else 'Not Blank')

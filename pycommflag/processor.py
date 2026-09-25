@@ -265,6 +265,8 @@ class VideoProc(Thread):
         self.prev_col = None
         self.lasttime = 0
         self.frames = []
+        self.keep = False  # False until the first frame tells us the frame size; then
+                           # a mask, or None when there is nothing to leave out
 
     def stop(self):
         self.queue.put(None)
@@ -302,11 +304,15 @@ class VideoProc(Thread):
         #print("at",frame.time-self.vt_start)
         #print("max=",x)
         if x < 45:
-            fcolor = logo_finder.subtract(fcolor, self.logo)
-            m = np.median(fcolor, (0,1))
-            #print("median=",m,"maxmediam=",max(m),"stdmedian=",np.std(m),"allstd=",np.std(fcolor))
-            frame_blank = max(m) < 24 and np.std(m) <= 3 and np.std(fcolor) < 8
-            fcolor = None
+            # the logo and any stuck overlay stay lit while the picture goes black, so
+            # leave those pixels out of the statistics rather than counting them
+            if self.keep is False:
+                self.keep = logo_finder.keep_mask(fcolor.shape, self.logo)
+            px = fcolor if self.keep is None else fcolor[self.keep]
+            m = np.median(px, (0,1) if self.keep is None else 0)
+            #print("median=",m,"maxmediam=",max(m),"stdmedian=",np.std(m),"allstd=",np.std(px))
+            frame_blank = max(m) < 24 and np.std(m) <= 3 and np.std(px) < 8
+            fcolor = px = None
         else:
             frame_blank = False
 
