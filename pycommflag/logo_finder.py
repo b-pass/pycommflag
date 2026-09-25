@@ -1,20 +1,127 @@
 from av.video import VideoFrame
-from scipy.ndimage import sobel as scipy_sobel
 import logging as log
 import math
 import numpy as np
+from scipy import ndimage
 from typing import Any, BinaryIO
 
 from .player import Player
 
 _LOGO_EDGE_THRESHOLD = 12 # minimum contrast step, in gray levels, to count as an edge
 
+_OVERSCAN = .03   # ignore this fraction of each side; signal artifacts live there
+
 def _edges(data:np.ndarray) -> np.ndarray:
     # re-cast so that sobel doesn't wrap the u8
     data = data.astype(np.float32, copy=False)
     # The /4 is the 3x3 kernel's gain for a step edge, which puts the result back on the input's scale -- a step of N gray levels comes out as N.
-    mag = np.hypot(scipy_sobel(data, 0), scipy_sobel(data, 1)) / 4
+    mag = np.hypot(ndimage.sobel(data, 0), ndimage.sobel(data, 1)) / 4
     return mag > _LOGO_EDGE_THRESHOLD
+
+def _blank_margins(a:np.ndarray, shape:tuple) -> np.ndarray:
+    """Zero the places neither a logo nor an alert banner can be.  In place.
+
+    The frame edges carry signal artifacts that the edge detector happily reports, and
+    they are persistent, so they have to go before anything else looks at the map.
+    """
+    # overscan, ignore 3% on each side -- sometimes there are signal artifacts here (which the edge det sees)
+    a[:math.ceil(shape[0]*_OVERSCAN)] = 0
+    a[-math.ceil(shape[0]*_OVERSCAN)-1:] = 0
+    a[..., 0:math.ceil(shape[1]*_OVERSCAN)] = 0
+    a[..., -math.ceil(shape[1]*_OVERSCAN)-1:] = 0
+
+    # no logos in the middle 1/3 of the screen -- and no alert banners either, they always
+    # sit near the top or the bottom
+    a[int(shape[0]/3):int(shape[0]*2/3),int(shape[1]/3):int(shape[1]*2/3)] = 0
+    return a
+
+def _find_stuck(persist:np.ndarray, shape:tuple) -> tuple[list, list]:
+    """Locate always-on overlays (weather alerts and the like) in a persistence map.
+
+    These are not solid graphics: typically a colored band with scrolling text, sometimes
+    with a static radar map on it.  Summed over the recording that leaves high-persistence
+    islands -- the band's edges, the radar -- separated by the moving-text gap, which is
+    only patchily persistent.  So finding them is two steps: grow each island to pick up
+    the soft skirt around it, then merge nearby islands to recover the band as a whole.
+
+    Returns (remove, report).  `remove` is what to erase before looking for a logo, where
+    being too generous is harmless.  `report` is what the blank-frame check should ignore,
+    where being too generous means throwing away real picture, so an implausibly large
+    region is dropped from it.
+    """
+    # A weather/alert overlay sits on screen through the commercial breaks, so it persists far
+    # longer than a logo (which can only be there while the show is).  Anything that persistent
+    # can't tell show from commercial, so it is removed whether it is an overlay or a logo on a
+    # commercial-free recording -- it is useless for flagging either way.
+    _STUCK_PERSIST   = .85  # at/above this fraction of frames, it isn't a usable logo
+    _STUCK_GROW      = .60  # follow each core's skirt down to here, where connected to it
+    _STUCK_GROW_PX   = 15   # ...and only this far, so growth can't run across the frame
+    _STUCK_MIN_PX    = 50   # ignore specks (dead pixels, encoder artifacts)
+    _STUCK_MERGE_GAP = .05  # join boxes within this fraction of frame height of each other
+    _STUCK_PAD       = 10    # px of slack on the final boxes
+    _STUCK_MAX_AREA  = .35  # a merged box larger than this is a detection failure, not an overlay
+
+    core = persist >= _STUCK_PERSIST
+    if not core.any():
+        return [], []
+
+    # Grow each core into its own skirt.  The skirt is contiguous with the core, so a
+    # geodesic dilation picks it up while a logo elsewhere is left alone; the iteration
+    # limit is what keeps it from crawling across a frame full of static scenery.
+    region = ndimage.binary_dilation(core, structure=np.ones((3,3), bool),
+                                     iterations=_STUCK_GROW_PX, mask=persist >= _STUCK_GROW)
+
+    labels, n = ndimage.label(region, structure=np.ones((3,3), bool))
+    boxes = []
+    for sl in ndimage.find_objects(labels):
+        if sl is None:
+            continue
+        ys, xs = sl
+        if np.count_nonzero(region[sl]) >= _STUCK_MIN_PX:
+            boxes.append([ys.start, xs.start, ys.stop, xs.stop])
+    if not boxes:
+        return [], []
+
+    # Merge the islands.  Two edges of one band are separated by the text gap, so anything
+    # within a fraction of the frame height belongs to the same overlay.
+    gap = max(1, int(shape[0] * _STUCK_MERGE_GAP))
+    merged = True
+    while merged:
+        merged = False
+        for i in range(len(boxes)):
+            for j in range(len(boxes)-1, i, -1):
+                a, b = boxes[i], boxes[j]
+                if (a[0]-gap < b[2] and b[0]-gap < a[2] and
+                    a[1]-gap < b[3] and b[1]-gap < a[3]):
+                    boxes[i] = [min(a[0],b[0]), min(a[1],b[1]), max(a[2],b[2]), max(a[3],b[3])]
+                    del boxes[j]
+                    merged = True
+
+    over_y = math.ceil(shape[0]*_OVERSCAN)
+    over_x = math.ceil(shape[1]*_OVERSCAN)
+    remove, report = [], []
+    for t, l, b, r in boxes:
+        t, l = max(0, t-_STUCK_PAD), max(0, l-_STUCK_PAD)
+        b, r = min(shape[0], b+_STUCK_PAD), min(shape[1], r+_STUCK_PAD)
+        # These bands often run right off the top or bottom of the picture, but the
+        # overscan margin was blanked before we ever saw it, so the outermost edge is
+        # missing from the map.  Anything that reaches the margin gets extended to meet it.
+        if t <= over_y: t = 0
+        if l <= over_x: l = 0
+        if b >= shape[0]-over_y: b = shape[0]
+        if r >= shape[1]-over_x: r = shape[1]
+
+        box = ((t,l),(b,r))
+        remove.append(box)
+        area = (b-t)*(r-l) / float(shape[0]*shape[1])
+        if area > _STUCK_MAX_AREA:
+            log.warning(f"Stuck region {box} covers {area*100:.0f}% of the frame; removing it "
+                        f"from the logo search but not from blank detection")
+        else:
+            report.append(box)
+        log.info(f"Stuck overlay at {box} ({area*100:.1f}% of frame), peak "
+                 f"{persist[t:b,l:r].max()*100:.0f}% persistent")
+    return remove, report
 
 def search(player:Player, opts:Any=None) -> tuple|None:
     player.disable_audio()
@@ -52,44 +159,24 @@ def _analyze(logo_sum:np.ndarray, fcount:int, shape:tuple) -> tuple|None:
     Split out of search() so the same decision logic can be re-run over an accumulation
     gathered at a different edge threshold, without decoding the video again.
     """
-    # overscan, ignore 3% on each side -- sometimes there are signal artifacts here (which the edge det sees)
-    logo_sum[:math.ceil(shape[0]*.03)] = 0
-    logo_sum[-math.ceil(shape[0]*.03)-1:] = 0
-    logo_sum[..., 0:math.ceil(shape[1]*.03)] = 0
-    logo_sum[..., -math.ceil(shape[1]*.03)-1:] = 0
+    if fcount < 1:
+        log.info("No logo found (no frames were sampled)")
+        return None
 
-    # no logos in the middle 1/3 of the screen
-    logo_sum[int(shape[0]/3):int(shape[0]*2/3),int(shape[1]/3):int(shape[1]*2/3)] = 0
+    _blank_margins(logo_sum, shape)
 
-    # in case we found something stuck on the screen, try to look beyond that
-    stuck = []
+    # Anything that never goes away is an overlay rather than a logo, so cut it out and
+    # look for the logo in what is left.  This also guarantees the peak below is under
+    # _STUCK_PERSIST, making the useful range a band: _analyze only ever returns a logo
+    # that is present for between half and 85% of the recording.
+    remove, stuck = _find_stuck(logo_sum / fcount, shape)
+    for (t,l),(b,r) in remove:
+        logo_sum[t:b, l:r] = 0
+
     best = np.max(logo_sum)
-    while best >= fcount*.94:
-        stuck_mask = logo_sum >= best*.95
-        
-        h = shape[0]//2
-        w = shape[1]//2
-        count = 0
-        t = 0
-        l = 0
-
-        for y in (0, h):
-            for x in (0, w):
-                c = np.count_nonzero(stuck_mask[y:y+h, x:x+w])
-                if c >= count:
-                    count = c
-                    t = y
-                    l = x
-        
-        log.info(f'Stuck logo ({best*100/fcount}%), concentrated at in quad {t},{l} with count={count}, NUKE IT')
-        logo_sum[t:t+h, l:l+w] = 0
-        
-        best = np.max(logo_sum)
-        log.debug(f'New best = {best*100/fcount}% of {fcount}')
-
     log.debug(f"Logo detection result: {best} ({round(best*100/fcount)}%)")
 
-    if best <= fcount*.5:
+    if best <= fcount*.55:
         log.info(f"No logo found (insufficient edge strength, best={best*100/fcount}%)")
         return None
     
@@ -238,11 +325,19 @@ def toimage(logo):
         return None
     return Image.fromarray(np.where(logo[2], 255, 0).astype('uint8'), mode="L")
 
-def subtract(data:np.ndarray, logo:tuple)->np.ndarray:
-    if logo is not None:
-        ((top,left),(bottom,right),lmask,thresh,*stuck) = logo
-        data[top:bottom,left:right] = 0
-        if stuck is not None and len(stuck) > 0:
-            for ((top,left),(bottom,right)) in stuck:
-                data[top:bottom,left:right] = 0    
-    return data
+def keep_mask(shape:tuple, logo:tuple)->np.ndarray|None:
+    """True where a pixel should count toward whole-frame statistics, or None for all of them.
+
+    Blank detection has to ignore the logo and any stuck overlay: during a break the
+    picture goes black but those stay lit, and the frame only reads as blank once they are
+    out of the sample.  Excluding the pixels rather than blacking them out keeps the
+    median and standard deviation honest -- forced zeros would drag both.
+    """
+    if logo is None:
+        return None
+    ((top,left),(bottom,right),lmask,thresh,*stuck) = logo
+    keep = np.ones(shape[:2], bool)
+    keep[top:bottom,left:right] = False
+    for ((top,left),(bottom,right)) in stuck:
+        keep[top:bottom,left:right] = False
+    return keep
