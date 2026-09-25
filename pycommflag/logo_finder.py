@@ -7,11 +7,16 @@ from typing import Any, BinaryIO
 
 from .player import Player
 
-_LOGO_EDGE_THRESHOLD = 85 # how strong an edge is strong enough?
+_LOGO_EDGE_THRESHOLD = 12 # minimum contrast step, in gray levels, to count as an edge
 
-def search(player:Player, search_beginning:bool=False, opts:Any=None) -> tuple|None:
-    global _LOGO_EDGE_THRESHOLD
+def _edges(data:np.ndarray) -> np.ndarray:
+    # re-cast so that sobel doesn't wrap the u8
+    data = data.astype(np.float32, copy=False)
+    # The /4 is the 3x3 kernel's gain for a step edge, which puts the result back on the input's scale -- a step of N gray levels comes out as N.
+    mag = np.hypot(scipy_sobel(data, 0), scipy_sobel(data, 1)) / 4
+    return mag > _LOGO_EDGE_THRESHOLD
 
+def search(player:Player, opts:Any=None) -> tuple|None:
     player.disable_audio()
     player.seek(0)
 
@@ -32,21 +37,29 @@ def search(player:Player, search_beginning:bool=False, opts:Any=None) -> tuple|N
             r = 0
             print("Logo Searching, %3.1f%%    " % (min(fcount/percent,100.0)), end='\r')
         data = _gray(frame)
-        logo_sum += scipy_sobel(data) > _LOGO_EDGE_THRESHOLD
+        logo_sum += _edges(data)
         fcount += 1
         if fcount >= ftotal: 
             break
     
     if not opts.quiet: print("Logo Searching is complete.\n")
 
+    return _analyze(logo_sum, fcount, player.shape)
+
+def _analyze(logo_sum:np.ndarray, fcount:int, shape:tuple) -> tuple|None:
+    """Turn a per-pixel count of "was an edge in this frame" into a logo, or None.
+
+    Split out of search() so the same decision logic can be re-run over an accumulation
+    gathered at a different edge threshold, without decoding the video again.
+    """
     # overscan, ignore 3% on each side -- sometimes there are signal artifacts here (which the edge det sees)
-    logo_sum[:math.ceil(player.shape[0]*.03)] = 0
-    logo_sum[-math.ceil(player.shape[0]*.03)-1:] = 0
-    logo_sum[..., 0:math.ceil(player.shape[1]*.03)] = 0
-    logo_sum[..., -math.ceil(player.shape[1]*.03)-1:] = 0
-    
+    logo_sum[:math.ceil(shape[0]*.03)] = 0
+    logo_sum[-math.ceil(shape[0]*.03)-1:] = 0
+    logo_sum[..., 0:math.ceil(shape[1]*.03)] = 0
+    logo_sum[..., -math.ceil(shape[1]*.03)-1:] = 0
+
     # no logos in the middle 1/3 of the screen
-    logo_sum[int(player.shape[0]/3):int(player.shape[0]*2/3),int(player.shape[1]/3):int(player.shape[1]*2/3)] = 0
+    logo_sum[int(shape[0]/3):int(shape[0]*2/3),int(shape[1]/3):int(shape[1]*2/3)] = 0
 
     # in case we found something stuck on the screen, try to look beyond that
     stuck = []
@@ -54,8 +67,8 @@ def search(player:Player, search_beginning:bool=False, opts:Any=None) -> tuple|N
     while best >= fcount*.94:
         stuck_mask = logo_sum >= best*.95
         
-        h = player.shape[0]//2
-        w = player.shape[1]//2
+        h = shape[0]//2
+        w = shape[1]//2
         count = 0
         t = 0
         l = 0
@@ -76,7 +89,7 @@ def search(player:Player, search_beginning:bool=False, opts:Any=None) -> tuple|N
 
     log.debug(f"Logo detection result: {best} ({round(best*100/fcount)}%)")
 
-    if best <= fcount*.6:
+    if best <= fcount*.5:
         log.info(f"No logo found (insufficient edge strength, best={best*100/fcount}%)")
         return None
     
@@ -93,12 +106,11 @@ def search(player:Player, search_beginning:bool=False, opts:Any=None) -> tuple|N
     right = int(np.max(nz[1]))
     
     # if the bound is more than half the image then clip it
-    if bottom-top >= player.shape[0]/2 or right-left >= player.shape[1]/2:
+    if bottom-top >= shape[0]/2 or right-left >= shape[1]/2:
         log.debug(f"Need to clip logo bounding box {top},{left}->{bottom},{right}, it is too large")
 
-        h = player.shape[0]//2
-        w = player.shape[1]//2
-        i = 0
+        h = shape[0]//2
+        w = shape[1]//2
         count = 0
         top = left = 0
         bottom = h
@@ -136,13 +148,12 @@ def search(player:Player, search_beginning:bool=False, opts:Any=None) -> tuple|N
                     for xo in range(-2,3):
                         if (xo or yo) and logo_mask[y+yo,x+xo]:
                             ok = True
-                            break
                 if not ok:
                     logo_mask[y,x] = False
                     filt += 1
     if filt:
         log.debug(f"Filtered {filt} logo mask elements that were isolated from others")
-        nz = np.nonzero(logo_mask[top:bottom,left:right])
+        nz = np.nonzero(logo_mask[top:bottom+1,left:right+1])
         bottom = top + int(np.max(nz[0]))
         right = left + int(np.max(nz[1]))
         top += int(np.min(nz[0])) 
@@ -172,11 +183,10 @@ def search(player:Player, search_beginning:bool=False, opts:Any=None) -> tuple|N
 def logo_in_frame(frame :VideoFrame, logo :tuple) -> tuple[int, int]:
     if not logo:
         return (0,1)
-    global _LOGO_EDGE_THRESHOLD
-    
+
     ((top,left),(bottom,right),lmask,thresh,*_) = logo
     c = _gray(frame, [top,bottom,left,right])
-    c = scipy_sobel(c) > _LOGO_EDGE_THRESHOLD
+    c = _edges(c)
     c = np.where(lmask, c, False)
     #print('\n!',np.count_nonzero(c),'of',np.count_nonzero(lmask),'!')
     n = np.count_nonzero(c)
@@ -201,7 +211,7 @@ def _gray(frame:VideoFrame,box:tuple=None) -> np.ndarray:
         return x
 
 import json
-def from_json(js:list|str)->tuple|None:
+def from_json(js:list|str)->list|None:
     if type(js) is str:
         js = json.loads(js)
     if js is None:
