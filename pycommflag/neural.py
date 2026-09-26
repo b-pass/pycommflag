@@ -60,6 +60,7 @@ WINDOW_BEFORE = 60
 WINDOW_AFTER = 60
 SUMMARY_RATE = 1
 RATE = 29.97
+DIFF_THRESHOLD = 15.0
 
 # training params
 MTYPE = ''
@@ -73,7 +74,7 @@ K         = 5  # TCN kernel size
 DILATIONS = [1, 2, 4, 8] # TCN dilation schedule
 DROPOUT   = 0.25
 START_DROP= 0.15
-TCN_DROP  = 0.2
+TCN_DROP  = 0.25
 
 def build_model(input_shape=(121, 23)):
     global MTYPE
@@ -85,10 +86,10 @@ def build_model(input_shape=(121, 23)):
 
     inputs = Input(shape=input_shape[-2:], dtype='float32', name="input")
 
-    # some features are unreliable ...
+    # Normalize so that zero introduced by the dropout below is neutral
     x = layers.BatchNormalization(center=False, scale=False, name="input_norm")(inputs)
     x = layers.SpatialDropout1D(START_DROP)(x)
-
+    
     x = layers.Dense(F, use_bias=False, name="projection")(x)
     x = layers.BatchNormalization()(x)
     x = layers.Activation("relu")(x)
@@ -105,7 +106,7 @@ def build_model(input_shape=(121, 23)):
                           name=f"{name_prefix}_conv1")(x)
         x = layers.BatchNormalization(name=f"{name_prefix}_ln1")(x)
         x = layers.Activation("swish", name=f"{name_prefix}_act1")(x)
-        x = layers.SpatialDropout1D(TCN_DROP)(x) # Add this to both Conv units in the block
+        x = layers.SpatialDropout1D(TCN_DROP)(x)
 
         x = layers.Conv1D(F, K,
                           padding="same",
@@ -114,7 +115,7 @@ def build_model(input_shape=(121, 23)):
                           name=f"{name_prefix}_conv2")(x)
         x = layers.BatchNormalization(name=f"{name_prefix}_ln2")(x)
         x = layers.Activation("swish", name=f"{name_prefix}_act2")(x)
-        x = layers.SpatialDropout1D(TCN_DROP)(x) # Add this to both Conv units in the block
+        x = layers.SpatialDropout1D(TCN_DROP)(x)
         
         # Squeeze
         se = layers.GlobalAveragePooling1D()(x)
@@ -187,7 +188,7 @@ def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]],
         hi = np.searchsorted(diff_times, when + max_distance/2, 'right')
         if hi > lo:
             k = lo + int(np.argmax(diff_mags[lo:hi]))
-            if diff_mags[k] >= processor.DIFF_THRESHOLD:
+            if diff_mags[k] >= DIFF_THRESHOLD:
                 return float(diff_times[k])
 
         return when
