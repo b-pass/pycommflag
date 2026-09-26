@@ -1,121 +1,309 @@
 # pycommflag
-A commercial flagging utility written in Python.
 
-This utility uses image, audio, video, and machine learning techniques to
-identify ("flag") segments of a video as being one of several categories:
-'content' (aka 'show'), 'commercial' (aka 'advertizing'), 'credits', or 
-'intro'.
+pycommflag finds the commercials in TV recordings. It extracts video and audio
+features from a recording, runs them through a small neural network, and
+outputs the commercial breaks. You can send those breaks to MythTV, or write
+them as an EDL or comskip-style `.txt` file.
 
-pycommflag is also a drop-in replacement for mythcommflag.  mythcommflag was revolutionary in its day, but it is now old and has seen no significant algorithmic updates in more than 15 years.  pycommflag stands on the shoulders of giants, many ideas in pycommflag are inspired by mythcommflag, and pycommflag would absolutely not exist without it!
+It is a drop-in replacement for MythTV's `mythcommflag`: it accepts the same
+job-queue arguments and writes breaks into the same database table, so
+mythfrontend, MythWeb, and kodi-pvr-mythtv can use them as they are. It can also
+stand in for [comskip](https://github.com/erikkaashoek/Comskip) wherever you
+currently use comskip's `.edl` or `.txt` output.
 
-## Features
+pycommflag builds on many ideas from mythcommflag and would not exist without it.
+mythcommflag was revolutionary in its day, but its algorithms have not changed
+significantly in more than 15 years.
 
-- Graphically edit flags and save them for training ML models
-- Train ML models on hand-curated data, and use the trained models to flag or re-flag
-- Run modes:
-    - Command line
-    - From the mythtv JobQueue as a user job
-    - From the mythtv JobQueue as a replacement for mythcommflag
-    - Integrate into a python application as a module
-- Output options:
-    - Json
-    - MythTV `recordedmarkup` table (can then be used commercial flags in mythfrontend or with kodi-pvr-mythtv)
-    - EDL (Edit Decision List - tab separated format) 
-    - Text (comskip text format (`FILE PROCESSING COMPLETE`...))
+## How it differs from mythcommflag and comskip
 
-# Installation
+| | mythcommflag / comskip | pycommflag |
+|---|---|---|
+| Detection | Hand-tuned heuristics (blank frames, logo, scene changes, aspect ratio, …) | A neural network that learns from those same kinds of signals |
+| Tuning | Many knobs (`comskip.ini`, detection method bitmasks) | A few limits on break length. To improve accuracy, you correct its mistakes and retrain |
+| Re-running | Decodes the whole video again | Saves a small "feature log" and can re-flag from it in seconds |
+| Speed | Fast | Slower (see [Speed](#speed)) |
 
-sorry, I am lazy and didn't make a setup.py yet.  
+pycommflag does not read `comskip.ini` or MythTV's per-channel detection method
+bitmask. The only per-channel MythTV setting it honors is "commercial flagging
+disabled".
 
-1. Clone the repo (or download a release)
-2. Put it somewhere
-3. Install the required python dependencies (Python 3.10+) listed in `requirements.txt`, either system-wide or into a virtualenv at `/path/to/pycommflag/venv` (`run.sh` activates it automatically)
-4. Put the installation in your PATH, such as by running `sudo ln -s /absolute/path/to/pycommflag/run.sh /usr/bin/pycommflag` to create a `pycommflag` command
+## Installation
 
-# Running
+There is no `setup.py` or PyPI package yet.
 
-## Flagging commercials
+1. Clone the repository (or download a release):
+   ```sh
+   git clone https://github.com/b-pass/pycommflag.git /opt/pycommflag
+   ```
+2. Install Python 3.10 or newer. You also need the build headers for
+   `mysqlclient` (e.g. `libmysqlclient-dev` or `default-libmysqlclient-dev`, plus
+   `pkg-config`). The editing GUI needs Tk (e.g. `python3-tk`). `libjemalloc2`
+   is optional, and `run.sh` preloads it if present.
+3. Install the Python dependencies into a virtualenv named `venv` inside the
+   checkout. `run.sh` activates it automatically:
+   ```sh
+   cd /opt/pycommflag
+   python3 -m venv venv
+   ./venv/bin/pip install -r requirements.txt
+   ```
+4. Put a model at `/opt/pycommflag/models/model.keras` (see [Models](#models)).
+5. Optionally, add a `pycommflag` command to your `PATH`:
+   ```sh
+   sudo ln -s /opt/pycommflag/run.sh /usr/local/bin/pycommflag
+   ```
 
-This repository includes an ML model trained on over 60 hand-curated recordings from a variety of channels (broadcast and cable) available in the United States in 2024.  You can download this model from github and place it in `/path/to/pycommflag/models/` as `model.keras` (older `model.h5` files are also accepted; `model.keras` is used first if both exist).  You can also point at a specific model with `--model /path/to/model.keras`.
+The first run downloads the inaSpeechSegmenter audio model into
+`~/.keras/datasets/inaSpeechSegmenter`, so it needs network access once. Note
+that this happens separately for each user: if MythTV runs pycommflag as the
+`mythtv` user, that user needs network access the first time too.
 
-The first run will also download the inaSpeechSegmenter audio model (into `~/.keras/datasets/inaSpeechSegmenter`), so it needs network access once.
+### Models
 
-Then simply run `pycommflag -f /path/to/video` and pycommflag will run.  Typical runtimes take about 15 minutes to flag a 1 hour recording.  But this will vary greatly depending on the hardware running pycommflag and on the codec of the recording.
+pycommflag cannot flag anything without a trained model. Models are not stored
+in git. It looks for one in this order:
 
-The output will be a json file in `/tmp` which is called a "Frame log" and includes the recordings in a key called "tags".  If you have a `~/.mythtv/config.xml` file and you run pycommflag on a recording file from mythtv, it will write its results directly into the mythtv database.
+1. `--model /path/to/file.keras`
+2. `models/model.keras` in the checkout (use `--models DIR` to change the directory)
+3. `models/model.h5`
 
-### Setting up mythtv
+A pre-trained model is published on the
+[releases page](https://github.com/b-pass/pycommflag/releases). A model only
+works with the version of pycommflag whose features it was trained on. If you
+update pycommflag and the model's input shape no longer matches, get a newer
+model or [train your own](#training-your-own-model).
 
-Because pycommflag is still experimental, we recommend you try pycommflag out on selected recordings.  First on the commandline, then via a user job on selected recording schedules, and finally as a replacement for mythcommflag.
+## Flagging a recording
 
-### As a user-job
+```sh
+pycommflag -f /path/to/recording.ts
+```
 
-You can use `mythtv-setup` on your backend to add a user job for `pycommflag`.  The recommended commandline for pycommflag as a userjob is: `pycommflag --no-log -j %JOBID%`.
+What happens to the results depends on `-o` / `--output-type`:
 
-After you've added the job and restarted your mythtvbackend, you will see the job as an option on your recordings and schedules.
+| `-o` | Result |
+|---|---|
+| `auto` (default) | If the recording is in MythTV, the breaks are written to the database. Otherwise, an `.edl` file is written. |
+| `mythtv` | Write the breaks only to the MythTV database. |
+| `edl` | Write `recording.edl` next to the video: one `start<TAB>end<TAB>type` line per segment, in seconds, with `3` (commercial break) for commercials. Kodi reads this format. |
+| `txt` | Write `recording.txt` next to the video in comskip's format (`FILE PROCESSING COMPLETE N FRAMES AT R`, then `start end` frame numbers for each break). |
+
+pycommflag also keeps a **feature log** at `$TMPDIR/cf_<video filename>.json`
+(normally in `/tmp`). This file holds everything pycommflag extracted from the
+video, plus the breaks it found (under the `"tags"` key). It is usually well
+under 1% of the video's size. Keep it if you might want to re-flag the
+recording later or use it for training. Use `-l FILE` to choose its location,
+or `--no-log` to skip keeping it. If you flag the same video again with an
+existing log, pycommflag reuses the station logo saved in that log.
+
+Other useful options (`pycommflag --help` lists them all):
+
+- `--break-min-len` / `--break-max-len` / `--show-min-len`: the shortest
+  allowed break (default 59 s), the longest allowed break (default 335 s), and
+  the shortest allowed show segment between breaks (default 59 s).
+- `--no-logo`: skip the station logo search.
+- `--deinterlace`: turn on deinterlacing (off by default).
+- `-q` / `--noprogress`: don't print progress.
+- `--yaml FILE`: load options from a YAML file. Keys are the option names as
+  pycommflag stores them internally (e.g. `break_max_len: 300`), and they
+  override the command line.
+
+### Speed
+
+A 1-hour recording typically takes about 10 minutes, but this varies a lot with
+your hardware and the recording's codec. Extraction lowers its own CPU priority
+(`nice 10`) so it can run in the background.
+
+Re-flagging from a saved feature log skips the video decode and takes seconds:
+
+```sh
+pycommflag -r /tmp/cf_*.json
+```
+
+With several logs, `-r` rewrites a log and its output only when the breaks
+changed. `-r` is how you apply a new model to old recordings.
+
+## Using it with MythTV
+
+pycommflag reads the database credentials from `~/.mythtv/config.xml` of the
+user that runs it. If that file doesn't exist, all MythTV features are quietly
+skipped. For MythTV recordings named in the usual `<chanid>_<starttime>.ts`
+format, pycommflag works out the channel and start time from the filename.
+You can also pass `--chanid`/`--starttime` or `-j JOBID`, just like with
+mythcommflag.
+
+We recommend trying pycommflag in three stages: from the command line first,
+then as a user job on a few schedules, and finally as a full replacement for
+mythcommflag.
+
+Whenever MythTV runs pycommflag, it runs as the `mythtv` user. That user needs
+read access to the checkout and its `venv` and `models`, and it needs its own
+`~/.mythtv/config.xml`.
+
+### Command line
+
+```sh
+pycommflag -f /var/lib/mythtv/recordings/1051_20240101200000.ts
+```
+
+This writes the breaks straight into `recordedmarkup`, and the next time you
+play the recording, mythfrontend uses them.
+
+### Where the settings are
+
+Both setups below use the backend's job queue settings. The same settings
+appear in two places:
+
+- **Web app (recommended):** open `http://<your-backend>:6544`, choose
+  **Backend Setup** in the side menu, go to the **General** step, and expand
+  the section named below.
+- **`mythtv-setup` (deprecated, but still works):** go to **General** and page
+  through to the section of the same name.
+
+Restart `mythbackend` after changing them.
+
+### As a user job
+
+1. In **Job Queue (Job Commands)**, fill in an unused User Job's description
+   (e.g. `pycommflag`) and set its command to:
+   ```
+   pycommflag --no-log -j %JOBID%
+   ```
+2. In **Job Queue (Backend-Specific)**, tick the checkbox that allows that user
+   job to run on this backend. In the web app, the checkbox is labeled with the
+   job's description; in `mythtv-setup`, it reads "Allow User Job #N jobs".
+
+The job now appears in the recording menu and in the schedule options.
 
 ### As a mythcommflag replacement
 
-You can change the "JobQueueCommFlagCommand" setting via mythweb or in the settings table on your backend.  (TBD, can you change this via mythtv-setup or the UI??)
+In **Job Queue (Global)**, set **Commercial Detection Command** (the
+`JobQueueCommFlagCommand` setting) to:
 
-You should include the `-e` flag on your command.  Our recommended value for this setting is: `pycommflag -e --no-log -j %JOBID%`.
+```
+pycommflag -e --no-log -j %JOBID%
+```
 
-Once you change this any schedule you have set to run commercial flagging will run pycommflag instead of mythcommflag.  pycommflag will be run as the mythtv user (so keep that in mind during your installation).
+From then on, every schedule that has commercial flagging turned on runs
+pycommflag.
 
-# Training your own pycommflag model
+This setting holds the whole command line, not just the program name. Unless
+it is exactly `mythcommflag`, MythTV runs it as written: it replaces `%JOBID%`
+(and the other `%…%` variables that user jobs support) but adds no arguments
+of its own. So you must include `-j %JOBID%` yourself, and use a full path if
+`pycommflag` isn't on the backend's `PATH`.
 
-## Creating training data
+`-e` matters here. MythTV reads the command's exit status as the number of
+breaks found and treats 256 or higher as a failure. `-e` makes pycommflag exit
+with its break count, and makes crashes exit with 256, so MythTV doesn't read a
+crash as "1 break".
 
-If pycommflag gets a commercial wrong, the best way to fix it is to hand-curate a set of training data to train your own pycommflag model from your recordings.
+For command-line compatibility, pycommflag also accepts mythcommflag's
+`--rebuild` (rebuild the seek table) and `--queue` options. It doesn't
+implement them: it just runs the real `mythcommflag` from the `PATH` with the
+same arguments. For that reason, don't replace the `mythcommflag` binary itself
+with pycommflag. Use the setting above instead.
 
-When you run pycommflag *without* the `--no-log` option, it will generate a "feature log" in `/tmp` which contains everything about the recording that pycommflag discovered, and also the result of the pycommflag flagging.  You hand-curate a training set by running `pycommflag -g /tmp/something-to-curate.json`.  This will open a tk GUI that will show you the video, features pycommflag found, and options for changing the flagging that pycommflag has figured out.
+## Coming from comskip
 
-(TODO: screen shots? button-by-button walk through?)
+- Use `-o txt` to get comskip's `.txt` format, or `-o edl` to get an `.edl` for
+  Kodi and other players that understand EDL action `3` (commercial break).
+  Both files are written next to the video with the extension replaced, like
+  comskip's output.
+- There is no `.ini` file. Instead of tuning detection, you correct the
+  recordings pycommflag gets wrong in the GUI and retrain (see below). Options
+  can go in a YAML file (`--yaml`) if you'd rather not put them on the command
+  line.
+- Post-processing scripts that run comskip can call
+  `pycommflag --no-log -o edl -f "$FILE"` instead.
 
-When you are done, press "Save and Exit" and pycommflag will update the json file with your changes.  You should then save off the json file to use in training.
+## Training your own model
 
-## Training
+If pycommflag keeps getting a channel or show wrong, the fix is more training
+data, not more knobs.
 
-To train your own model, run `pycommflag -t --data /path/to/training/*.json TEST /path/to/validation/*.json`.  Files listed after the literal word `TEST` are held out as the validation set; you need some there, since validation accuracy drives early stopping and picks the best epoch.  Keep an eye on "val_weighted_accuracy" during training, this is the most important measure of the success of the training process.  If the "val" accuracy is much lower than the training accuracy, you do not have enough (or varied enough) training data.
+### Curating recordings
 
-The first time a feature log is used for training, pycommflag caches the pre-processed data next to it as `*.data.npy` and `*.nologo.data.npy`.  Delete these if you change the feature log (e.g. re-curate it in the GUI) or the feature code, otherwise the stale cache will be used.
+Flag a recording without `--no-log` so its feature log is kept, then open the
+log in the editor:
 
-After training is complete, pycommflag evaluates the best epoch and, if its validation accuracy is at least 0.95, saves it in `/path/to/pycommflag/models/` (or `--models DIR`) as `pycf-*stuff*.keras`.  The "stuff" starts with the validation accuracy so you can see which training runs have produced useful output models.  When you have a model that you want to use for `pycommflag` flagging, you can either specify it on the commandline with `--model` or move/link it to `model.keras` in the models directory.
+```sh
+pycommflag -g /tmp/cf_recording.ts.json
+```
 
-To compare models, run `pycommflag --eval model1.keras model2.keras --data /path/to/curated/*.json`.
+The GUI needs the original video (it uses the path saved in the log) and a
+model. It shows the video, a timeline of the extracted features, and the
+current flags. You can step through the recording by frame, second, or
+blank/diff/audio change, and jump between breaks. Use the `Flag Break` /
+`Flag Show` / `Flag Intro` / `Flag Credits` / `Flag Ignore` buttons to mark
+segments. `Ignore` excludes a segment from training. When you're done, click
+`Save & Exit`. This saves your flags into the feature log and also writes them
+to MythTV or an EDL, just like a normal run. Then copy the log somewhere
+permanent: `/tmp` is not a good place to keep training data.
 
-## Reprocessing
+### Training
 
-The models the pycommflag uses are run based on "features" extracted from the video file and not the file itself.  The features are saved in the "feature log" files.  If you keep these files, then you can quickly (less than 60 seconds) re-run a new model against something that pycommflag has previously run against, without the lengthy (15+ minute) process of re-processing the video.
+```sh
+pycommflag -t --data /path/to/training/*.json TEST /path/to/validation/*.json
+```
 
-Simply run `pycommflag -r /path/to/feature_log.json`.  If you don't keep your feature logs around, then you will have to reprocess the full video (with `-f`).
+Logs listed after the literal word `TEST` are held out for validation. You need
+some, because validation accuracy decides when training stops and which epoch
+is kept. Watch `val_weighted_accuracy`: if it is much lower than the training
+accuracy, you need more (or more varied) training data.
 
-### A note about advanced options
+If the best epoch reaches at least 0.95 validation accuracy, it is saved to
+`models/pycf-<val_acc>-….keras`. The filename starts with the accuracy, so you
+can easily compare runs. To use a model, pass it with `--model` or link it as
+`models/model.keras`. Then re-flag your saved logs with `-r`.
 
-Note that the data available for flagging and training has to be present both in the training data and in the recordings you want to use.  So if you change options like logo or audio detection, it might make the model not work well with your data.  You would need to retrain it, probably you would need to curate new data processed with the same settings.  The models available on github have been trained using the `pycommflag` defaults, which are suitable for cable and HD broadcast TV in the US, but maybe not in other locations.
+To compare models on the same data (this needs `scikit-learn`):
 
-# How does it work
+```sh
+pycommflag --eval models/model.keras models/pycf-0.97-….keras --data /path/to/curated/*.json
+```
 
-It extracts "features" from the video.
+The first time training uses a feature log, it caches preprocessed data next to
+the log as `*.data.npy` and `*.nologo.data.npy`. **Delete these after you
+re-curate a log in the GUI**, or training will keep using the old flags.
 
-Features:
-- Rate of "difference"/change between frames of the video
-- Presence of a station-identification logo in any of the corners of the screen (detected using the Sobel edge detection algorithm)
-- Two different measures of time/position in the video
-- Using the INAFOSS "speech/music/noise" audio detection algorithm and library
-- RMS audio peek (rolling 0.5s window) of the "main" and "surround" channels
-- And also the presence of all-black frames
+Training runs at the lowest CPU priority (`nice 19`).
 
-Each of these features is recorded for every frame of the video.  For inference they are condensed into one-second summaries, and a window of 60 seconds before and after each second is fed to a small temporal convolutional network (dilated 1D convolutions), which outputs the probability that the second is a commercial.  That is then smoothed into breaks using the `--break-min-len`, `--break-max-len`, and `--show-min-len` limits.
+### A note about feature extraction options
 
-Frame logs save these in a convienient json format, which is (usually) much less than 1% the size of the original video file.  That makes these files easy to keep around for training and experimentation.
+A model can only use the features it was trained with. If you flag with
+non-default extraction options (e.g. `--no-logo`, `--diff-threshold`,
+`--deinterlace`), the features no longer match what the published model
+expects, and accuracy may drop. In that case, train on logs extracted with the
+same options. The published model uses the defaults, which suit US cable and HD
+broadcast TV. It may do less well elsewhere.
 
-# To do / ideas
+## How it works
 
-- Setup.  It would be good to get proper installation working, and then this could be put on pypi.
+For every video frame, pycommflag records:
 
-- Per-channel configuration.  Some channels might be more useful with different thresholds, or different settings.  So far the models seem to generalize pretty well with enough data.
+- whether a station logo is present (found by sampling the whole recording for
+  static Sobel edges in the screen corners)
+- whether the frame is blank
+- how much the picture changed from the previous frame
+- the RMS volume of the front and rear/surround audio channels, and silence
+- speech/music/noise classification from
+  [inaSpeechSegmenter](https://github.com/ina-foss/inaSpeechSegmenter)
+- the frame's time and position in the recording
 
-- I suppose it might be possible to do per-channel models?  I don't know how that would work.
+It then derives more features from those, such as how long the logo has been
+present and how far the frame is from the nearest blank. Everything is
+condensed into one row per second. For each second, a window from 60 seconds
+before to 60 seconds after is fed to a small temporal convolutional network
+(dilated 1D convolutions), which outputs the probability that the second is a
+commercial. Finally, those probabilities are turned into breaks: each break is
+snapped to nearby blank frames or scene changes, and the length limits above
+are applied.
 
-- New video/audio features.  Would be cool, might really help flagging?  I am running out of ideas.  Also usually these mean starting over on making new training data, which is really time consuming, so I am not super motivated.
+## Ideas / to do
+
+- Proper packaging (`setup.py` / PyPI).
+- Per-channel settings or models. So far, one model trained on enough varied
+  data seems to generalize well.
+- New video/audio features. These mean retraining from scratch, and possibly
+  re-curating data.
