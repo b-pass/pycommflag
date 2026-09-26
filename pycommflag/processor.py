@@ -340,13 +340,19 @@ def mean_axis1(fcolor:np.ndarray, dtype='uint8')->np.ndarray:
     return np.stack((cr,cg,cb), axis=1).astype(dtype)
 
 class AudioProc(Thread):
-    def __init__(self, volume_window=.05, work_rate=60.0):
+    def __init__(self, volume_window=.05, work_rate=60.0, overlap=5.0):
         super().__init__(name="audioProc")
         import tensorflow as tf
         tf.config.threading.set_intra_op_parallelism_threads(1)
         tf.config.threading.set_inter_op_parallelism_threads(1)
         self.volume_window = max(2/29.97, volume_window)
         self.work_rate = max(1.0, work_rate)
+        # The segmenter viterbi-decodes each chunk independently, so its labels can disagree
+        # across a chunk boundary.  We hand it this much extra audio on each pass and splice
+        # the two opinions together where they already agree; see _reconcile().  A half second
+        # (the old value) is less than the DNN's own 1.36s patch width, so the seam always fell
+        # inside the region the decoder was least sure about.
+        self.overlap = min(max(0.0, overlap), self.work_rate)
         self.seg = ina_foss.Segmenter()
         self.queue = Queue(300)
         self.fspan = AudioFeatureSpan()
@@ -369,6 +375,47 @@ class AudioProc(Thread):
             self.spsig.resample_poly(surr, 16000, sr, padtype='mean') if surr is not None else None,
         )
 
+    @staticmethod
+    def _clip(segs, lo, hi):
+        """the parts of `segs` (absolute times) lying inside [lo,hi)"""
+        out = []
+        for (lab, sb, se) in segs:
+            sb, se = max(sb, lo), min(se, hi)
+            if se > sb:
+                out.append((lab, sb, se))
+        return out
+
+    @staticmethod
+    def _rasterize(segs, grid):
+        """label at each grid time; anything no segment covers is silence, which is what
+        AudioFeatureSpan would fill a gap with anyway"""
+        out = np.full(len(grid), AudioSegmentLabel.SILENCE.value, dtype='int8')
+        for (lab, sb, se) in segs:
+            out[np.searchsorted(grid, sb, 'left'):np.searchsorted(grid, se, 'left')] = lab.value
+        return out
+
+    def _reconcile(self, prev, cur_segs, ob, oe):
+        """Pick the time in [ob,oe) to stop believing the previous chunk and start believing
+        this one.  Splicing in the middle of the longest stretch where they already agree
+        means the seam introduces no transition at all.  Blending is not an option: the
+        segmenter viterbi-decodes to hard labels and discards the posteriors."""
+        step = 0.02  # the segmenter's own resolution
+        n = int(round((oe - ob) / step))
+        if n < 2:
+            return (ob + oe) / 2
+        grid = ob + (np.arange(n) + 0.5) * step
+        same = self._rasterize(prev, grid) == self._rasterize(cur_segs, grid)
+
+        # run-length encode the agreement and take the middle of the longest run
+        edges = np.flatnonzero(np.diff(np.concatenate(([0], same.view('int8'), [0]))))
+        starts, ends = edges[0::2], edges[1::2]
+        if not len(starts):
+            log.debug(f'Audio segmenter never agreed with itself over [{ob:.1f},{oe:.1f}); '
+                      f'splicing at the midpoint')
+            return (ob + oe) / 2
+        best = int(np.argmax(ends - starts))
+        return float(grid[(starts[best] + ends[best]) // 2])
+
     def run(self):
         import scipy.signal as spsig
         self.spsig = spsig
@@ -378,9 +425,11 @@ class AudioProc(Thread):
         cur = 0.0
         nexttime = 0.0
         self.rms = [(0,0,0)]
-        work_unit = round(16000 * self.work_rate)
-        min_work = work_unit + 8000
+        hop = round(16000 * self.work_rate)
+        ovl = round(16000 * self.overlap)
+        min_work = hop + ovl
         vwnd = round(16000*self.volume_window)
+        held = []          # previous chunk's opinion of the region this one also covers
         done = False
         while not done:
             # merge samples into a contiguous array
@@ -417,16 +466,18 @@ class AudioProc(Thread):
                 surr = np.append(surr, ss)
             else:
                 done = True
+                # whatever is left is one last (short) chunk; below half a second there is
+                # not enough for the segmenter to say anything useful
                 min_work = 8000
-                #print('FINISHED at',cur,'have',len(main),'audio samples left')
             
             # now chunk into "work_rate" sized pieces and work on them individually
             while len(main) >= min_work:
                 assert(len(main) == len(surr))
 
-                # slice the time
-                mwork = main[0:work_unit]
-                swork = surr[0:work_unit]
+                # slice the time: a full hop plus the overlap we hand to the segmenter twice
+                mwork = main[0:hop+ovl]
+                swork = surr[0:hop+ovl]
+                chunk_end = cur + len(mwork)/16000.0
                 
                 # calculate the volume via RMS for both the main and surround 
                 # in small rolling and overlapping slices
@@ -443,20 +494,30 @@ class AudioProc(Thread):
                 
                 # classify the main channel
                 #print('Running audio segmenter on',len(mwork),'samples at',cur)
-                for (lab, sb, se) in self.seg(mwork):
-                    # we put an extra half second at the beginning so there is overlap in the data that
-                    # we see on successive runs (so it isn't starting cold on important data). But,
-                    # we don't actually care about that time...
-                    if cur == 0 or se > 0.5:
-                        self.fspan.add(round(cur+sb,5), round(cur+se,5), AudioSegmentLabel[lab])
-                
-                # done with this time slice, leaving the half second in the buffer to repeat it next time.
-                main = main[work_unit-8000:]
-                surr = surr[work_unit-8000:]
-                if cur == 0:
-                    # all the subsequent runs will overlap by half a second with the previous one.
-                    work_unit += 8000
-                cur += (len(mwork) - 8000)/16000.0
+                segs = [(AudioSegmentLabel[lab], cur+sb, cur+se) for (lab, sb, se) in self.seg(mwork)]
+
+                # where the previous chunk also had an opinion, splice the two together at a
+                # point they agree on rather than letting one of them win arbitrarily
+                emit_from = cur
+                if held:
+                    emit_from = self._reconcile(held, segs, cur, min(cur + self.overlap, chunk_end))
+                    for (lab, sb, se) in self._clip(held, cur, emit_from):
+                        self.fspan.add(round(sb,5), round(se,5), lab)
+
+                # hold back the tail that the next chunk will also see
+                hold_from = cur + hop/16000.0
+                for (lab, sb, se) in self._clip(segs, emit_from, hold_from):
+                    self.fspan.add(round(sb,5), round(se,5), lab)
+                held = self._clip(segs, hold_from, chunk_end)
+
+                # advance; the final chunk can be shorter than a whole hop
+                step = min(hop, len(mwork))
+                main = main[step:]
+                surr = surr[step:]
+                cur += step/16000.0
+
+        for (lab, sb, se) in held:
+            self.fspan.add(round(sb,5), round(se,5), lab)
         self.fspan.end(cur)
 
 def reprocess(feature_log_filename:str, opts:Any=None) -> dict:
