@@ -195,12 +195,12 @@ def _reprocess_one(opts, fl, allow_archive:bool) -> bool:
 
     old = flog.get('tags', [])
     result = predict(flog, opts)
-    (missing, extra, all) = diff_tags(old, result)
+    (missing, extra, all) = diff_tags(result, old)
 
     chng = ''
     for (t,b,e) in all:
         if t != 0:
-            chng += f'{e-b}s {"missing" if t < 0 else "extra"} at {b} to {e}; '
+            chng += f'{e-b}s {"removed" if t < 0 else "added"} at {b} to {e}; '
     print(f'{vf}: {len(result)} breaks - changed {extra-missing} seconds : {chng}')
 
     if chng or missing or extra or len(old) != len(all):
