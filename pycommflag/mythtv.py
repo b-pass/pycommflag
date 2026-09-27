@@ -21,7 +21,12 @@ def _open():
     import xml.etree.ElementTree as xml
     for e in xml.parse(cfgfile).find('Database').iter():
         dbc[e.tag.lower()] = e.text
-    import MySQLdb as mysql
+    try:
+        import MySQLdb as mysql
+    except ImportError:
+        log.info("mysqlclient is not installed, so no mythtv extensions will work")
+        g_off = True
+        return None
     g_connection = mysql.connect(
         host=dbc.get('host', "localhost"),
         user=dbc.get('username', "mythtv"),
@@ -39,6 +44,18 @@ def _get_filename(cursor, chanid, starttime):
         if d and f:
             return os.path.join(d,f)
     return None
+
+JOB_REBUILD = 0x0008 # jobqueue.flags bit, from mythtv's libs/libmythtv/jobqueue.h
+
+def is_rebuild_job(jobid)->bool:
+    """True if this commflag job asks for a seek-table rebuild (`mythcommflag --queue --rebuild`)."""
+    conn = _open()
+    if conn is None:
+        return False
+    with conn.cursor() as c:
+        c.execute("SELECT flags FROM jobqueue WHERE id = %s", (jobid,))
+        row = c.fetchone()
+    return row is not None and (int(row[0] or 0) & JOB_REBUILD) != 0
 
 def get_filename(opts)->str|None:
     if not opts.chanid or not opts.starttime:

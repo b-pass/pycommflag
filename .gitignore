@@ -13,3 +13,5 @@ data
 models
 .claude
 .vscode
+build/
+*.egg-info/

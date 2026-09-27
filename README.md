@@ -30,48 +30,77 @@ disabled".
 
 ## Installation
 
-There is no `setup.py` or PyPI package yet.
+You need Python 3.10 or newer. A few features also need system packages:
 
-1. Clone the repository (or download a release):
-   ```sh
-   git clone https://github.com/b-pass/pycommflag.git /opt/pycommflag
-   ```
-2. Install Python 3.10 or newer. You also need the build headers for
-   `mysqlclient` (e.g. `libmysqlclient-dev` or `default-libmysqlclient-dev`, plus
-   `pkg-config`). The editing GUI needs Tk (e.g. `python3-tk`). `libjemalloc2`
-   is optional, and `run.sh` preloads it if present.
-3. Install the Python dependencies into a virtualenv named `venv` inside the
-   checkout. `run.sh` activates it automatically:
-   ```sh
-   cd /opt/pycommflag
-   python3 -m venv venv
-   ./venv/bin/pip install -r requirements.txt
-   ```
-4. Put a model at `/opt/pycommflag/models/model.keras` (see [Models](#models)).
-5. Optionally, add a `pycommflag` command to your `PATH`:
-   ```sh
-   sudo ln -s /opt/pycommflag/run.sh /usr/local/bin/pycommflag
-   ```
+- **MythTV integration** needs the `mysqlclient` build headers (e.g.
+  `libmysqlclient-dev` or `default-libmysqlclient-dev`, plus `pkg-config`).
+- **The editing GUI** (`-g`) needs Tk (e.g. `python3-tk`).
 
-The first run downloads the inaSpeechSegmenter audio model into
-`~/.keras/datasets/inaSpeechSegmenter`, so it needs network access once. Note
-that this happens separately for each user: if MythTV runs pycommflag as the
-`mythtv` user, that user needs network access the first time too.
+### For your own user (comskip-style use)
+
+Install with [pipx](https://pipx.pypa.io/), which puts pycommflag in its own
+virtualenv and adds a `pycommflag` command:
+
+```sh
+pipx install git+https://github.com/b-pass/pycommflag
+```
+
+To use it with MythTV, install `pycommflag[mythtv]` instead. You can also add
+MythTV support to an existing install later with
+`pipx inject pycommflag mysqlclient`.
+
+### On a MythTV backend
+
+MythTV runs flagging jobs as the `mythtv` user, so install pycommflag
+somewhere every user can reach it, such as a system-wide virtualenv:
+
+```sh
+sudo python3 -m venv /opt/pycommflag
+sudo /opt/pycommflag/bin/pip install 'pycommflag[mythtv] @ git+https://github.com/b-pass/pycommflag'
+sudo ln -s /opt/pycommflag/bin/pycommflag /usr/local/bin/pycommflag
+```
+
+With pipx 1.5 or newer, `sudo pipx install --global 'pycommflag[mythtv] @ git+https://github.com/b-pass/pycommflag'`
+does the same thing. To upgrade, run the same `pip install` again with
+`--upgrade`.
+
+### From a source checkout (for development)
+
+```sh
+git clone https://github.com/b-pass/pycommflag.git
+cd pycommflag
+python3 -m venv venv
+./venv/bin/pip install -e '.[all]'
+```
+
+The `pycommflag` command is then in `venv/bin`. You can also use `./run.sh`
+from the checkout, which activates `./venv` and, if `libjemalloc2` is
+installed, preloads it to reduce memory use.
+
+Optional extras: `mythtv` (MythTV database support), `train` (scikit-learn,
+for `--eval`), `yaml` (for `--yaml`), and `all`.
 
 ### Models
 
-pycommflag cannot flag anything without a trained model. Models are not stored
-in git. It looks for one in this order:
+pycommflag needs a trained model to flag anything. It looks for one in this
+order:
 
 1. `--model /path/to/file.keras`
-2. `models/model.keras` in the checkout (use `--models DIR` to change the directory)
-3. `models/model.h5`
+2. `model.keras`, then `model.h5`, in the models directory. This is `models/`
+   in a source checkout, or `~/.keras/pycommflag/` otherwise. Use `--models DIR`
+   to change it.
+3. Otherwise, it downloads the published model that matches this version of
+   pycommflag into `~/.keras/pycommflag/`. Pass `--no-download` to get an
+   error instead.
 
-A pre-trained model is published on the
-[releases page](https://github.com/b-pass/pycommflag/releases). A model only
-works with the version of pycommflag whose features it was trained on. If you
-update pycommflag and the model's input shape no longer matches, get a newer
-model or [train your own](#training-your-own-model).
+The first run also downloads the inaSpeechSegmenter audio model into
+`~/.keras/inaSpeechSegmenter/`. Both downloads happen once per user, so if
+MythTV runs pycommflag as the `mythtv` user, that user needs network access
+the first time too (or copy `~/.keras` over from another user).
+
+A model only works with the version of pycommflag whose features it was trained
+on. If they don't match, pycommflag stops with an error saying so, rather than
+flagging badly. You can [train your own](#training-your-own-model).
 
 ## Flagging a recording
 
@@ -127,7 +156,9 @@ changed. `-r` is how you apply a new model to old recordings.
 
 pycommflag reads the database credentials from `~/.mythtv/config.xml` of the
 user that runs it. If that file doesn't exist, all MythTV features are quietly
-skipped. For MythTV recordings named in the usual `<chanid>_<starttime>.ts`
+skipped, and the same happens if `mysqlclient` isn't installed. If you
+explicitly ask for MythTV (`-j`, `--chanid`, `--starttime`, `-e` or
+`-o mythtv`) without `mysqlclient`, pycommflag stops with an error. For MythTV recordings named in the usual `<chanid>_<starttime>.ts`
 format, pycommflag works out the channel and start time from the filename.
 You can also pass `--chanid`/`--starttime` or `-j JOBID`, just like with
 mythcommflag.
@@ -137,8 +168,9 @@ then as a user job on a few schedules, and finally as a full replacement for
 mythcommflag.
 
 Whenever MythTV runs pycommflag, it runs as the `mythtv` user. That user needs
-read access to the checkout and its `venv` and `models`, and it needs its own
-`~/.mythtv/config.xml`.
+pycommflag installed somewhere it can reach (see
+[On a MythTV backend](#on-a-mythtv-backend)), `mysqlclient` installed, and its
+own `~/.mythtv/config.xml`.
 
 ### Command line
 
@@ -194,15 +226,18 @@ of its own. So you must include `-j %JOBID%` yourself, and use a full path if
 `pycommflag` isn't on the backend's `PATH`.
 
 `-e` matters here. MythTV reads the command's exit status as the number of
-breaks found and treats 256 or higher as a failure. `-e` makes pycommflag exit
-with its break count, and makes crashes exit with 256, so MythTV doesn't read a
-crash as "1 break".
+breaks found, and treats values of 128 or more as a failure. `-e` makes
+pycommflag exit with its break count, and makes errors exit with 255, so
+MythTV doesn't read an error as "1 break". (255 is the only error value that
+survives MythTV's exit status handling.)
 
 For command-line compatibility, pycommflag also accepts mythcommflag's
 `--rebuild` (rebuild the seek table) and `--queue` options. It doesn't
 implement them: it just runs the real `mythcommflag` from the `PATH` with the
-same arguments. For that reason, don't replace the `mythcommflag` binary itself
-with pycommflag. Use the setting above instead.
+same arguments. Likewise, if the job queue hands pycommflag a job that
+`mythcommflag --queue --rebuild` created, pycommflag passes the whole job to the
+real `mythcommflag`. For these reasons, don't replace the `mythcommflag` binary
+itself with pycommflag. Use the setting above instead.
 
 ## Coming from comskip
 
@@ -302,7 +337,7 @@ are applied.
 
 ## Ideas / to do
 
-- Proper packaging (`setup.py` / PyPI).
+- Publish to PyPI.
 - Per-channel settings or models. So far, one model trained on enough varied
   data seems to generalize well.
 - New video/audio features. These mean retraining from scratch, and possibly
