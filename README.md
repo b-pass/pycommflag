@@ -86,12 +86,17 @@ pycommflag needs a trained model to flag anything. It looks for one in this
 order:
 
 1. `--model /path/to/file.keras`
-2. `model.keras`, then `model.h5`, in the models directory. This is `models/`
+2. `model.keras`, then `model.h5`, then the published model's file (e.g.
+   `pycommflag-f23-w60x60.keras`) in the models directory. This is `models/`
    in a source checkout, or `~/.keras/pycommflag/` otherwise. Use `--models DIR`
    to change it.
 3. Otherwise, it downloads the published model that matches this version of
-   pycommflag into `~/.keras/pycommflag/`. Pass `--no-download` to get an
+   pycommflag into the models directory. If that directory isn't writable, it
+   downloads to `~/.keras/pycommflag/` instead. Pass `--no-download` to get an
    error instead.
+
+Put your own model in the models directory as `model.keras` (a symlink works)
+to use it in place of the published one.
 
 The first run also downloads the inaSpeechSegmenter audio model into
 `~/.keras/inaSpeechSegmenter/`. Both downloads happen once per user, so if

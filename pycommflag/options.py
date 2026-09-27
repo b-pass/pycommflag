@@ -4,13 +4,16 @@ from enum import Enum
 
 # todo: automatically gz/ungz the feaature logs
 
+def user_models_dir():
+    """Per-user models dir, next to where keras caches the ina speech model."""
+    return os.path.join(os.environ.get('KERAS_HOME', os.path.join(os.path.expanduser('~'), '.keras')), 'pycommflag')
+
 def _default_models_dir():
-    # a source checkout keeps its models next to the package; an installed copy uses the
-    # same per-user cache that the auto-downloaded model goes into
+    # a source checkout keeps its models next to the package; an installed copy uses the per-user dir
     checkout = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'models')
     if os.path.isdir(checkout):
         return checkout
-    return os.path.join(os.environ.get('KERAS_HOME', os.path.join(os.path.expanduser('~'), '.keras')), 'pycommflag')
+    return user_models_dir()
 
 def get_options():
     parser = argparse.ArgumentParser(add_help=True,formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -54,9 +57,10 @@ def get_options():
     ml.add_argument('--batch-size', dest='tf_batch_size', type=int, default=1000,
                   help="Model training batch size")
     ml.add_argument('--models', dest='models_dir', default=_default_models_dir(),
-                  help="Path to use for models (output for training, input for infrencing)")
+                  help="Directory for models: training output, and where inference looks for model.keras, model.h5, "
+                       "then the published model (which is downloaded here if missing)")
     ml.add_argument('--model', dest='model_file', default='',
-                  help="Path to model to use for inference/prediction")
+                  help="Path to model to use for inference/prediction (default: look in the --models directory)")
     ml.add_argument('--no-download', dest='no_download', action='store_true',
                   help="Don't download the published model when no model is found")
     ml.add_argument('--eval', dest="eval", nargs='+',
