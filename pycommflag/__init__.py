@@ -5,14 +5,10 @@ pycommflag : A commercial flagging utility written in Python.
 This utility uses image, audio, video, and machine learning techniques to 
 identify ("flag") segments of a video as being one of several categories: 
 'content'(aka 'show'), 'commercial' (aka 'advertizing'), 'credits', etc.
-
-This utility can be run directly, or can be integrated into other 
-applications as a python module.
 """
 
-from . import logo_finder, options, processor, gui
-from .player import Player
-
+# submodules are imported on demand (see main.py) so that e.g. the tk GUI and
+# tensorflow are only loaded by the modes that need them
 
 import logging
 logging.getLogger('h5py').setLevel(logging.WARNING)

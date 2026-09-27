@@ -17,7 +17,7 @@ pycommflag flags segments of a TV recording as show/commercial (plus intro/credi
 
 ## Running
 
-No setup.py, no test suite, no linter config. Deps are in `requirements.txt` (TensorFlow/Keras, PyAV, scipy, scikit-image, mysqlclient, Pillow; scikit-learn only for `--eval`, pyyaml only for `--yaml`). Entry point is `python3 -m pycommflag` (from repo root) or `./run.sh`, which activates `./venv` if present and preloads jemalloc.
+No test suite, no linter config. Packaging is `pyproject.toml` (setuptools; console script `pycommflag = pycommflag.__main__:main`); it is the source of truth for deps, with extras `mythtv` (mysqlclient), `train` (scikit-learn, for `--eval`), `yaml` (pyyaml, for `--yaml`) and `all`. `requirements.txt` mirrors it (with all extras) for the `./run.sh` + `./venv` flow; keep the two in sync. `run.sh` activates `./venv` if present, preloads jemalloc, and runs `python3 -m pycommflag` from the checkout. `pycommflag/__init__.py` deliberately imports no submodules, so tkinter/TF are only loaded by modes that need them.
 
 ```sh
 ./run.sh -f video.ts                 # full pipeline: extract features -> feature log -> predict -> output
@@ -28,13 +28,13 @@ No setup.py, no test suite, no linter config. Deps are in `requirements.txt` (Te
 ./run.sh --no-log -o edl -f video.ts # don't keep feature log; write .edl next to video
 ```
 
-All options live in `options.get_options()` as one flat argparse parser (no subparsers, for mythcommflag CLI compatibility). The mode is derived afterwards by `options.resolve_mode` with fixed precedence: `--rebuild`/`--queue` > `-t` > `-r` > `--eval` > `-g` > flag. `--yaml FILE` overwrites any parsed option with the YAML's keys. Note `--deinterlace` stores `False` into `no_deinterlace` (deinterlacing is off by default). `main.run`'s return value is not used as the process exit code.
+All options live in `options.get_options()` as one flat argparse parser (no subparsers, for mythcommflag CLI compatibility). The mode is derived afterwards by `options.resolve_mode` with fixed precedence: `--rebuild`/`--queue` > `-t` > `-r` > `--eval` > `-g` > flag. `--yaml FILE` overwrites any parsed option with the YAML's keys. Note `--deinterlace` stores `False` into `no_deinterlace` (deinterlacing is off by default). `main.run`'s return value is the process exit code (via `__main__.main`; `run.py` ignores it).
 
 Without `-l` or `--no-log`, the feature log is written to `$TMPDIR/cf_<video basename>.json` and kept. When re-running `-f` against an existing log, its saved logo is reused and the logo search is skipped.
 
-Models live in `models/` (gitignored; `--models` overrides the dir). Prediction uses `--model`, else `models/model.keras`, falling back to `models/model.h5` — this lookup is duplicated in `neural.predict` and `neural.raw_predict`. The GUI calls `raw_predict`, so it needs a model too. Training writes `models/pycf-<val_acc>-...keras` only if val accuracy >= 0.95.
+The models dir (`--models`) defaults to the checkout's `models/` (gitignored) if it exists, else `~/.keras/pycommflag` (`options._default_models_dir`, so installed copies don't point into site-packages). `neural._find_model` resolves `--model`, else `model.keras`/`model.h5` in the models dir, else downloads `MODEL_URL` via `keras.utils.get_file` into `~/.keras/pycommflag/` (skipped with `--no-download`). `neural._load_model` rejects models whose input shape isn't `(WINDOW_BEFORE+1+WINDOW_AFTER, FEATURE_WIDTH)`; the published asset name `MODEL_FNAME` encodes that shape, so after a feature/window change a new model must be published and `MODEL_SHA256` updated. The GUI calls `raw_predict`, so it needs a model too. Training writes `<models dir>/pycf-<val_acc>-...keras` only if val accuracy >= 0.95.
 
-The ina_foss audio segmenter downloads its model on first use via `keras.utils.get_file` (needs network, cached in `~/.keras/datasets/inaSpeechSegmenter`).
+The ina_foss audio segmenter downloads its model on first use via `keras.utils.get_file` (needs network, cached in `~/.keras/inaSpeechSegmenter`; Keras 3's `get_file` has no `datasets/` level).
 
 Extraction and training both `os.nice()` themselves (10 and 19) because they are meant to run as background jobs.
 
@@ -63,6 +63,6 @@ Pipeline (orchestrated by `main.run`, which dispatches to the `_cmd_*` functions
 
 ### MythTV integration
 
-`mythtv.py` reads DB credentials from `~/.mythtv/config.xml`; if missing, all MythTV functions silently no-op. `main._resolve_inputs` fills in whatever is missing: filename from `-j` or from `--chanid`/`--starttime`, and `chanid`/`starttime` from `<chanid>_<starttime>.ext` (or `cf_<chanid>_<starttime>...`) filenames. `-j JOBID` updates job-queue status; `-e` makes `set_breaks` `sys.exit()` with the number of breaks (and forces uncaught exceptions to exit 256 so MythTV doesn't misread them). `--rebuild`/`--queue` just exec the real `mythcommflag`. `check_method(chanid)` respects per-channel commflag-disabled settings; when disabled, an empty break list is still output. `mythtv.get_breaks`/`processor.guess_external_breaks` can read existing breaks back out of MythTV.
+`mythtv.py` reads DB credentials from `~/.mythtv/config.xml`; if it is missing or mysqlclient isn't installed, all MythTV functions silently no-op (so `-o auto` falls back to EDL). `main._check_mythtv_support` errors out up front if MythTV was explicitly requested (`-j`/`--chanid`/`--starttime`/`-e`/`-o mythtv`) without mysqlclient. `main._resolve_inputs` fills in whatever is missing: filename from `-j` or from `--chanid`/`--starttime`, and `chanid`/`starttime` from `<chanid>_<starttime>.ext` (or `cf_<chanid>_<starttime>...`) filenames. `-j JOBID` updates job-queue status; `-e` makes `set_breaks` `sys.exit()` with the number of breaks (and forces uncaught exceptions to exit 255: MythTV runs the command with `kMSLowExitVal`, which mangles 128–254, and 256 wraps to 0, so 255 is the only error status it sees as a failure). `--rebuild`/`--queue` just exec the real `mythcommflag`, and so does a `-j` flag run whose jobqueue row has `JOB_REBUILD` set (queued by `mythcommflag --queue --rebuild`; `main.run` execs `mythcommflag -j N --noprogress`). `check_method(chanid)` respects per-channel commflag-disabled settings; when disabled, an empty break list is still output. `mythtv.get_breaks`/`processor.guess_external_breaks` can read existing breaks back out of MythTV.
 
 `extern/` contains vendored code (inaSpeechSegmenter, sidekit MFCC, pyannote viterbi) — avoid restyling it.

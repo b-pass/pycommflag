@@ -12,12 +12,23 @@ def run(opts) -> int:
         os.execvp("mythcommflag", ["mythcommflag"] + sys.argv[1:])
 
     if opts.exitcode:
-        # make sure to return >= 256 for unhandled exceptions
-        # otherwise mythtv will stupidly interpret python's exit(1) as a number of commercials
+        # mythtv reads the exit status as the number of breaks, so errors must exit 255: python's
+        # exit(1) would be "1 break", 256 wraps to 0, and myth_system(kMSLowExitVal) mangles 128-254
         def myexcepthook(type, value, tb):
             sys.__excepthook__(type, value, tb)
-            sys.exit(256)
+            sys.exit(255)
         sys.excepthook = myexcepthook
+
+    if err := _check_mythtv_support(opts):
+        print(err)
+        return 255 if opts.exitcode else 1
+
+    if opts.mythjob and opts.mode is Mode.FLAG:
+        from .mythtv import is_rebuild_job
+        if is_rebuild_job(opts.mythjob):
+            # we're the JobQueueCommFlagCommand, but this job wants a seek-table rebuild, so the
+            # real mythcommflag handles the whole job (including its status and exit code)
+            os.execvp("mythcommflag", ["mythcommflag", "-j", str(opts.mythjob), "--noprogress"])
 
     # training has no single input file, so it runs before input resolution
     if opts.mode is Mode.TRAIN:
@@ -32,6 +43,18 @@ def run(opts) -> int:
         Mode.GUI: _cmd_gui,
         Mode.FLAG: _cmd_flag,
     }[opts.mode](opts)
+
+def _check_mythtv_support(opts) -> None|str:
+    """MythTV support is optional, but asking for it explicitly without mysqlclient is an error."""
+    explicit = opts.mythjob or opts.chanid or opts.starttime or opts.exitcode or opts.output_type in ('mythtv', 'myth')
+    if not explicit:
+        return None
+    try:
+        import MySQLdb
+    except ImportError:
+        return ('MythTV options need mysqlclient: run "pipx inject pycommflag mysqlclient" '
+                'or "pip install \'pycommflag[mythtv]\'"')
+    return None
 
 # --- input resolution ---------------------------------------------------------
 

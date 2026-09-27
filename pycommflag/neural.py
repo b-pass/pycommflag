@@ -60,6 +60,12 @@ WINDOW_BEFORE = 60
 WINDOW_AFTER = 60
 SUMMARY_RATE = 1
 RATE = 29.97
+
+# Pre-trained model downloaded when none is found locally. The asset name encodes the input
+# shape; publish a new one (and update these) whenever FEATURE_WIDTH or the window sizes change.
+MODEL_FNAME = f'pycommflag-f{FEATURE_WIDTH}-w{WINDOW_BEFORE}x{WINDOW_AFTER}.keras'
+MODEL_URL = 'https://github.com/b-pass/pycommflag/releases/download/models/' + MODEL_FNAME
+MODEL_SHA256 = None # TODO: set when the model is published
 DIFF_THRESHOLD = 15.0
 
 # training params
@@ -804,6 +810,7 @@ def train(opts:Any=None):
         print('Saving as ' + name)
 
         import shutil
+        os.makedirs(os.path.dirname(name), exist_ok=True)
         shutil.copy(model_path, name)
         try: os.chmod(name, 0o644)
         except: pass
@@ -812,25 +819,44 @@ def train(opts:Any=None):
 
     return 0
 
-def raw_predict(feature_log:str|TextIO|dict, opts:Any=None)->list:
-    import keras
+def _find_model(opts:Any)->str:
+    """--model, else model.keras/model.h5 in the models dir, else download the published model."""
+    if opts is not None and opts.model_file:
+        if not os.path.exists(opts.model_file):
+            raise Exception(f"Model file '{opts.model_file}' does not exist")
+        return opts.model_file
 
+    models_dir = (opts.models_dir if opts is not None else None) or '.'
+    for name in ('model.keras', 'model.h5'):
+        mf = os.path.join(models_dir, name)
+        if os.path.exists(mf):
+            return mf
+
+    if opts is not None and getattr(opts, 'no_download', False):
+        raise Exception(f"No model.keras or model.h5 in '{models_dir}' (and --no-download was given)")
+
+    from keras.utils import get_file
+    log.info(f'No model in {models_dir}, downloading {MODEL_URL}')
+    return get_file(MODEL_FNAME, MODEL_URL, cache_subdir='pycommflag', file_hash=MODEL_SHA256)
+
+def _load_model(opts:Any):
+    import keras
+    mf = _find_model(opts)
+    model:keras.models.Model = keras.models.load_model(mf)
+    assert(model.output_shape[-1] == 1)
+    want = (WINDOW_BEFORE + 1 + WINDOW_AFTER, FEATURE_WIDTH)
+    if tuple(model.input_shape[-2:]) != want:
+        raise Exception(f"Model '{mf}' expects input {tuple(model.input_shape[-2:])} but this version of "
+                        f"pycommflag produces {want}; it was trained for an incompatible pycommflag version")
+    return model
+
+def raw_predict(feature_log:str|TextIO|dict, opts:Any=None)->list:
     flog = processor.read_feature_log(feature_log)
     frame_rate = flog.get('frame_rate', 29.97)
     
     assert(flog['frames'][-1][0] > frame_rate)
 
-    mf = opts.model_file if opts is not None else './model.keras'
-    if not mf and opts:
-        mf = f'{opts.models_dir or "."}{os.sep}model.keras'
-    if not os.path.exists(mf):
-        blah = mf
-        mf = f'{opts.models_dir or "."}{os.sep}model.h5'
-        if not os.path.exists(mf):
-            raise Exception(f"Model files '{blah}' or '{mf}' do not exist")
-    
-    model:keras.models.Model = keras.models.load_model(mf)
-    assert(model.output_shape[-1] == 1)
+    model = _load_model(opts)
 
     data,_,_,times = load_data_sliding_window(load_nonpersistent(flog, False))
     prediction = model.predict(make_data_generator(data), verbose=True)
@@ -841,24 +867,12 @@ def predict(feature_log:str|TextIO|dict, opts:Any, write_log=None)->list:
     from .mythtv import set_job_status
     set_job_status(opts, "Inferencing...")
 
-    import keras
-
     flog = processor.read_feature_log(feature_log)
     frame_rate = flog.get('frame_rate', 29.97)
     
     assert(flog['frames'][-1][0] > frame_rate)
 
-    mf = opts.model_file
-    if not mf and opts:
-        mf = f'{opts.models_dir or "."}{os.sep}model.keras'
-    if not os.path.exists(mf):
-        blah = mf
-        mf = f'{opts.models_dir or "."}{os.sep}model.h5'
-        if not os.path.exists(mf):
-            raise Exception(f"Model files '{blah}' or '{mf}' do not exist")
-    
-    model:keras.models.Model = keras.models.load_model(mf)
-    assert(model.output_shape[-1] == 1)
+    model = _load_model(opts)
 
     data,_,_,times = load_data_sliding_window(load_nonpersistent(flog, False))
     prediction = model.predict(make_data_generator(data), verbose=True)

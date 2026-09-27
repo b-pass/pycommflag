@@ -4,6 +4,14 @@ from enum import Enum
 
 # todo: automatically gz/ungz the feaature logs
 
+def _default_models_dir():
+    # a source checkout keeps its models next to the package; an installed copy uses the
+    # same per-user cache that the auto-downloaded model goes into
+    checkout = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'models')
+    if os.path.isdir(checkout):
+        return checkout
+    return os.path.join(os.environ.get('KERAS_HOME', os.path.join(os.path.expanduser('~'), '.keras')), 'pycommflag')
+
 def get_options():
     parser = argparse.ArgumentParser(add_help=True,formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
@@ -45,10 +53,12 @@ def get_options():
                   help="Data to train/eval with, as a list of feature-log files")
     ml.add_argument('--batch-size', dest='tf_batch_size', type=int, default=1000,
                   help="Model training batch size")
-    ml.add_argument('--models', dest='models_dir', default=os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', 'models'),
+    ml.add_argument('--models', dest='models_dir', default=_default_models_dir(),
                   help="Path to use for models (output for training, input for infrencing)")
     ml.add_argument('--model', dest='model_file', default='',
                   help="Path to model to use for inference/prediction")
+    ml.add_argument('--no-download', dest='no_download', action='store_true',
+                  help="Don't download the published model when no model is found")
     ml.add_argument('--eval', dest="eval", nargs='+',
                   help="List of model files to evaluate against the supplied data")
     
