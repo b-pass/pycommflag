@@ -61,11 +61,12 @@ WINDOW_AFTER = 60
 SUMMARY_RATE = 1
 RATE = 29.97
 
-# Pre-trained model downloaded when none is found locally. The asset name encodes the input
-# shape; publish a new one (and update these) whenever FEATURE_WIDTH or the window sizes change.
+# Pre-trained model downloaded when none is found locally. It is saved under MODEL_FNAME, which
+# encodes the input shape, so a feature/window change never reuses a stale download; publish a
+# new model (and update these) whenever FEATURE_WIDTH or the window sizes change.
 MODEL_FNAME = f'pycommflag-f{FEATURE_WIDTH}-w{WINDOW_BEFORE}x{WINDOW_AFTER}.keras'
-MODEL_URL = 'https://github.com/b-pass/pycommflag/releases/download/models/' + MODEL_FNAME
-MODEL_SHA256 = None # TODO: set when the model is published
+MODEL_URL = 'https://github.com/b-pass/pycommflag/releases/download/beta/'
+MODEL_SHA256 = 'de0caec88492c670e078fa4fb50c85e49edbf10e7d9117b948a4baa358e08ce5'
 DIFF_THRESHOLD = 15.0
 
 # training params
@@ -826,13 +827,16 @@ def _find_model(opts:Any)->str:
             raise Exception(f"Model file '{opts.model_file}' does not exist")
         return opts.model_file
 
-    models_dir = (opts.models_dir if opts is not None else None) or '.'
-    for name in ('model.keras', 'model.h5', MODEL_FNAME):
+    models_dir = (opts.models_dir if opts is not None else None) or './models/'
+    for name in ('model.keras', 'model.h5'):
         mf = os.path.join(models_dir, name)
         if os.path.exists(mf):
             return mf
 
+    downloaded = os.path.join(models_dir, MODEL_FNAME)
     if opts is not None and getattr(opts, 'no_download', False):
+        if os.path.exists(downloaded):
+            return downloaded
         raise Exception(f"No model.keras, model.h5 or {MODEL_FNAME} in '{models_dir}' (and --no-download was given)")
 
     try:
@@ -848,7 +852,7 @@ def _find_model(opts:Any)->str:
         os.makedirs(cache_dir, exist_ok=True)
 
     from keras.utils import get_file
-    log.info(f'No model in {models_dir}, downloading {MODEL_URL} into {cache_dir}')
+    log.info(f'No model.keras in {models_dir}, using the published model {MODEL_URL} (cached in {cache_dir})')
     return get_file(MODEL_FNAME, MODEL_URL, cache_dir=cache_dir, cache_subdir='', file_hash=MODEL_SHA256)
 
 def _load_model(opts:Any):
