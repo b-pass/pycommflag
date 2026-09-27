@@ -820,24 +820,36 @@ def train(opts:Any=None):
     return 0
 
 def _find_model(opts:Any)->str:
-    """--model, else model.keras/model.h5 in the models dir, else download the published model."""
+    """--model, else model.keras/model.h5 in the models dir, else the published model (downloaded into the models dir)."""
     if opts is not None and opts.model_file:
         if not os.path.exists(opts.model_file):
             raise Exception(f"Model file '{opts.model_file}' does not exist")
         return opts.model_file
 
     models_dir = (opts.models_dir if opts is not None else None) or '.'
-    for name in ('model.keras', 'model.h5'):
+    for name in ('model.keras', 'model.h5', MODEL_FNAME):
         mf = os.path.join(models_dir, name)
         if os.path.exists(mf):
             return mf
 
     if opts is not None and getattr(opts, 'no_download', False):
-        raise Exception(f"No model.keras or model.h5 in '{models_dir}' (and --no-download was given)")
+        raise Exception(f"No model.keras, model.h5 or {MODEL_FNAME} in '{models_dir}' (and --no-download was given)")
+
+    try:
+        os.makedirs(models_dir, exist_ok=True)
+    except OSError:
+        pass
+    if os.access(models_dir, os.W_OK):
+        cache_dir = models_dir
+    else:
+        # e.g. a root-owned checkout run by the mythtv user; get_file would otherwise fall back to /tmp
+        from .options import user_models_dir
+        cache_dir = user_models_dir()
+        os.makedirs(cache_dir, exist_ok=True)
 
     from keras.utils import get_file
-    log.info(f'No model in {models_dir}, downloading {MODEL_URL}')
-    return get_file(MODEL_FNAME, MODEL_URL, cache_subdir='pycommflag', file_hash=MODEL_SHA256)
+    log.info(f'No model in {models_dir}, downloading {MODEL_URL} into {cache_dir}')
+    return get_file(MODEL_FNAME, MODEL_URL, cache_dir=cache_dir, cache_subdir='', file_hash=MODEL_SHA256)
 
 def _load_model(opts:Any):
     import keras
