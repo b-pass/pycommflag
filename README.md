@@ -255,7 +255,104 @@ itself with pycommflag. Use the setting above instead.
   can go in a YAML file (`--yaml`) if you'd rather not put them on the command
   line.
 - Post-processing scripts that run comskip can call
-  `pycommflag --no-log -o edl -f "$FILE"` instead.
+  `pycommflag --no-log -o edl -f "$FILE"` instead. See the next section for
+  specific DVRs.
+
+## Using it with other DVRs and players
+
+Most DVRs can run a command when a recording finishes, and many players and
+plugins read `.edl` files that sit next to the video. pycommflag fits anywhere
+comskip does in that kind of setup.
+
+A few things apply to all of them:
+
+- The DVR runs pycommflag as its own service user (e.g. `hts` for Tvheadend),
+  so install it system-wide as in
+  [On a MythTV backend](#on-a-mythtv-backend), without the `[mythtv]` extra.
+  That user also needs network access the first time, to download the models
+  (see [Models](#models)).
+- Flagging takes a while (see [Speed](#speed)), so the skip markers show up a
+  few minutes after the recording ends.
+- The `.edl` from a normal run contains only commercial breaks (type `3`). If
+  you re-save a recording from the GUI, any Intro/Credits/Ignore segments you
+  marked are also written, as type `2`. Kodi treats `2` as a scene marker, but
+  some plugins read it differently (see Jellyfin below).
+
+### Tvheadend (with Kodi)
+
+Tvheadend reads `.edl` and comskip `.txt` files next to a recording and sends
+them to Kodi's Tvheadend client as commercial skip points. In the web UI, go to
+Configuration → Recording → Digital Video Recorder Profiles, and set
+**Post-processor command** to:
+
+```
+/usr/local/bin/pycommflag --no-log -o edl -f "%f"
+```
+
+`%f` is the full path of the recording. Tvheadend runs the command without a
+shell, so use the full path to `pycommflag`.
+
+### Kodi on its own
+
+Kodi reads `.edl` and comskip `.txt` files next to a video, and skips entries
+of type `3` (commercial break). If Kodi plays your recordings as files, write
+either format with `-o edl` or `-o txt`, from whatever runs after each
+recording.
+
+### Jellyfin
+
+Jellyfin doesn't read EDL files itself. The
+[EdlToMediaSegments](https://github.com/rrhett/EdlToMediaSegments) plugin
+turns them into Jellyfin "media segments", which clients can skip. Type `3`
+becomes a Commercial segment. That plugin treats type `2` as "Recap", so only
+use EDL files from normal flagging runs with it, not ones re-saved from the
+GUI.
+
+To run pycommflag after each recording, create a small wrapper script, e.g.
+`/usr/local/bin/pycommflag-jellyfin`:
+
+```sh
+#!/bin/sh
+exec /usr/local/bin/pycommflag --no-log -o edl -f "$1"
+```
+
+Make it executable. Then, in Dashboard → DVR → Recording Post Processing, set
+**Post-processing application** to the script, and **Post-processor command
+line arguments** to `"{path}"`. Jellyfin's docs recommend a wrapper script
+because of how it quotes arguments. New segments appear after the plugin's next
+scan. You can also start one from Scheduled Tasks → "Media Segment Scan".
+
+### Emby
+
+The [Emby.ComSkipper](https://github.com/BillOatmanWork/Emby.ComSkipper) plugin
+skips commercials using the `.edl` files next to recordings. Use Emby's DVR
+post-processing setting to run pycommflag with `-o edl`, as for Jellyfin.
+
+### NextPVR
+
+NextPVR reads a `.edl` next to each recording and shows the breaks on its
+timeline. Put a post-processing script in NextPVR's `Scripts` directory
+(`PostProcessing.bat` on Windows). NextPVR passes the recording's filename as
+the first argument, and the script should run:
+
+```
+pycommflag --no-log -o edl -f <filename>
+```
+
+### Plex
+
+Plex has its own comskip-based commercial detection, and it doesn't read
+`.edl` files. Its **Postprocessing Script** setting (Settings → Live TV & DVR →
+DVR Settings) can run pycommflag, but the breaks then have to be cut out of the
+file itself. For example, a script could run `pycommflag -o edl` and then use
+the `.edl` to drive ffmpeg. pycommflag doesn't include such a script.
+
+### Channels DVR and HDHomeRun DVR
+
+Channels DVR has built-in, comskip-based commercial detection, and there's no
+supported way to plug in a different detector. HDHomeRun's DVR has no
+commercial skipping of its own. In both cases, pycommflag is only useful if
+your player can read `.edl` files.
 
 ## Training your own model
 

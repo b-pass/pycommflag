@@ -855,15 +855,24 @@ def _find_model(opts:Any)->str:
     log.info(f'No model.keras in {models_dir}, using the published model {MODEL_URL} (cached in {cache_dir})')
     return get_file(MODEL_FNAME, MODEL_URL, cache_dir=cache_dir, cache_subdir='', file_hash=MODEL_SHA256)
 
+# path -> (mtime, model). Every keras load_model leaks ~5MB inside TF (clear_session doesn't free
+# it), which adds up when -r re-predicts many logs, so each model file is only loaded once.
+_model_cache:dict = {}
+
 def _load_model(opts:Any):
     import keras
     mf = _find_model(opts)
+    key = os.path.realpath(mf) # so repointing a model.keras symlink loads the new model
+    mtime = os.path.getmtime(key)
+    if (cached := _model_cache.get(key)) is not None and cached[0] == mtime:
+        return cached[1]
     model:keras.models.Model = keras.models.load_model(mf)
     assert(model.output_shape[-1] == 1)
     want = (WINDOW_BEFORE + 1 + WINDOW_AFTER, FEATURE_WIDTH)
     if tuple(model.input_shape[-2:]) != want:
         raise Exception(f"Model '{mf}' expects input {tuple(model.input_shape[-2:])} but this version of "
                         f"pycommflag produces {want}; it was trained for an incompatible pycommflag version")
+    _model_cache[key] = (mtime, model)
     return model
 
 def raw_predict(feature_log:str|TextIO|dict, opts:Any=None)->list:
