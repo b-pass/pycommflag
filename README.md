@@ -1,34 +1,75 @@
-# pycommflag
+# 📺 pycommflag
 
-pycommflag finds the commercials in TV recordings. It extracts video and audio
-features from a recording, runs them through a small neural network, and
-outputs the commercial breaks. You can send those breaks to MythTV, or write
-them as an EDL or comskip-style `.txt` file.
+pycommflag finds the commercials in TV recordings using a small neural network.
 
-It is a drop-in replacement for MythTV's `mythcommflag`: it accepts the same
-job-queue arguments and writes breaks into the same database table, so
-mythfrontend, MythWeb, and kodi-pvr-mythtv can use them as they are. It can also
-stand in for [comskip](https://github.com/erikkaashoek/Comskip) wherever you
-currently use comskip's `.edl` or `.txt` output.
+- It is a drop-in replacement for MythTV's `mythcommflag`, and it can also write
+  comskip-style `.edl` and `.txt` files for Kodi, Tvheadend, Jellyfin, Emby,
+  NextPVR, and others.
+- It was built and tuned in the 2020s for US cable and broadcast TV.
+- It works on shows that have no station logo.
+- It uses the audio as well as the picture.
+- The trade-off: it is slower than the older tools (about 10 minutes per hour of
+  video), and there's no `.ini` to tune. If it gets something wrong, you correct
+  it and retrain.
 
 pycommflag builds on many ideas from mythcommflag and would not exist without it.
 mythcommflag was revolutionary in its day, but its algorithms have not changed
 significantly in more than 15 years.
 
-## How it differs from mythcommflag and comskip
+**Contents:**
+[Quick start](#-quick-start) ·
+[How it compares](#-how-it-compares) ·
+[Installation](#-installation) ·
+[Flagging a recording](#-flagging-a-recording) ·
+[MythTV](#-using-it-with-mythtv) ·
+[Coming from comskip](#-coming-from-comskip) ·
+[Other DVRs and players](#-using-it-with-other-dvrs-and-players) ·
+[Training](#-training-your-own-model) ·
+[How it works](#-how-it-works) ·
+[Ideas / to do](#-ideas--to-do)
 
-| | mythcommflag / comskip | pycommflag |
-|---|---|---|
-| Detection | Hand-tuned heuristics (blank frames, logo, scene changes, aspect ratio, …) | A neural network that learns from those same kinds of signals |
-| Tuning | Many knobs (`comskip.ini`, detection method bitmasks) | A few limits on break length. To improve accuracy, you correct its mistakes and retrain |
-| Re-running | Decodes the whole video again | Saves a small "feature log" and can re-flag from it in seconds |
-| Speed | Fast | Slower (see [Speed](#speed)) |
+## 🚀 Quick start
+
+```sh
+pipx install git+https://github.com/b-pass/pycommflag
+pycommflag -f /path/to/recording.ts
+```
+
+If the recording is in MythTV, the breaks go straight into its database.
+Otherwise, you get a `recording.edl` next to the video. The first run downloads
+the models. See [Installation](#-installation) for MythTV backends and other
+setups, then [Using it with MythTV](#-using-it-with-mythtv) or
+[other DVRs and players](#-using-it-with-other-dvrs-and-players).
+
+## 🆚 How it compares
+
+| | pycommflag | mythcommflag | comskip |
+|---|---|---|---|
+| Approach | Neural network trained on hand-labeled recordings | Hand-written heuristics | Hand-written heuristics, with about 100 `.ini` settings |
+| Video cues | Station logo, blank frames, scene changes | Blank frames, scene changes, station logo | Blank frames, station logo, scene changes, aspect ratio and resolution changes |
+| Audio cues | Speech/music/noise classification, front and surround volume, silence | None | Volume and silence |
+| Shows with no station logo | Handled; it is also trained on recordings with the logo removed | Blank frames and scene changes only | Falls back on its other methods |
+| Tuned for | 2020s US cable and broadcast TV | 2000s-era TV (largely unchanged since) | Whatever your `.ini` says; many community `.ini` files exist |
+| Improving accuracy | Correct mistakes in the GUI and retrain | Pick a detection method per channel | Edit `comskip.ini` |
+| Re-flagging with a new model or settings | Seconds, from a saved "feature log" | Decodes the whole video again | Decodes the whole video again |
+| Speed | About 10 min per hour of video (see [Speed](#speed)) | Fast | Very fast |
+| Output | MythTV database, EDL, comskip `.txt` | MythTV database | EDL, `.txt`, and many player-specific formats |
+| Runs on | Linux, with Python 3.10+ and TensorFlow | Part of MythTV | Windows, Linux, macOS |
+| License | MIT | GPL-2 | GPL-2 |
 
 pycommflag does not read `comskip.ini` or MythTV's per-channel detection method
 bitmask. The only per-channel MythTV setting it honors is "commercial flagging
 disabled".
 
-## Installation
+What about other flaggers? Plex, Channels DVR, NextPVR, and the Emby and
+Jellyfin commercial-skip plugins all run comskip under the hood. MCEBuddy is a
+Windows wrapper around comskip or ShowAnalyzer, and ShowAnalyzer is
+closed-source and no longer developed.
+[tv-detect](https://github.com/simonchrz/tv-detect) is another machine-learning
+detector, aimed at German TV. Jellyfin's Intro Skipper finds repeated intros,
+not commercials.
+
+## 📦 Installation
 
 You need Python 3.10 or newer. A few features also need system packages:
 
@@ -105,9 +146,9 @@ the first time too (or copy `~/.keras` over from another user).
 
 A model only works with the version of pycommflag whose features it was trained
 on. If they don't match, pycommflag stops with an error saying so, rather than
-flagging badly. You can [train your own](#training-your-own-model).
+flagging badly. You can [train your own](#-training-your-own-model).
 
-## Flagging a recording
+## 🎬 Flagging a recording
 
 ```sh
 pycommflag -f /path/to/recording.ts
@@ -157,7 +198,7 @@ pycommflag -r /tmp/cf_*.json
 With several logs, `-r` rewrites a log and its output only when the breaks
 changed. `-r` is how you apply a new model to old recordings.
 
-## Using it with MythTV
+## 📼 Using it with MythTV
 
 pycommflag reads the database credentials from `~/.mythtv/config.xml` of the
 user that runs it. If that file doesn't exist, all MythTV features are quietly
@@ -244,7 +285,7 @@ same arguments. Likewise, if the job queue hands pycommflag a job that
 real `mythcommflag`. For these reasons, don't replace the `mythcommflag` binary
 itself with pycommflag. Use the setting above instead.
 
-## Coming from comskip
+## 🔄 Coming from comskip
 
 - Use `-o txt` to get comskip's `.txt` format, or `-o edl` to get an `.edl` for
   Kodi and other players that understand EDL action `3` (commercial break).
@@ -258,7 +299,7 @@ itself with pycommflag. Use the setting above instead.
   `pycommflag --no-log -o edl -f "$FILE"` instead. See the next section for
   specific DVRs.
 
-## Using it with other DVRs and players
+## 🔌 Using it with other DVRs and players
 
 Most DVRs can run a command when a recording finishes, and many players and
 plugins read `.edl` files that sit next to the video. pycommflag fits anywhere
@@ -354,7 +395,7 @@ supported way to plug in a different detector. HDHomeRun's DVR has no
 commercial skipping of its own. In both cases, pycommflag is only useful if
 your player can read `.edl` files.
 
-## Training your own model
+## 🧠 Training your own model
 
 If pycommflag keeps getting a channel or show wrong, the fix is more training
 data, not more knobs.
@@ -415,7 +456,7 @@ expects, and accuracy may drop. In that case, train on logs extracted with the
 same options. The published model uses the defaults, which suit US cable and HD
 broadcast TV. It may do less well elsewhere.
 
-## How it works
+## 🔬 How it works
 
 For every video frame, pycommflag records:
 
@@ -437,7 +478,7 @@ commercial. Finally, those probabilities are turned into breaks: each break is
 snapped to nearby blank frames or scene changes, and the length limits above
 are applied.
 
-## Ideas / to do
+## 💡 Ideas / to do
 
 - Publish to PyPI.
 - Per-channel settings or models. So far, one model trained on enough varied
