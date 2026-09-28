@@ -118,8 +118,8 @@ The `pycommflag` command is then in `venv/bin`. You can also use `./run.sh`
 from the checkout, which activates `./venv` and, if `libjemalloc2` is
 installed, preloads it to reduce memory use.
 
-Optional extras: `mythtv` (MythTV database support), `train` (scikit-learn,
-for `--eval`), `yaml` (for `--yaml`), and `all`.
+Optional extras: `mythtv` (MythTV database support), `yaml` (for `--yaml`),
+and `all`.
 
 ### Models
 
@@ -435,7 +435,7 @@ If the best epoch reaches at least 0.95 validation accuracy, it is saved to
 can easily compare runs. To use a model, pass it with `--model` or link it as
 `models/model.keras`. Then re-flag your saved logs with `-r`.
 
-To compare models on the same data (this needs `scikit-learn`):
+To compare models on the same data:
 
 ```sh
 pycommflag --eval models/model.keras models/pycf-0.97-….keras --data /path/to/curated/*.json
@@ -481,7 +481,6 @@ are applied.
 ## 💡 Ideas / to do
 
 - Publish to PyPI.
-- Per-channel settings or models. So far, one model trained on enough varied
-  data seems to generalize well.
-- New video/audio features. These mean retraining from scratch, and possibly
-  re-curating data.
+- Per-channel settings or models. So far, one model trained on enough varied data seems to generalize well.
+- Live/streaming flagging ... would need to lag at least a couple minutes behind live TV, but could be done.  Would this require integration with the recorder, or could it be accomplished just with access to the file on disk?
+- Training logs from other countries might help?  Or fine tuning for those?  Should we have a SILENCE_SINCE/SILENCE_UNIT feature for UK?  Or the existing audio classes already work well enough for UK?
