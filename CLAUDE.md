@@ -17,7 +17,7 @@ pycommflag flags segments of a TV recording as show/commercial (plus intro/credi
 
 ## Running
 
-No test suite, no linter config. Packaging is `pyproject.toml` (setuptools; console script `pycommflag = pycommflag.__main__:main`); it is the source of truth for deps, with extras `mythtv` (mysqlclient), `train` (scikit-learn, for `--eval`), `yaml` (pyyaml, for `--yaml`) and `all`. `requirements.txt` mirrors it (with all extras) for the `./run.sh` + `./venv` flow; keep the two in sync. `run.sh` activates `./venv` if present, preloads jemalloc, and runs `python3 -m pycommflag` from the checkout. `pycommflag/__init__.py` deliberately imports no submodules, so tkinter/TF are only loaded by modes that need them.
+No test suite, no linter config. Packaging is `pyproject.toml` (setuptools; console script `pycommflag = pycommflag.__main__:main`); it is the source of truth for deps, with extras `mythtv` (mysqlclient), `yaml` (pyyaml, for `--yaml`) and `all`. `requirements.txt` mirrors it (with all extras) for the `./run.sh` + `./venv` flow; keep the two in sync. `run.sh` activates `./venv` if present, preloads jemalloc, and runs `python3 -m pycommflag` from the checkout. `pycommflag/__init__.py` deliberately imports no submodules, so tkinter/TF are only loaded by modes that need them.
 
 ```sh
 ./run.sh -f video.ts                 # full pipeline: extract features -> feature log -> predict -> output
