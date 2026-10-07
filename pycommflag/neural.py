@@ -881,10 +881,14 @@ def raw_predict(feature_log:str|TextIO|dict, opts:Any=None)->list:
     
     assert(flog['frames'][-1][0] > frame_rate)
 
-    model = _load_model(opts)
+    data = load_nonpersistent(flog, False)
+    if data is None:
+        return []
+    data,_,_,times = load_data_sliding_window(data)
+    data = make_data_generator(data)
 
-    data,_,_,times = load_data_sliding_window(load_nonpersistent(flog, False))
-    prediction = model.predict(make_data_generator(data), verbose=True)
+    model = _load_model(opts)
+    prediction = model.predict(data, verbose=True)
 
     return list(zip(times, prediction.flatten()))
 
@@ -897,10 +901,15 @@ def predict(feature_log:str|TextIO|dict, opts:Any, write_log=None)->list:
     
     assert(flog['frames'][-1][0] > frame_rate)
 
-    model = _load_model(opts)
+    data = load_nonpersistent(flog, False)
+    if data is None:
+        log.debug(f'Final tags n=0: no tags')
+        return []
+    data,_,_,times = load_data_sliding_window(data)
+    data = make_data_generator(data)
 
-    data,_,_,times = load_data_sliding_window(load_nonpersistent(flog, False))
-    prediction = model.predict(make_data_generator(data), verbose=True)
+    model = _load_model(opts)
+    prediction = model.predict(data, verbose=True)
 
     results = post_predict(flog, prediction.flatten(), times, opts)
     if not results:
