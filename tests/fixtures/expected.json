@@ -1,0 +1,190 @@
+{
+ "alert-band-1080": {
+  "expect": {
+   "bbox": [
+    919,
+    97,
+    978,
+    156
+   ],
+   "mask_px": 539,
+   "stuck": [
+    [
+     [
+      992,
+      0
+     ],
+     [
+      1080,
+      1920
+     ]
+    ]
+   ],
+   "thresh": 359
+  },
+  "human_verdict": "confirmed by eye: a real weather alert, a full-width band across the bottom with the station logo above it"
+ },
+ "alert-band-720": {
+  "expect": {
+   "bbox": [
+    558,
+    1129,
+    646,
+    1222
+   ],
+   "mask_px": 624,
+   "stuck": [
+    [
+     [
+      662,
+      53
+     ],
+     [
+      720,
+      1280
+     ]
+    ]
+   ],
+   "thresh": 416
+  },
+  "human_verdict": "confirmed by eye: a real weather alert, a band across the bottom with the station logo above it"
+ },
+ "logo-1080-large": {
+  "expect": {
+   "bbox": [
+    871,
+    1697,
+    1001,
+    1825
+   ],
+   "mask_px": 3327,
+   "stuck": [],
+   "thresh": 2218
+  },
+  "human_verdict": null
+ },
+ "logo-1080-translucent": {
+  "expect": {
+   "bbox": [
+    909,
+    97,
+    969,
+    157
+   ],
+   "mask_px": 771,
+   "stuck": [],
+   "thresh": 514
+  },
+  "human_verdict": null
+ },
+ "logo-1080-wide": {
+  "expect": {
+   "bbox": [
+    919,
+    1554,
+    1020,
+    1809
+   ],
+   "mask_px": 3335,
+   "stuck": [],
+   "thresh": 2223
+  },
+  "human_verdict": null
+ },
+ "logo-720": {
+  "expect": {
+   "bbox": [
+    598,
+    1129,
+    690,
+    1222
+   ],
+   "mask_px": 1583,
+   "stuck": [],
+   "thresh": 1055
+  },
+  "human_verdict": null
+ },
+ "logo-720-b": {
+  "expect": {
+   "bbox": [
+    569,
+    980,
+    664,
+    1155
+   ],
+   "mask_px": 3959,
+   "stuck": [],
+   "thresh": 2639
+  },
+  "human_verdict": null
+ },
+ "logo-handflagged": {
+  "expect": {
+   "bbox": [
+    877,
+    1596,
+    1042,
+    1825
+   ],
+   "mask_px": 1850,
+   "stuck": [],
+   "thresh": 1233
+  },
+  "human_verdict": "confirmed by eye: a real and useful logo; this recording also has hand-flagged tags"
+ },
+ "logo-letterboxed": {
+  "expect": {
+   "bbox": [
+    636,
+    638,
+    682,
+    1241
+   ],
+   "mask_px": 1859,
+   "stuck": [],
+   "thresh": 1239
+  },
+  "human_verdict": "confirmed by eye: a real logo, plus a letterbox border that the mask also picks up"
+ },
+ "logo-sd": {
+  "expect": {
+   "bbox": [
+    382,
+    577,
+    433,
+    646
+   ],
+   "mask_px": 1779,
+   "stuck": [],
+   "thresh": 1186
+  },
+  "human_verdict": null
+ },
+ "logo-wordmark": {
+  "expect": {
+   "bbox": [
+    894,
+    1547,
+    941,
+    1808
+   ],
+   "mask_px": 2762,
+   "stuck": [],
+   "thresh": 1841
+  },
+  "human_verdict": "confirmed by eye: a real logo, a word mark in the bottom right"
+ },
+ "stuck-logo-1080": {
+  "expect": null,
+  "human_verdict": "confirmed by eye: the logo is real but carries no signal, no breaks except at the end"
+ },
+ "stuck-logo-720": {
+  "expect": null,
+  "human_verdict": "confirmed by eye: the logo is real but carries no signal, there are no breaks during the show"
+ },
+ "stuck-logo-sd": {
+  "expect": null,
+  "human_verdict": "confirmed by eye: the logo is stuck -- the recording has no commercials -- so removing it is correct"
+ }
+}
