@@ -49,14 +49,24 @@ def _find_stuck(persist:np.ndarray, shape:tuple) -> tuple[list, list]:
     where being too generous means throwing away real picture, so an implausibly large
     region is dropped from it.
     """
-    # A weather/alert overlay sits on screen through the commercial breaks, so it persists far
-    # longer than a logo (which can only be there while the show is).  Anything that persistent
-    # can't tell show from commercial, so it is removed whether it is an overlay or a logo on a
-    # commercial-free recording -- it is useless for flagging either way.
+    # Something on screen nearly all the time cannot tell show from commercial, so it is
+    # useless as a feature and worse than nothing -- it feeds a constant signal the model
+    # reads as "show".  That covers an alert banner, a logo on a commercial-free recording,
+    # and a station bug that is simply malfunctioning and never goes off.  All three are
+    # removed, and no attempt is made to tell them apart.
+    #
+    # Note this compares *per-pixel* persistence, which runs ~.08-.16 above the fraction of
+    # frames the logo is actually detected in, because background content keeps re-lighting
+    # the same pixels while the logo is off.  Measured over ten recordings, per-pixel
+    # persistence also ORDERS the cases wrongly -- 2755 (a working logo, off for 23% of its
+    # runtime) peaks at .909 while 33201 (off for 15%) peaks at .894 -- whereas the duty
+    # cycle orders them correctly.  Duty cycle would need a second sampling pass once the
+    # mask is known.  Until then .85 is the value that gets all ten right, but only together
+    # with _STUCK_CORE_PX, and the margin is thin.
     _STUCK_PERSIST   = .85  # at/above this fraction of frames, it isn't a usable logo
+    _STUCK_CORE_PX   = 100  # only bound a core where that many connected pixels agree
     _STUCK_GROW      = .60  # follow each core's skirt down to here, where connected to it
     _STUCK_GROW_PX   = 15   # ...and only this far, so growth can't run across the frame
-    _STUCK_MIN_PX    = 50   # ignore specks (dead pixels, encoder artifacts)
     _STUCK_MERGE_GAP = .05  # join boxes within this fraction of frame height of each other
     _STUCK_PAD       = 10    # px of slack on the final boxes
     _STUCK_MAX_AREA  = .35  # a merged box larger than this is a detection failure, not an overlay
@@ -64,6 +74,26 @@ def _find_stuck(persist:np.ndarray, shape:tuple) -> tuple[list, list]:
     core = persist >= _STUCK_PERSIST
     if not core.any():
         return [], []
+
+    # Throw away cores too small to be an overlay before growing them.  A logo's strongest
+    # few pixels can poke over the line on their own: on real recordings whose peak sits
+    # just under _STUCK_PERSIST the largest connected group above it is 4-10px, and growing
+    # one of those would drag the whole logo into a "stuck" box and delete it.  Every part
+    # of a real alert -- a band's edges, its labels, a radar map outline -- runs to several
+    # hundred pixels, so the two don't overlap.  This also covers the specks (dead pixels,
+    # encoder artifacts) that the old post-growth size check was there for -- that check ran
+    # after the dilation, by which point a 4px seed had already grown into thousands.
+    labels, n = ndimage.label(core, structure=np.ones((3,3), bool))
+    sizes = np.bincount(labels.ravel())
+    sizes[0] = 0  # background
+    keep = sizes >= _STUCK_CORE_PX
+    if not keep.any():
+        log.debug(f"Ignoring {n} persistent core(s), none over {_STUCK_CORE_PX}px "
+                  f"(largest {sizes.max()}px); too small to be an overlay")
+        return [], []
+    if not keep[1:].all():
+        log.debug(f"Ignoring {n - int(keep.sum())} of {n} persistent cores, under {_STUCK_CORE_PX}px")
+    core = keep[labels]
 
     # Grow each core into its own skirt.  The skirt is contiguous with the core, so a
     # geodesic dilation picks it up while a logo elsewhere is left alone; the iteration
@@ -77,8 +107,7 @@ def _find_stuck(persist:np.ndarray, shape:tuple) -> tuple[list, list]:
         if sl is None:
             continue
         ys, xs = sl
-        if np.count_nonzero(region[sl]) >= _STUCK_MIN_PX:
-            boxes.append([ys.start, xs.start, ys.stop, xs.stop])
+        boxes.append([ys.start, xs.start, ys.stop, xs.stop])
     if not boxes:
         return [], []
 
@@ -166,9 +195,16 @@ def _analyze(logo_sum:np.ndarray, fcount:int, shape:tuple) -> tuple|None:
     _blank_margins(logo_sum, shape)
 
     # Anything that never goes away is an overlay rather than a logo, so cut it out and
-    # look for the logo in what is left.  This also guarantees the peak below is under
-    # _STUCK_PERSIST, making the useful range a band: _analyze only ever returns a logo
-    # that is present for between half and 85% of the recording.
+    # look for the logo in what is left.
+    #
+    # Note this does NOT bound the peak that survives.  Zeroing every pixel over
+    # _STUCK_PERSIST was tried and reverted: on a light-commercial recording with a real
+    # logo (2755, duty .766, which separates true show from true commercial 87.8% to 0.3%)
+    # it deleted 340px -- 14% of the mask, and the strongest edges in it -- then dragged the
+    # mask band down to admit weaker ones in their place.  A logo's per-pixel persistence
+    # legitimately exceeds _STUCK_PERSIST; only its duty cycle says whether it is usable,
+    # and that is not knowable from this map.  The abutment check below is what keeps an
+    # unbounded fragment from standing in for a logo.
     remove, stuck = _find_stuck(logo_sum / fcount, shape)
     for (t,l),(b,r) in remove:
         logo_sum[t:b, l:r] = 0
@@ -254,6 +290,20 @@ def _analyze(logo_sum:np.ndarray, fcount:int, shape:tuple) -> tuple|None:
     left -= 2
     bottom += 2
     right += 2
+
+    # An overlay's skirt is not always connected to its core.  On one measured recording the
+    # leftover sat a single pixel below a removed banner with nothing above .50 joining the
+    # two, so no amount of geodesic growth reaches it -- and what got returned was a sparse
+    # scatter of edges, not a logo.  Anything found this close to a region we just deleted
+    # belongs to that region; a real logo that near an overlay was already swallowed by the
+    # box's own padding, and would be unusable anyway.
+    _STUCK_ABUT = 12  # a candidate this close to a removed overlay is part of it
+    for (bt,bl),(bb,br) in remove:
+        if (bt - _STUCK_ABUT < bottom and top < bb + _STUCK_ABUT and
+            bl - _STUCK_ABUT < right  and left < br + _STUCK_ABUT):
+            log.info(f"No logo found (candidate {top},{left}->{bottom},{right} abuts the stuck "
+                     f"region {bt},{bl}->{bb},{br}, so it is part of it)")
+            return None
 
     logo_mask = logo_mask[top:bottom,left:right]
     
