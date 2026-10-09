@@ -15,3 +15,4 @@ models
 .vscode
 build/
 *.egg-info/
+tests/private/
