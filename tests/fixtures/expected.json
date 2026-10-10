@@ -176,8 +176,18 @@
   "human_verdict": "confirmed by eye: a real logo, a word mark in the bottom right"
  },
  "stuck-logo-1080": {
-  "expect": null,
-  "human_verdict": "confirmed by eye: the logo is real but carries no signal, no breaks except at the end"
+  "expect": {
+   "bbox": [
+    892,
+    1615,
+    1033,
+    1825
+   ],
+   "mask_px": 6464,
+   "stuck": [],
+   "thresh": 4309
+  },
+  "human_verdict": "confirmed by eye: the logo is real but carries no signal, no breaks except at the end; it peaks at .894, so since _STUCK_PERSIST went to .875 it is knowingly returned as a logo"
  },
  "stuck-logo-720": {
   "expect": null,

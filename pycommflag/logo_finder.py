@@ -61,14 +61,16 @@ def _find_stuck(persist:np.ndarray, shape:tuple) -> tuple[list, list]:
     # persistence also ORDERS the cases wrongly -- 2755 (a working logo, off for 23% of its
     # runtime) peaks at .909 while 33201 (off for 15%) peaks at .894 -- whereas the duty
     # cycle orders them correctly.  Duty cycle would need a second sampling pass once the
-    # mask is known.  Until then .85 is the value that gets all ten right, but only together
-    # with _STUCK_CORE_PX, and the margin is thin.
-    _STUCK_PERSIST   = .85  # at/above this fraction of frames, it isn't a usable logo
+    # mask is known.  .85 got all ten right (only together with _STUCK_CORE_PX, and the
+    # margin was thin).  It is .875 so that a logo on for ~85% of a recording -- a channel
+    # whose breaks are short -- is not thrown away; the price is that stuck-logo-1080 (a real
+    # logo on a recording with no breaks, peak .894) is now returned as a logo.
+    _STUCK_PERSIST   = .875 # at/above this fraction of frames, it isn't a usable logo
     _STUCK_CORE_PX   = 100  # only bound a core where that many connected pixels agree
     _STUCK_GROW      = .60  # follow each core's skirt down to here, where connected to it
     _STUCK_GROW_PX   = 15   # ...and only this far, so growth can't run across the frame
     _STUCK_MERGE_GAP = .05  # join boxes within this fraction of frame height of each other
-    _STUCK_PAD       = 10    # px of slack on the final boxes
+    _STUCK_PAD       = 10   # px of slack on the final boxes
     _STUCK_MAX_AREA  = .35  # a merged box larger than this is a detection failure, not an overlay
 
     core = persist >= _STUCK_PERSIST
@@ -317,21 +319,32 @@ def _analyze(logo_sum:np.ndarray, fcount:int, shape:tuple) -> tuple|None:
 
     return ((top,left), (bottom,right), logo_mask, thresh, *stuck)
 
-def logo_in_frame(frame :VideoFrame, logo :tuple) -> tuple[int, int]:
-    if not logo:
-        return (0,1)
-
-    ((top,left),(bottom,right),lmask,thresh,*_) = logo
-    c = _gray(frame, [top,bottom,left,right])
-    c = _edges(c)
-    c = np.where(lmask, c, False)
-    #print('\n!',np.count_nonzero(c),'of',np.count_nonzero(lmask),'!')
-    n = np.count_nonzero(c)
-    return n, thresh
+# Matching the mask only asks "are there edges where the logo's edges go", and anything
+# dense enough lights every pixel in the box -- a QR code an ad parks in the logo's corner,
+# fine print, a busy badge -- so it reads as the logo for as long as it is up.  A real logo
+# leaves the rest of its box to whatever is behind it.  Measured on four channels, with the
+# logo matched during show, the box's other pixels were edges <.46 of the time in 95% of
+# frames, and >=.75 in 0-.2% of them; a "scan to give" QR code over a COMET bug ran
+# .83-.89 for its whole three minutes, and a fake news chyron over another bug .80-.85.
+# Those false positives were what cost the tagging: on the COMET recording the model
+# called the QR ad show and cut the break from 240s to 60s.  Show-time dropouts cost
+# nothing, so the line sits closer to the show tail than to the QR code.
+_LOGO_MAX_OFF_EDGES = .75
 
 def check_frame(frame :VideoFrame, logo :tuple) -> bool:
-    (n,t) = logo_in_frame(frame, logo)
-    return n >= t
+    if not logo:
+        return False
+    ((top,left),(bottom,right),*_) = logo
+    return _logo_matches(_edges(_gray(frame, [top,bottom,left,right])), logo)
+
+def _logo_matches(edges:np.ndarray, logo:tuple) -> bool:
+    """Whether an edge map of the logo's box shows the logo."""
+    (_,_,lmask,thresh,*_) = logo
+    if np.count_nonzero(edges & lmask) < thresh:
+        return False
+    off = ~lmask
+    n_off = np.count_nonzero(off)
+    return n_off == 0 or np.count_nonzero(edges & off) < n_off * _LOGO_MAX_OFF_EDGES
 
 def _gray(frame:VideoFrame,box:tuple=None) -> np.ndarray:
     if frame.format.is_planar:

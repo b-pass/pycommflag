@@ -34,7 +34,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _PRIVATE = os.environ.get('PYCF_TEST_FIXTURES') or os.path.join(_HERE, 'private')
 FX = _PRIVATE if os.path.exists(os.path.join(_PRIVATE, 'expected.json')) \
      else os.path.join(_HERE, 'fixtures')
-STUCK_PERSIST = .85   # mirrors the constant inside _find_stuck
+STUCK_PERSIST = .875  # mirrors the constant inside _find_stuck
 
 _fails = []
 print(f'fixtures: {os.path.relpath(FX, _HERE)}'
@@ -221,6 +221,28 @@ s[int(bgshape[0]*0.02):int(bgshape[0]*0.50), :] = int(0.99 * bgfc)
 remove, report = lf._find_stuck(blanked(s, bgfc, bgshape), bgshape)
 check('an implausibly large region is removed but not reported for blank detection',
       len(remove) >= 1 and len(report) == 0, f'{len(remove)} removed, {len(report)} reported')
+
+# Per-frame matching.  A QR code an ad parks over the logo is edges everywhere, so it
+# matches any mask; what gives it away is that the rest of the box is just as busy.
+rng = np.random.default_rng(1)
+art = np.zeros((48, 72), bool)
+for x in range(10, 62, 12):
+    art[12:36, x:x+5] = True             # five bars, like letters
+art[12:16, 10:62] = True
+def paint(bg):
+    return np.where(art, 235.0, bg)
+lmask = lf._edges(paint(np.full(art.shape, 60.0)))
+logo = ((0, 0), art.shape, lmask, round(np.count_nonzero(lmask) * 2 / 3))
+texture = ndimage.gaussian_filter(rng.uniform(0, 255, art.shape), 1.5)
+qr = np.kron(rng.integers(0, 2, (art.shape[0]//2, art.shape[1]//2)), np.ones((2, 2))) * 255.0  # 2px modules, as on SD
+for name, img, expect in (('the logo over a flat picture', paint(np.full(art.shape, 60.0)), True),
+                          ('the logo over a textured picture', paint(texture), True),
+                          ('a flat picture', np.full(art.shape, 60.0), False),
+                          ('a QR code', qr, False)):
+    got = lf._logo_matches(lf._edges(img), logo)
+    check(f'{name} {"matches" if expect else "does not match"} the logo', got == expect)
+check('a QR code lights the mask well past the match threshold (so only the off-mask test rejects it)',
+      np.count_nonzero(lf._edges(qr) & lmask) >= logo[3])
 
 print()
 if _fails:
