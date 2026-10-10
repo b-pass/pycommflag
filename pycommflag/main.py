@@ -69,7 +69,7 @@ def _resolve_inputs(opts) -> None:
             opts.feature_log = opts.gui
         if not opts.filename:
             from .processor import read_feature_log
-            opts.filename = read_feature_log(opts.feature_log).get('filename', '')
+            opts.filename = _find_video(read_feature_log(opts.feature_log).get('filename', ''))
 
     if opts.mythjob:
         from .mythtv import get_filename
@@ -174,6 +174,10 @@ def _reprocess_one(opts, fl, allow_archive:bool) -> bool:
     opts.chanid = flog.get('chanid', '')
     opts.starttime = flog.get('starttime', '')
 
+    if vf and (found := _find_video(vf)) != vf:
+        print(f'Using {found} ({vf} does not exist)')
+        vf = found
+
     if vf and not os.path.exists(vf):
         old = os.path.join(os.path.dirname(fl), 'old')
         if allow_archive and os.path.exists(old):
@@ -208,6 +212,24 @@ def _reprocess_one(opts, fl, allow_archive:bool) -> bool:
         output(opts, result, flog)
     
     return False
+
+
+def _find_video(vf:str) -> str:
+    """vf, or the .mkv it was transcoded to if vf is a .ts that has since been deleted."""
+    if vf and vf.endswith('.ts') and not os.path.exists(vf) and os.path.isfile(vf[:-3] + '.mkv'):
+        return vf[:-3] + '.mkv'
+    return vf
+
+
+def _video_rate(vf:str) -> None|float:
+    """The frame rate the way Player (and so every feature log) computes it."""
+    import av
+    try:
+        with av.open(vf) as c:
+            rate = c.streams.video[0].guessed_rate
+            return round(float(rate), 3) if rate else None
+    except Exception:
+        return None
 
 
 def _cmd_flag(opts) -> int:
@@ -258,6 +280,13 @@ def _feature_log_path(opts):
 def output(opts, result, feature_log=None):
     if result is None:
         return
+
+    if feature_log and (vf := _find_video(feature_log.get('filename', ''))):
+        # the outputs that count frames (mythtv, txt) need the video's own rate, which isn't the
+        # log's after a transcode changed it; the log itself keeps the rate its features were at
+        feature_log = dict(feature_log, filename=vf)
+        if rate := _video_rate(vf):
+            feature_log['frame_rate'] = rate
 
     if opts.output_type in ['mythtv', 'myth', 'auto', '', None]:
         from .mythtv import set_breaks

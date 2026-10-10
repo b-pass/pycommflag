@@ -1,4 +1,6 @@
 import tkinter as tk
+import tkinter.font as tkfont
+import bisect
 import math
 import time
 import numpy as np
@@ -9,11 +11,20 @@ from . import processor
 from . import neural
 from .feature_span import *
 
+INFO_LINES = 16 # in the info box, which must not change height
+LOGO_DEBOUNCE = 3 # log frames a new logo state must last before Logo |</>| count it as a change
+
 class Window(tk.Tk):
     def __init__(self, opts, video, flog):
         tk.Tk.__init__(self)
         self.title("pycommflag editor")
         self.player = Player(video, no_deinterlace=True)
+        # the main frames and the -5s/+5s thumbnails each get their own decoder, so they never
+        # seek each other's position away (which is what makes small steps cheap)
+        self.cursor = _Cursor(self.player)
+        self.thumb_cursors = [_Cursor(Player(video, no_deinterlace=True), keep=int(1.5*self.player.frame_rate))
+                              for _ in range(2)]
+        self.thumb_job = None
 
         self.duration = self.player.duration
         self.frame_rate = self.player.frame_rate
@@ -30,7 +41,36 @@ class Window(tk.Tk):
         # want scene change marks, so threshold it into that shape here
         self.spans['diff'] = [(True, (t, t)) for (t, v) in self.spans.get('diff', [])
                               if v >= neural.DIFF_THRESHOLD]
-        self.raw = neural.raw_predict(flog, opts)
+        # the log's per-frame rows, for the info panel
+        self.frames = [f for f in flog['frames'] if f is not None]
+        self.ftimes = np.array([f[0] for f in self.frames])
+        self.fstep = float(np.median(np.diff(self.ftimes[:1000]))) if len(self.ftimes) > 1 else 1.0
+        # the logo detection flickers, so for skipping (and the info box, which shows where the
+        # skips go) a change only counts once the new state has held for LOGO_DEBOUNCE frames
+        self.logo_spans = []
+        state = None
+        for f in self.frames:
+            v = bool(f[1])
+            if state is None:
+                (state, start, run) = (v, f[0], 0)
+            elif v == state:
+                run = 0
+            else:
+                if run == 0:
+                    run_start = f[0]
+                run += 1
+                if run >= LOGO_DEBOUNCE:
+                    self.logo_spans.append((state, (start, run_start)))
+                    (state, start, run) = (v, run_start, 0)
+        if state is not None:
+            self.logo_spans.append((state, (start, self.ftimes[-1])))
+        # what training's _adjust_tags snaps a tag edge onto
+        self.blank_mids = np.array([b + (e-b)/2 for (v,(b,e)) in self.spans.get('blank', []) if v])
+        self.diff_mags = np.array([f[3] for f in self.frames], dtype='float32')
+        # load_nonpersistent crops a leading/trailing DO_NOT_USE out of the log it is given (deleting
+        # those tags, frames and shortening duration), which would then be lost when this saves
+        self.raw = neural.raw_predict(dict(flog, tags=list(flog.get('tags', [])), frames=list(flog['frames'])), opts)
+        self.raw_times = np.array([t for (t,_) in self.raw])
         tags = processor.read_tags(flog)
         if not tags or opts.reprocess:
             (times,preds) = zip(*self.raw)
@@ -132,7 +172,7 @@ class Window(tk.Tk):
         b.grid(row=0, column=1, padx=5)
         self.misc.append(b)
 
-        b = tk.Button(skips, text="|< Audio", command=lambda:self.prev('audio'))
+        b = tk.Button(skips, text="|< Logo", command=lambda:self.prev('logo'))
         b.grid(row=0, column=2, padx=5)
         self.misc.append(b)
 
@@ -144,7 +184,7 @@ class Window(tk.Tk):
         b.grid(row=0, column=5, padx=(10,5))
         self.misc.append(b)
 
-        b = tk.Button(skips, text="Audio >|", command=lambda:self.next('audio'))
+        b = tk.Button(skips, text="Logo >|", command=lambda:self.next('logo'))
         b.grid(row=0, column=6, padx=5)
         self.misc.append(b)
         
@@ -222,8 +262,18 @@ class Window(tk.Tk):
         else:
             v.configure(text='[No logo]')
         
-        self.vinfo = tk.Label(self)
-        self.vinfo.grid(row=1, column=4, sticky='nswe')
+        # a fixed-size box the size of the +5s thumbnail below it, so the text can't widen that column
+        infof = tk.Frame(self, width=320, height=360)
+        infof.grid(row=1, column=4, sticky='nw')
+        infof.grid_propagate(False)
+        # sized once for ~30 chars x INFO_LINES, so it doesn't jump around while stepping
+        self.info_font = tkfont.nametofont('TkFixedFont').copy()
+        size = self.info_font.cget('size')
+        while abs(size) > 6 and (self.info_font.measure('0'*30) > 314 or self.info_font.metrics('linespace')*INFO_LINES > 358):
+            size += 1 if size < 0 else -1
+            self.info_font.configure(size=size)
+        self.vinfo = tk.Label(infof, font=self.info_font, justify=tk.LEFT, anchor='nw')
+        self.vinfo.place(x=0, y=0, relwidth=1, relheight=1)
 
         self.images = [ImageTk.PhotoImage(Image.new("RGB", (320,180))), ImageTk.PhotoImage(Image.new("RGB", (640,360)))]
         for v in range(len(self.video_labels)):
@@ -236,39 +286,40 @@ class Window(tk.Tk):
 
         self.move(abs=0)
     
-    def prev(self,key='diff'):
-        span = []
-        if key == 'break':
-            span = self.tags
-        else:
-            span = self.spans.get(key)
-            
-        for (t,(b,e)) in reversed(span):
+    def _targets(self, key):
+        """Where the |< and >| buttons for `key` jump to, in order."""
+        out = []
+        span = self.tags if key == 'break' else self.logo_spans if key == 'logo' else self.spans.get(key, [])
+        for (t,(b,e)) in span:
+            if key == 'logo':
+                # every change, the logo going away as much as it coming back
+                if b > 0:
+                    out.append(b)
+                continue
             if not t: continue
-            if key == 'blank' and (e-b) >= 3*self.frame_rate:
-                p = b+(e-b)/2
-            else:
-                p = b
-            if (p - self.position) < -2/self.frame_rate:
-                self.move(abs=p)
-                return
+            # a blank of a few frames is a better landing spot in its middle
+            out.append(b+(e-b)/2 if key == 'blank' and (e-b) >= 3/self.frame_rate else b)
+        return out
+
+    def _around(self, key):
+        """The (prev, next) targets for `key`, and whether we are on one; the same ones the buttons use."""
+        # landing on a target can be off by a frame, so a target this close counts as here
+        tol = 2/self.frame_rate
+        targets = self._targets(key)
+        prev = [p for p in targets if p - self.position < -tol]
+        nxt = [p for p in targets if p - self.position > tol]
+        here = any(math.fabs(p - self.position) <= tol for p in targets)
+        return (prev[-1] if prev else None, nxt[0] if nxt else None, here)
+
+    def prev(self,key='diff'):
+        (p, _, _) = self._around(key)
+        if p is not None:
+            self.move(abs=p)
 
     def next(self,key='diff'):
-        span = []
-        if key == 'break':
-            span = self.tags
-        else:
-            span = self.spans.get(key)
-            
-        for (t,(b,e)) in span:
-            if not t: continue
-            if key == 'blank' and (e-b) >= 3*self.frame_rate:
-                p = b+(e-b)/2
-            else:
-                p = b
-            if (p - self.position) > 2/self.frame_rate:
-                self.move(abs=p)
-                return
+        (_, n, _) = self._around(key)
+        if n is not None:
+            self.move(abs=n)
 
     def move_prev_frame(self):
         self.move(abs=self.prev_frame_time)
@@ -284,81 +335,38 @@ class Window(tk.Tk):
             seconds += self.position
         seconds = max(0, min(seconds, self.duration))
 
-        self.prev_frame_time = seconds - 1/self.frame_rate
-        self.position = seconds
-        self.next_frame_time = seconds + 1/self.frame_rate
-        self.images = [None]*5
+        (prev, cur, nxt) = self.cursor.window(seconds)
+        t = self.cursor.time
+        self.position = t(cur) if cur is not None else seconds
+        self.prev_frame_time = t(prev) if prev is not None else self.position - 1/self.frame_rate
+        self.next_frame_time = t(nxt) if nxt is not None else self.position + 1/self.frame_rate
 
-        #print("SEEK", self.prev_frame_time, seconds, self.next_frame_time)
+        if len(self.images) != 5:
+            self.images = [None]*5
+        for (n, f, size) in ((1, prev, (320,180)), (2, cur, (640,360)), (3, nxt, (320,180))):
+            self.images[n] = ImageTk.PhotoImage(f.to_image(width=size[0], height=size[1])) if f is not None else None
+            # tkinter drops None options, which would leave the old picture up
+            self.video_labels[n].configure(image=self.images[n] if self.images[n] is not None else '')
 
-        if seconds >= 5:
-            f = self.player.seek_exact(seconds - 5)
-            if f is not None:
-                self.images[0] = ImageTk.PhotoImage(f.to_image(height=180,width=320))
-        
-        f = self.player.seek_exact(max(0, min(seconds - 7/self.frame_rate, self.duration - 10/self.frame_rate)))
-        
-        frames = []
-        if f is not None:
-            frames.append(f)
-        try:
-            for f in self.player.frames():
-                frames.append(f)
-                if len(frames) >= 3 and round(f.time - self.player.vt_start, 3) > round(seconds,3) and round(frames[-2].time - self.player.vt_start, 3) >= round(seconds,3):
-                    break
-        except:
-            pass
+        # the -5s/+5s thumbnails are drawn just after the main frames have shown up, and only for
+        # the last of several quick moves
+        if self.thumb_job is not None:
+            self.after_cancel(self.thumb_job)
+        self.thumb_job = self.after(10, self.updateThumbs)
 
-        #print([f.time - self.player.vt_start for f in frames])
-        if len(frames) >= 3:
-            self.images[1] = ImageTk.PhotoImage(frames[-3].to_image(height=180,width=320))
-        if len(frames) >= 2:
-            self.position = frames[-2].time - self.player.vt_start
-            self.images[2] = ImageTk.PhotoImage(frames[-2].to_image(height=360,width=640))
-        if len(frames) >= 1:
-            self.images[3] = ImageTk.PhotoImage(frames[-1].to_image(height=180,width=320))
-        
-        info = ''
-        prev = None
-        n = 0
-        for frame in frames[-3:]:
-            # stolen from processor
-            n += 1
-            fcolor = frame.to_ndarray(format="rgb24")
-            c = processor.mean_axis1(fcolor, dtype='int16')
-            if prev is None:
-                prev = c
-                continue
-            diff = prev - c
-            prev = c
-            scm = np.mean(np.std(np.abs(diff), (0)))
-            info += 'Diff: %9.05f\n\n' % (scm,)
-            if n == 2:
-                # stolen from processor
-                cmax = np.max(fcolor[int(fcolor.shape[0]*3/8):int(fcolor.shape[0]*5/8),int(fcolor.shape[1]*3/8):int(fcolor.shape[1]*5/8)])
-                keep = logo_finder.keep_mask(fcolor.shape, self.logo)
-                bchk = fcolor if keep is None else fcolor[keep]
-                med = np.median(bchk, (0,1) if keep is None else 0)
-                frame_blank = max(med) < 26 and np.std(med) <= 3.1 and np.std(bchk) < 8
-                info += f'c-Max: {cmax} | Max: {max(med)}\nStdMed: {round(np.std(med),2)} | StdAll: {round(np.std(bchk),2)}\n'
-                info += ('Blank' if frame_blank else 'Not Blank')
-                info += '\n'
-                lif = logo_finder.logo_in_frame(frame, self.logo)
-                info += 'Logo? %3.01f%% (%d of %d)\n\n' % (lif[0]/lif[1]*100, lif[0], lif[1])
-
-        self.vinfo.configure(text=info)
-
-        f = self.player.seek_exact(seconds + 5)
-        if f is not None:
-            self.images[4] = ImageTk.PhotoImage(f.to_image(height=180,width=320))
-        
-        for n in range(len(self.images)):
-            self.video_labels[n].configure(image=self.images[n])
-            
         self.updatePosIndicators()
-    
+
+    def updateThumbs(self):
+        self.thumb_job = None
+        for (i, n, d) in ((0, 0, -5), (1, 4, 5)):
+            at = self.position + d
+            f = self.thumb_cursors[i].window(at)[1] if 0 <= at <= self.duration else None
+            self.images[n] = ImageTk.PhotoImage(f.to_image(width=320, height=180)) if f is not None else None
+            self.video_labels[n].configure(image=self.images[n] if self.images[n] is not None else '')
+
     def updatePosIndicators(self):
         self.pos_label.configure(text=f'{int(self.position/60):02}:{self.position%60:06.03f}')
+        self.updateInfo()
         
         self.scale_pos.set(self.position/60) #self.scroller.set(self.position/60)
         x = math.ceil(self.position / (self.duration / self.map_width))
@@ -373,6 +381,95 @@ class Window(tk.Tk):
                 stopx += 1
             self.mapCanvas.coords(self.vMaybe, startx, 0, stopx, self.map_height)
             #print(self.settype, self.vMaybe, self.setpos, self.position, startx, stopx)
+
+    TAG_NAMES = {SceneType.SHOW:'Show', SceneType.INTRO:'Intro', SceneType.TRANSITION:'Trans',
+                 SceneType.COMMERCIAL:'Break', SceneType.CREDITS:'Credits', SceneType.DO_NOT_USE:'Ignore'}
+    AUDIO_NAMES = ['silent', 'speech', 'music', 'noise']
+
+    @staticmethod
+    def _span_at(spans, pos):
+        # the (value,(b,e)) span containing pos, or None
+        i = bisect.bisect_right([b for (_,(b,_)) in spans], pos) - 1
+        if 0 <= i < len(spans) and spans[i][1][0] <= pos <= spans[i][1][1]:
+            return spans[i]
+        return None
+
+    def _around_text(self, key):
+        # 'prev -1.23s  next +4.56s' for where the |< and >| buttons would go
+        (p, n, here) = self._around(key)
+        p = f'{p-self.position:+.2f}s' if p is not None else 'none'
+        n = f'{n-self.position:+.2f}s' if n is not None else 'none'
+        return f'{p:>8} {n:>8}' + (' HERE' if here else '')
+
+    def updateInfo(self):
+        pos = self.position
+        lines = []
+
+        if self.settype is not None:
+            lines.append(f'FLAG {self.TAG_NAMES.get(self.settype)} from {self.setpos-pos:+.2f}s')
+        else:
+            lines.append('')
+
+        if len(self.ftimes):
+            # the log's rows nearest the video's frames; they differ when the video was transcoded to
+            # another frame rate (from 29.97 to 59.94, two video frames can share a row)
+            def nearest(t):
+                i = int(np.searchsorted(self.ftimes, t))
+                if i > 0 and (i >= len(self.ftimes) or t - self.ftimes[i-1] < self.ftimes[i] - t):
+                    i -= 1
+                return self.frames[i] if math.fabs(self.ftimes[i] - t) <= self.fstep else None
+            rows = [nearest(t) for t in (self.prev_frame_time, pos, self.next_frame_time)]
+            def row(name, vals):
+                return f'{name:<5}' + ''.join(f'{v:>7}' for v in vals)
+            def frow(name, fmt):
+                return row(name, [fmt(r) if r is not None else '' for r in rows])
+            def audio(r):
+                for a in range(4):
+                    if r[6+a]:
+                        return self.AUDIO_NAMES[a]
+                return '?'
+            lines.append(row('', ['-1f', 'this', '+1f']))
+            # the model's commercial probability; it is per second, so the sides are -1s/+1s
+            j = int(np.searchsorted(self.raw_times, pos))
+            if j > 0 and (j >= len(self.raw_times) or pos - self.raw_times[j-1] < self.raw_times[j] - pos):
+                j -= 1
+            lines.append(row('model', [f'{self.raw[k][1]*100:.0f}%' if 0 <= k < len(self.raw) else ''
+                                       for k in (j-1, j, j+1)]))
+            lines.append(frow('diff', lambda r: ('*' if r[3] >= neural.DIFF_THRESHOLD else '') + f'{r[3]:.2f}'))
+            lines.append(frow('logo', lambda r: 'yes' if r[1] else '-'))
+            lines.append(frow('blank', lambda r: 'BLANK' if r[2] else '-'))
+            lines.append(frow('fvol', lambda r: f'{r[4]:.3f}'))
+            lines.append(frow('rvol', lambda r: f'{r[5]:.3f}'))
+            lines.append(frow('audio', audio))
+
+        lines.append('')
+        lines.append(f'{"":<5}{"prev":>9}{"next":>9}')
+        lines.append(f'{"blank":<5} ' + self._around_text('blank'))
+        lines.append(f'{"diff":<5} ' + self._around_text('diff'))
+        for key in ('logo', 'audio'):
+            # the frame times shown are rounded to the ms, which can put a frame that starts a span
+            # a hair before it
+            sp = self._span_at(self.logo_spans if key == 'logo' else self.spans.get(key, []), pos + 0.5/self.frame_rate)
+            if sp is not None:
+                (v,(b,e)) = sp
+                v = ('on' if v else 'off') if key == 'logo' else self.AUDIO_NAMES[v.value]
+                lines.append(f'{key:<5} {v} {b-pos:+.1f}..{e-pos:+.1f}s')
+            else:
+                lines.append('')
+
+        # where training would move a break/show edge put here
+        snap = neural._align_edge(pos, neural._snap_distance(SceneType.COMMERCIAL), self.blank_mids, self.ftimes, self.diff_mags)
+        k = int(np.searchsorted(self.ftimes, snap))
+        if len(self.blank_mids) and np.min(np.abs(self.blank_mids - snap)) < 1e-6:
+            lines.append(f'Break snaps {snap-pos:+.2f}s blank')
+        elif k < len(self.ftimes) and self.ftimes[k] == snap and self.diff_mags[k] >= neural.DIFF_THRESHOLD:
+            lines.append(f'Break snaps {snap-pos:+.2f}s cut')
+        else:
+            lines.append('Break snaps here')
+
+        # a fixed line count, since a taller box would shift the grid
+        lines = (lines + ['']*INFO_LINES)[:INFO_LINES]
+        self.vinfo.configure(text='\n'.join(lines))
 
     def drawSpan(self, span, colorMap, top, bottom, force_width=None, name="span"):
         items = []
@@ -574,3 +671,45 @@ class Window(tk.Tk):
     def run(self):
         tk.mainloop()
         return self.result
+
+class _Cursor:
+    """Decoded frames around a position in a Player, decoding forward rather than seeking when it can."""
+    def __init__(self, player, keep=None):
+        self.player = player
+        self.keep = keep if keep is not None else int(2*player.frame_rate) # 1080p frames are ~3MB each
+        self.cache = [] # consecutive decoded frames, oldest first
+        self.it = None # player.frames(), positioned just after cache[-1]
+
+    def time(self, f):
+        return round(f.time - self.player.vt_start, 3)
+
+    def window(self, seconds):
+        """The decoded (prev, this, next) frames at `seconds`; any of them may be None."""
+        want = round(seconds, 3)
+        c = self.cache
+        if not (self.it is not None and c and self.time(c[0]) < want <= self.time(c[-1]) + 1.5):
+            # too far from what's decoded, so seek; starting a second early means
+            # stepping backwards is served from the cache for a while
+            if self.it is not None:
+                self.it.close()
+            c = self.cache = []
+            f = self.player.seek_exact(max(0, seconds - 1))
+            if f is not None:
+                c.append(f)
+            self.it = self.player.frames()
+
+        # decode forward until there's a frame after the wanted one
+        while self.it is not None and (len(c) < 2 or self.time(c[-2]) < want):
+            try:
+                c.append(next(self.it))
+            except Exception:
+                self.it = None
+            if len(c) > self.keep:
+                del c[0]
+
+        k = 0
+        while k < len(c) and self.time(c[k]) < want:
+            k += 1
+        if k >= len(c):
+            return (c[-2] if len(c) >= 2 else None, c[-1] if c else None, None)
+        return (c[k-1] if k > 0 else None, c[k], c[k+1] if k+1 < len(c) else None)

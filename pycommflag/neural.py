@@ -158,6 +158,31 @@ def build_model(input_shape=(121, 23)):
     return Model(inputs, outputs)
 
 
+def _snap_distance(tt) -> float:
+    # human show/commercial boundaries are looser than the rest, so search further
+    if isinstance(tt, SceneType): tt = tt.value
+    return 5 if tt in (SceneType.SHOW.value, SceneType.COMMERCIAL.value) else 2
+
+def _align_edge(when: float, max_distance: float, blank_mids: np.ndarray,
+                diff_times: np.ndarray, diff_mags: np.ndarray) -> float:
+    """Where _adjust_tags moves a tag edge at `when`; the arrays are sorted by time."""
+    # a nearby blank frame wins; being sorted, the closest one brackets `when`
+    i = np.searchsorted(blank_mids, when)
+    near = [m for m in blank_mids[max(i-1,0):i+1] if abs(m - when) < max_distance]
+    if near:
+        return float(min(near, key=lambda m: abs(m - when)))
+
+    # no blank, so fall back to the frame with the largest visual change, which is the
+    # actual cut.  Windows holding no real cut are left alone, or we snap onto noise.
+    lo = np.searchsorted(diff_times, when - max_distance/2, 'left')
+    hi = np.searchsorted(diff_times, when + max_distance/2, 'right')
+    if hi > lo:
+        k = lo + int(np.argmax(diff_mags[lo:hi]))
+        if diff_mags[k] >= DIFF_THRESHOLD:
+            return float(diff_times[k])
+
+    return when
+
 def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]],
                  blanks: List[Tuple[bool, Tuple[float, float]]],
                  diffvals: List[Tuple[float, float]]) \
@@ -183,22 +208,7 @@ def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]],
     diff_mags = np.asarray([v for _,v in diffvals], dtype='float32')
 
     def align(when: float, max_distance: float) -> float:
-        # a nearby blank frame wins; being sorted, the closest one brackets `when`
-        i = np.searchsorted(blank_mids, when)
-        near = [m for m in blank_mids[max(i-1,0):i+1] if abs(m - when) < max_distance]
-        if near:
-            return float(min(near, key=lambda m: abs(m - when)))
-
-        # no blank, so fall back to the frame with the largest visual change, which is the
-        # actual cut.  Windows holding no real cut are left alone, or we snap onto noise.
-        lo = np.searchsorted(diff_times, when - max_distance/2, 'left')
-        hi = np.searchsorted(diff_times, when + max_distance/2, 'right')
-        if hi > lo:
-            k = lo + int(np.argmax(diff_mags[lo:hi]))
-            if diff_mags[k] >= DIFF_THRESHOLD:
-                return float(diff_times[k])
-
-        return when
+        return _align_edge(when, max_distance, blank_mids, diff_times, diff_mags)
 
     filtered_tags = []
     prev_end = 0
@@ -216,8 +226,7 @@ def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]],
             prev_end = end_time
             continue
 
-        # human show/commercial boundaries are looser than the rest, so search further
-        max_distance = 5 if tt in (SceneType.SHOW.value, SceneType.COMMERCIAL.value) else 2
+        max_distance = _snap_distance(tt)
 
         # clamped, because alignment must not back up into the previous tag
         new_start = max(align(start_time, max_distance), prev_end)
