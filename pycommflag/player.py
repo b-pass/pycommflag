@@ -227,6 +227,33 @@ class Player:
         if pts is not None:
             self.container.seek(pts, stream=vs, any_frame=True)
 
+    # Video frames must never go backwards, recovering or not: seeking into a corrupt patch
+    # makes the decoder hand back a frame from ahead of the target and then replay a span
+    # from behind it.  Letting the replay through drags vpts back to the pts that just failed,
+    # so the next error seeks to the same place and recovery cycles forever.
+    #
+    # But a single corrupt packet can also carry a timestamp hours ahead.  Taking it as the
+    # high-water mark would make that rule drop every real frame after it (seen losing the
+    # last 15 minutes of a recording), so a jump this far ahead is skipped unless enough
+    # frames in a row agree with it, which means the clock really did move.
+    MAX_PTS_JUMP = 15*60 # seconds
+    PTS_JUMP_CONFIRM = 5 # frames
+
+    def _check_pts(self, pts, last_pts, ahead):
+        """Returns (use this frame, new last_pts, new ahead count)."""
+        if pts is None:
+            return True, last_pts, ahead
+        if last_pts is not None:
+            if pts <= last_pts:
+                return False, last_pts, ahead # require monotonic pts
+            if (pts - last_pts) * self.vtime_base > self.MAX_PTS_JUMP:
+                ahead += 1
+                if ahead < self.PTS_JUMP_CONFIRM:
+                    if ahead == 1:
+                        log.info(f"Skipping a frame whose timestamp jumps {float((pts - last_pts) * self.vtime_base):.0f}s ahead")
+                    return False, last_pts, ahead
+        return True, pts, 0
+
     def move_audio(self)->list[tuple[np.ndarray,np.ndarray|None,float,int]]|None:
         x = self.aq
         if x is not None:
@@ -236,6 +263,7 @@ class Player:
     def frames(self) -> iter:
         rec = None
         last_pts = None
+        ahead = 0
         good = 0
         packets = self.container.decode(**self.streams)
         while True:
@@ -254,11 +282,10 @@ class Player:
             if type(frame) is av.AudioFrame:
                 self._queue_audio(frame)
             elif type(frame) is av.VideoFrame:
-                if frame.pts is not None:
-                    if last_pts is not None and frame.pts <= last_pts:
-                        continue # require monotonic pts
-                    last_pts = frame.pts
-                
+                use, last_pts, ahead = self._check_pts(frame.pts, last_pts, ahead)
+                if not use:
+                    continue
+
                 if rec is not None:
                     if rec.restore_audio():
                         packets = self.container.decode(**self.streams)
@@ -293,6 +320,7 @@ class Player:
 
         rec = None
         last_pts = None
+        ahead = 0
         packets = self.container.demux(**self.streams)
         to_skip = 0
         while True:
@@ -320,11 +348,10 @@ class Player:
                 packets = self.container.demux(**self.streams)
                 continue
 
-            if frame.pts is not None:
-                if last_pts is not None and frame.pts <= last_pts:
-                    to_skip = 0
-                    continue # require monotonic pts
-                last_pts = frame.pts
+            use, last_pts, ahead = self._check_pts(frame.pts, last_pts, ahead)
+            if not use:
+                to_skip = 0
+                continue
 
             if rec is not None:
                 rec.done()
