@@ -231,6 +231,61 @@ def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]],
 
     return filtered_tags
 
+def _split_lead_in(tags: list, flog: dict) -> list:
+    """
+    A leading DO_NOT_USE (starting in the first 5s, at most LEADIN_MAX_LEN long) is split on blank
+    frames; the leading pieces with the station logo stay DO_NOT_USE (likely the previous show),
+    and from the first piece without it on becomes COMMERCIAL, so the model learns to skip the lead-in.
+    """
+    # hand-tagged logs mark the junk before the show (tail of the previous show, a break) as one
+    # leading DO_NOT_USE; _split_lead_in turns the logo-less parts of a short one into COMMERCIAL
+    LEADIN_MAX_LEN = 60.5
+    LEADIN_LOGO_FRAC = 0.5
+
+    i = 0
+    while i < len(tags) and tags[i][1][1] <= tags[i][1][0]:
+        i += 1 # skip zero-length tags
+    if i >= len(tags):
+        return tags
+    tt, (st, et) = tags[i]
+    if tt not in (SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value) or st > 5 or et - st > LEADIN_MAX_LEN:
+        return tags
+
+    frames = [f for f in flog['frames'] if f is not None and st <= f[NORMTIME] < et]
+    have_logo = not not flog.get('logo', None)
+
+    # split at the middle of each blank run, ignoring ones right at the edges
+    cuts = [st]
+    bstart = None
+    for f in frames + [None]:
+        if f is not None and f[BLANK] > 0.5:
+            if bstart is None:
+                bstart = f[NORMTIME]
+            bend = f[NORMTIME]
+        elif bstart is not None:
+            mid = bstart + (bend - bstart)/2
+            if mid - cuts[-1] >= 1 and et - mid >= 1:
+                cuts.append(mid)
+            bstart = None
+    cuts.append(et)
+
+    # the pivot is the start of the first piece without the logo; the logo pieces before it
+    # stay DO_NOT_USE and everything from it on is COMMERCIAL, logo or not
+    pivot = et
+    for b, e in zip(cuts[:-1], cuts[1:]):
+        seg = [f[LOGO] for f in frames if b <= f[NORMTIME] < e]
+        if not (have_logo and seg and sum(seg)/len(seg) >= LEADIN_LOGO_FRAC):
+            pivot = b
+            break
+
+    pieces = []
+    if pivot > st:
+        pieces.append((SceneType.DO_NOT_USE.value, (st, pivot)))
+    if pivot < et:
+        pieces.append((SceneType.COMMERCIAL.value, (pivot, et)))
+
+    return list(tags[:i]) + pieces + list(tags[i+1:])
+
 def condense(frames: np.ndarray, timestamps: np.ndarray, answers: np.ndarray, weights: np.ndarray, step: int) -> np.ndarray:
     """
     Summarize video features by aggregating the specified step size.
@@ -351,7 +406,10 @@ def load_nonpersistent(flog:dict, for_training=False, no_logo=False, no_blanks=F
                 del tags[i]
             else:
                 i += 1
-    
+
+        # after the tiny-segment cleanup, which would otherwise delete short lead-in pieces
+        tags = _split_lead_in(tags, flog)
+
     frames = flog['frames']
 
     if frames and frames[0] is None: 
@@ -650,9 +708,10 @@ def load_data(opts, do_not_test=False) -> tuple:
             else:
                 i += 1
 
-    dlen = 0
-    data = ([],[],[])
-    tlen = 0
+    dlen = 0 # real windows only
+    alen = 0 # augmented windows
+    data = ([],[],[]) # both go in here
+    tlen = 0 # real only, no augments in test
     test = ([],[],[])
 
     variants = ['.nologo',] #['.nologo', '.noblanks', '.nothing']
@@ -664,7 +723,10 @@ def load_data(opts, do_not_test=False) -> tuple:
             print("Loading", f, e, end='')
             stuff = load_data_sliding_window(load_persistent(f, e), e != '')
             if stuff is not None:
-                dlen += len(stuff[0])
+                if e == '':
+                    dlen += len(stuff[0])
+                else:
+                    alen += len(stuff[0])
                 for x in range(3):
                     for i in range(len(stuff[x])):
                         data[x].append(stuff[x][i])
@@ -684,6 +746,9 @@ def load_data(opts, do_not_test=False) -> tuple:
         print('...', len(stuff[0]) if stuff is not None else 0)
             
     stuff = None
+
+    print(f"train: {dlen} real + {alen} augmented, val: {tlen}" +
+          (f" ({100*tlen/(tlen+dlen):.1f}% of real)" if tlen+dlen else ""))
 
     if False: #if not do_not_test:
         need = int(dlen*TEST_PERC+1) - tlen
@@ -1141,6 +1206,10 @@ def eval(opts:Any):
                 continue
 
             spans = processor.read_feature_spans(flog, 'diff', 'blank')
+
+            # score the lead-in the way training labels it; load_nonpersistent below then only
+            # crops the DO_NOT_USE pieces, so the model's predictions cover the rest
+            flog['tags'] = _split_lead_in(flog.get('tags', []), flog)
 
             duration = flog.get('duration',0.00001)
             real_dur = duration
