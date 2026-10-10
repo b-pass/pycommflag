@@ -1060,8 +1060,9 @@ def post_predict(flog:dict, prediction, times, opts:Any, threshold=0.5, spans=No
             if i+1 >= len(results) and clen >= 5 and results[i][1][1]+clen+10 >= duration:
                 # dont require full length if it is near the end of the recording
                 break
-            elif i == 0 and clen >= 5 and results[i][1][0] <= 5:
-                # don't require full length at the beginning of the recording
+            elif i == 0 and clen >= 5 and results[i][1][1] <= 66:
+                # don't require full length in the lead-in before the show (see _split_lead_in,
+                # which can leave the previous show's tail before it, so it needn't start at 0)
                 i += 1
                 pass
             else:
