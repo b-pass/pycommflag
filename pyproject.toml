@@ -29,6 +29,7 @@ Homepage = "https://github.com/b-pass/pycommflag"
 
 [project.scripts]
 pycommflag = "pycommflag.__main__:main"
+pycommflag-comskip = "pycommflag.comskip:main"
 
 [tool.setuptools]
 packages = ["pycommflag", "pycommflag.extern"]
