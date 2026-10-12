@@ -71,7 +71,7 @@ DIFF_THRESHOLD = 15.0
 
 # training params
 MTYPE = ''
-EPOCHS = 50
+EPOCHS = 25
 BATCH_SIZE = 64
 TEST_PERC = 0.25
 PATIENCE = floor(EPOCHS * .2)
@@ -141,14 +141,13 @@ def build_model(input_shape=(121, 23)):
 
     orig = x
     maxp = layers.GlobalMaxPooling1D()(x)
-    avgp = layers.GlobalAveragePooling1D()(x)
     # use light attention to focus on a few important slices
     attn = layers.Dense(1, use_bias=False)(x)
     attn = layers.Softmax(axis=1, name="attn")(attn)
     x = layers.Dot(axes=1)([x,attn])
     x = layers.Flatten()(x)
 
-    x = layers.Concatenate()([x, maxp, avgp, orig[:,60,:]])
+    x = layers.Concatenate()([x, maxp, orig[:,60,:]])
 
     x = layers.Dense(4*F, "relu", name="classifier")(x)
     x = layers.Dropout(DROPOUT)(x)
@@ -823,7 +822,7 @@ def train(opts:Any=None):
     cb.append(callbacks.EarlyStopping(monitor='val_weighted_accuracy', mode="max", patience=PATIENCE, restore_best_weights=True))
 
     def cosine_annealing_with_warmup(epoch, lr):
-        WARMUP = 4
+        WARMUP = min(4, EPOCHS//12)
         TOTAL = ceil(EPOCHS * .75)
         MAX_LR = 0.001
         MIN_LR = 0.00001 # Set your true floor here
@@ -835,7 +834,7 @@ def train(opts:Any=None):
         return min(lr, MIN_LR + (MAX_LR - MIN_LR) * 0.5 * (1 + np.cos(np.pi * progress)))
     
     cb.append(callbacks.LearningRateScheduler(cosine_annealing_with_warmup))
-    cb.append(callbacks.ReduceLROnPlateau(monitor='val_weighted_accuracy', mode="max", patience=PATIENCE-3, factor=0.5))
+    cb.append(callbacks.ReduceLROnPlateau(monitor='val_weighted_accuracy', mode="max", patience=max(3,PATIENCE-3), factor=0.5))
     
     class EpochModelCheckpoint(callbacks.ModelCheckpoint):
         def on_epoch_end(self, epoch, logs=None):

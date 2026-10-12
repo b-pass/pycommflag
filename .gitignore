@@ -16,3 +16,4 @@ models
 build/
 *.egg-info/
 tests/private/
+.tmp/
