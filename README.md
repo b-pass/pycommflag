@@ -4,7 +4,7 @@ pycommflag finds the commercials in TV recordings using a small neural network.
 
 - It is a drop-in replacement for MythTV's `mythcommflag`, and it can also write
   comskip-style `.edl` and `.txt` files for Kodi, Tvheadend, Jellyfin, Emby,
-  NextPVR, and others.
+  NextPVR, and others, and it can take comskip's place in Channels DVR.
 - It was built and tuned in the 2020s for US cable and broadcast TV.
 - It works on shows that have no station logo.
 - It uses the audio as well as the picture.
@@ -53,7 +53,7 @@ setups, then [Using it with MythTV](#-using-it-with-mythtv) or
 | Improving accuracy | Correct mistakes in the GUI and retrain | Pick a detection method per channel | Edit `comskip.ini` |
 | Re-flagging with a new model or settings | Seconds, from a saved "feature log" | Decodes the whole video again | Decodes the whole video again |
 | Speed | About 10 min per hour of video (see [Speed](#speed)) | Fast | Very fast |
-| Output | MythTV database, EDL, comskip `.txt` | MythTV database | EDL, `.txt`, and many player-specific formats |
+| Output | MythTV database, EDL, comskip `.txt`, Channels DVR | MythTV database | EDL, `.txt`, and many player-specific formats |
 | Runs on | Linux, with Python 3.10+ and TensorFlow | Part of MythTV | Windows, Linux, macOS |
 | License | MIT | GPL-2 | GPL-2 |
 
@@ -62,7 +62,8 @@ bitmask. The only per-channel MythTV setting it honors is "commercial flagging
 disabled".
 
 What about other flaggers? Plex, Channels DVR, NextPVR, and the Emby and
-Jellyfin commercial-skip plugins all run comskip under the hood. MCEBuddy is a
+Jellyfin commercial-skip plugins all run comskip under the hood (in Channels
+DVR, pycommflag can take comskip's place; see [Channels DVR](#channels-dvr)). MCEBuddy is a
 Windows wrapper around comskip or ShowAnalyzer, and ShowAnalyzer is
 closed-source and no longer developed.
 [tv-detect](https://github.com/simonchrz/tv-detect) is another machine-learning
@@ -162,6 +163,7 @@ What happens to the results depends on `-o` / `--output-type`:
 | `mythtv` | Write the breaks only to the MythTV database. |
 | `edl` | Write `recording.edl` next to the video: one `start<TAB>end<TAB>type` line per segment, in seconds, with `3` (commercial break) for commercials. Kodi reads this format. |
 | `txt` | Write `recording.txt` next to the video in comskip's format (`FILE PROCESSING COMPLETE N FRAMES AT R`, then `start end` frame numbers for each break). |
+| `channelsdvr` | Send the breaks to a Channels DVR server (see [Channels DVR](#channels-dvr)). |
 
 pycommflag also keeps a **feature log** at `$TMPDIR/cf_<video filename>.json`
 (normally in `/tmp`). This file holds everything pycommflag extracted from the
@@ -176,6 +178,8 @@ Other useful options (`pycommflag --help` lists them all):
 - `--break-min-len` / `--break-max-len` / `--show-min-len`: the shortest
   allowed break (default 59 s), the longest allowed break (default 335 s), and
   the shortest allowed show segment between breaks (default 59 s).
+- `--output-dir DIR` / `--output-name NAME`: write the `.edl`/`.txt` as
+  `DIR/NAME.edl` instead of next to the video.
 - `--no-logo`: skip the station logo search.
 - `--deinterlace`: turn on deinterlacing (off by default).
 - `-q` / `--noprogress`: don't print progress.
@@ -298,6 +302,14 @@ itself with pycommflag. Use the setting above instead.
 - Post-processing scripts that run comskip can call
   `pycommflag --no-log -o edl -f "$FILE"` instead. See the next section for
   specific DVRs.
+- For software that runs the `comskip` binary itself, pycommflag also installs
+  `pycommflag-comskip`, which takes comskip's command line (`--output`,
+  `--output-filename`, an output folder after the input, and so on; other
+  comskip options and the `.ini` are ignored) and writes the `.edl` where
+  comskip would. Like comskip, it exits 0 when it finds breaks and 1 when it
+  finds none. If flagging fails, it runs the real comskip instead, if it can
+  find one: `$PYCOMMFLAG_COMSKIP_REAL`, or `comskip.real` in the same
+  directory as the `comskip` it was run as.
 
 ## 🔌 Using it with other DVRs and players
 
@@ -388,12 +400,81 @@ DVR Settings) can run pycommflag, but the breaks then have to be cut out of the
 file itself. For example, a script could run `pycommflag -o edl` and then use
 the `.edl` to drive ffmpeg. pycommflag doesn't include such a script.
 
-### Channels DVR and HDHomeRun DVR
+### Channels DVR
 
-Channels DVR has built-in, comskip-based commercial detection, and there's no
-supported way to plug in a different detector. HDHomeRun's DVR has no
-commercial skipping of its own. In both cases, pycommflag is only useful if
-your player can read `.edl` files.
+Channels DVR runs its own copy of comskip after each recording, and has no
+other way to run a program when a recording finishes. pycommflag takes the
+place of that comskip.
+
+1. Install pycommflag system-wide, as in
+   [On a MythTV backend](#on-a-mythtv-backend), without the `[mythtv]` extra.
+   Channels runs it as the user Channels itself runs as, so that user needs
+   network access the first time, to download the models.
+2. Find Channels' comskip. It is in the `latest` directory of the Channels
+   install, e.g. `~/channels-dvr/latest/comskip` or
+   `/usr/share/channels-dvr/latest/comskip` (NAS packages put it elsewhere).
+3. Rename it to `comskip.real`, and put this script in its place as
+   `comskip` (make it executable):
+   ```sh
+   #!/bin/sh
+   export PYCOMMFLAG_COMSKIP_REAL="$(dirname "$0")/comskip.real"
+   export PYCOMMFLAG_LOG_DIR=/var/lib/pycommflag   # optional: keep feature logs here
+   exec /usr/local/bin/pycommflag-comskip "$@"
+   ```
+   The user Channels runs as must be able to write to `PYCOMMFLAG_LOG_DIR`.
+   Leave that line out to keep no logs. A plain symlink to
+   `pycommflag-comskip` also works, but keeps no logs.
+4. Leave commercial detection turned on in Channels. Channels' comskip
+   settings and `comskip.ini` have no effect on pycommflag.
+
+To check that it worked, look in the recording's directory under Channels'
+`Logs/comskip/`: it should have a `video.edl` (and no `video.log`, which
+comskip would have written).
+
+If flagging fails, the script runs the real comskip instead, so the recording
+still gets markers. "Redetect commercials" in Channels runs pycommflag over
+the whole recording again (see [Speed](#speed)).
+
+Channels updates itself by installing a fresh copy and pointing `latest` at
+it, which brings back the original comskip. Re-run the replacement from cron,
+e.g. every hour, with a script like this (it is safe to run repeatedly):
+
+```sh
+#!/bin/sh
+cd /usr/share/channels-dvr/latest || exit 1   # your Channels install's latest directory
+grep -q pycommflag comskip && exit 0          # already replaced
+mv comskip comskip.real && cp /usr/local/lib/pycommflag-channels-comskip comskip
+```
+
+(Keep a copy of the step 3 script at `/usr/local/lib/pycommflag-channels-comskip`
+for this.) The Docker image of Channels would need pycommflag installed inside
+the container.
+
+`-o channelsdvr` sends breaks to Channels directly, through the API behind its
+"edit commercials" dialog. It finds the recording by matching the video's path
+against the paths Channels lists. With feature logs kept (step 3), you can
+fix a recording in the GUI and send the result to Channels:
+
+```sh
+pycommflag -o channelsdvr -g /var/lib/pycommflag/cf_<recording>.json
+```
+
+or re-flag every recording with a new model, sending only the ones that
+changed:
+
+```sh
+pycommflag -o channelsdvr -r /var/lib/pycommflag/cf_*.json
+```
+
+The server defaults to `http://localhost:8089`; use `--channels-url` for
+another one. That API isn't officially documented, so a Channels update could
+change it.
+
+### HDHomeRun DVR
+
+HDHomeRun's DVR has no commercial skipping of its own, and no way to run a
+program after a recording. pycommflag is only useful with it if your player
+can read `.edl` files.
 
 ## 🧠 Training your own model
 

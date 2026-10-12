@@ -133,8 +133,7 @@ def _cmd_gui(opts) -> int:
 
     flog['tags'] = res
     processor.write_feature_log(flog, opts.feature_log)
-    output(opts, res, flog)
-    return 0
+    return 1 if output(opts, res, flog) is False else 0
 
 
 def _cmd_reprocess(opts) -> int:
@@ -143,6 +142,7 @@ def _cmd_reprocess(opts) -> int:
 
     i = 0
     archived = 0
+    failed = 0
     for fl in opts.reprocess:
         i += 1
         if not os.path.isfile(fl):
@@ -154,11 +154,12 @@ def _cmd_reprocess(opts) -> int:
             if _reprocess_one(opts, fl, allow_archive=len(opts.reprocess) > 1):
                 archived += 1
         except Exception:
+            failed += 1
             print('EXCEPTION')
             print(traceback.format_exc())
             print()
 
-    return 0
+    return 1 if failed else 0
 
 
 def _reprocess_one(opts, fl, allow_archive:bool) -> bool:
@@ -191,7 +192,8 @@ def _reprocess_one(opts, fl, allow_archive:bool) -> bool:
         from .mythtv import check_method
         if not check_method(opts.chanid):
             print("Channel has flagging disabled")
-            output(opts, [], flog)
+            if output(opts, [], flog) is False:
+                raise RuntimeError(f'Output failed for {vf}')
             return False
 
     from . import processor
@@ -209,7 +211,8 @@ def _reprocess_one(opts, fl, allow_archive:bool) -> bool:
 
     if chng or missing or extra or len(old) != len(all):
         processor.write_feature_log(flog, fl)
-        output(opts, result, flog)
+        if output(opts, result, flog) is False:
+            raise RuntimeError(f'Output failed for {vf}')
     
     return False
 
@@ -241,8 +244,7 @@ def _cmd_flag(opts) -> int:
         from .mythtv import check_method
         if not check_method(opts.chanid):
             print(f"Flagging disabled on channel {opts.chanid}")
-            output(opts, [], None)
-            return 0
+            return 1 if output(opts, [], None) is False else 0
 
     from .processor import process_video, read_feature_log
     from .neural import predict
@@ -252,8 +254,7 @@ def _cmd_flag(opts) -> int:
         flog = read_feature_log(feature_log)
         result = predict(flog, opts, feature_log)
 
-    output(opts, result, flog)
-    return 0
+    return 1 if output(opts, result, flog) is False else 0
 
 
 @contextmanager
@@ -277,7 +278,8 @@ def _feature_log_path(opts):
 
 # --- output -------------------------------------------------------------------
 
-def output(opts, result, feature_log=None):
+def output(opts, result, feature_log=None) -> None|bool:
+    """Returns False if the output could not be written (only -o channelsdvr reports that)."""
     if result is None:
         return
 
@@ -294,6 +296,10 @@ def output(opts, result, feature_log=None):
             return
         if opts.output_type in ['mythtv', 'myth']:
             return # was not auto, so dont try edl or txt
+
+    if opts.output_type in ['channelsdvr', 'channels']:
+        from .channels import set_breaks
+        return set_breaks(opts, result, (feature_log or {}).get('filename') or opts.filename)
 
     vf:str = opts.filename
     if feature_log:
@@ -316,6 +322,10 @@ def output(opts, result, feature_log=None):
             return
     else:
         return
+
+    out_dir, out_name = getattr(opts, 'output_dir', None), getattr(opts, 'output_name', None)
+    if out_dir or out_name:
+        ofn = os.path.join(out_dir or os.path.dirname(ofn), out_name or os.path.basename(ofn))
 
     if opts.output_type in ['txt', 'text']:
         from .edl import output_txt

@@ -25,7 +25,13 @@ def get_options():
     parser.add_argument('--no-log', dest="no_feature_log", action='store_true',
                         help="Use a temporary file for the feature log (which won't persist anywhere)")
     parser.add_argument('-o','--output-type', dest='output_type', type=str, default="auto",
-                        help="Output type [auto, mythtv, edl, txt] (auto will try mythtv and fall back to edl). EDL/TXT files are saved alongside the input video file")
+                        help="Output type [auto, mythtv, edl, txt, channelsdvr] (auto will try mythtv and fall back to edl). EDL/TXT files are saved alongside the input video file")
+    parser.add_argument('--output-dir', dest='output_dir', type=str,
+                        help="Write the EDL/TXT file into this directory instead of next to the video")
+    parser.add_argument('--output-name', dest='output_name', type=str,
+                        help="Base name (without extension) of the EDL/TXT file (default: the video's name)")
+    parser.add_argument('--channels-url', dest='channels_url', type=str, default='http://localhost:8089',
+                        help="Channels DVR server, for -o channelsdvr")
     parser.add_argument('-r', '--reprocess', dest="reprocess", type=str, nargs='+',
                         help="Input location of feature data log to be reprocessed.")
     parser.add_argument('-g', '--gui', dest='gui', type=str, 
@@ -138,7 +144,6 @@ def parse_yaml(filename:str):
 
 def parse_argv():
     import sys
-    import logging as log
     opts = get_options()
     if len(sys.argv) <= 1:
         opts.print_help()
@@ -150,9 +155,11 @@ def parse_argv():
             setattr(cfg, k, v)
 
     cfg.mode = resolve_mode(cfg)
+    setup_logging(cfg)
+    return cfg
 
-    log.basicConfig(encoding='utf-8', 
+def setup_logging(cfg):
+    import logging as log
+    log.basicConfig(encoding='utf-8',
                     level=log.getLevelName((cfg.loglevel or 'debug').upper()),
                     format='[%(asctime)s] %(levelname)s: %(message)s')
-
-    return cfg
