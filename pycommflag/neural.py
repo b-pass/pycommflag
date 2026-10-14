@@ -71,17 +71,17 @@ DIFF_THRESHOLD = 15.0
 
 # training params
 MTYPE = ''
-EPOCHS = 25
+EPOCHS = 50
 BATCH_SIZE = 64
 TEST_PERC = 0.25
-PATIENCE = floor(EPOCHS * .2)
+PATIENCE = max(floor(EPOCHS * .2), 3) # early stopping; at least 3 so the LR cut (2+ epochs) can come first
 
 F         = 48 # TCN filter count
 K         = 5  # TCN kernel size
 DILATIONS = [1, 2, 4, 8] # TCN dilation schedule
 DROPOUT   = 0.25
 START_DROP= 0.15
-TCN_DROP  = 0.25
+TCN_DROP  = 0.05
 
 def build_model(input_shape=(121, 23)):
     global MTYPE
@@ -95,11 +95,11 @@ def build_model(input_shape=(121, 23)):
 
     # Normalize so that zero introduced by the dropout below is neutral
     x = layers.BatchNormalization(center=False, scale=False, name="input_norm")(inputs)
-    x = layers.SpatialDropout1D(START_DROP)(x)
+    x = layers.SpatialDropout1D(START_DROP, name="input_drop")(x)
     
     x = layers.Dense(F, use_bias=False, name="projection")(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Activation("relu")(x)
+    x = layers.BatchNormalization(name="projection_bn")(x)
+    x = layers.Activation("relu", name="projection_act")(x)
 
     # --- TCN Blocks ---
     for i, dilation_rate in enumerate(DILATIONS, start=1):
@@ -111,46 +111,44 @@ def build_model(input_shape=(121, 23)):
                           dilation_rate=dilation_rate,
                           use_bias=False,
                           name=f"{name_prefix}_conv1")(x)
-        x = layers.BatchNormalization(name=f"{name_prefix}_ln1")(x)
+        x = layers.BatchNormalization(name=f"{name_prefix}_bn1")(x)
         x = layers.Activation("swish", name=f"{name_prefix}_act1")(x)
-        x = layers.SpatialDropout1D(TCN_DROP)(x)
+        x = layers.SpatialDropout1D(TCN_DROP, name=f"{name_prefix}_drop1")(x)
 
         x = layers.Conv1D(F, K,
                           padding="same",
                           dilation_rate=dilation_rate,
                           use_bias=False,
                           name=f"{name_prefix}_conv2")(x)
-        x = layers.BatchNormalization(name=f"{name_prefix}_ln2")(x)
+        x = layers.BatchNormalization(name=f"{name_prefix}_bn2")(x)
         x = layers.Activation("swish", name=f"{name_prefix}_act2")(x)
-        x = layers.SpatialDropout1D(TCN_DROP)(x)
+        x = layers.SpatialDropout1D(TCN_DROP, name=f"{name_prefix}_drop2")(x)
         
         # Squeeze
-        se = layers.GlobalAveragePooling1D()(x)
+        se = layers.GlobalAveragePooling1D(name=f"{name_prefix}_squeeze")(x)
         # Excite
-        se = layers.Dense(x.shape[-1]//4, activation='relu', use_bias=False)(se)
-        se = layers.Dense(x.shape[-1], activation='sigmoid', use_bias=False)(se)
+        se = layers.Dense(x.shape[-1]//4, activation='relu', use_bias=False, name=f"{name_prefix}_excite1")(se)
+        se = layers.Dense(x.shape[-1], activation='sigmoid', use_bias=False, name=f"{name_prefix}_excite2")(se)
         # Apply
-        se = layers.Reshape((1, x.shape[-1]))(se)
-        x = layers.Multiply()([x, se])
-
-        #if residual.shape[-1] != F:
-        #    residual = layers.Conv1D(F, 1, padding="same",
-        #                             name=f"{name_prefix}_res_proj")(residual)
+        se = layers.Reshape((1, x.shape[-1]), name=f"{name_prefix}_se_reshape")(se)
+        x = layers.Multiply(name=f"{name_prefix}_se_scale")([x, se])
 
         x = layers.Add(name=f"{name_prefix}_res")([x, residual])
 
-    orig = x
-    maxp = layers.GlobalMaxPooling1D()(x)
-    # use light attention to focus on a few important slices
-    attn = layers.Dense(1, use_bias=False)(x)
+    # the second being classified (a layer rather than x[:,60,:], so that it has a name)
+    center = layers.Cropping1D((WINDOW_BEFORE, WINDOW_AFTER), name="center_crop")(x)
+    center = layers.Flatten(name="center")(center)
+    maxp = layers.GlobalMaxPooling1D(name="maxpool")(x)
+    # use light attention to learn to focus on the important slices
+    attn = layers.Dense(1, use_bias=False, name="attn_score")(x)
     attn = layers.Softmax(axis=1, name="attn")(attn)
-    x = layers.Dot(axes=1)([x,attn])
-    x = layers.Flatten()(x)
+    x = layers.Dot(axes=1, name="attn_pool")([x,attn])
+    x = layers.Flatten(name="attn_flat")(x)
 
-    x = layers.Concatenate()([x, maxp, orig[:,60,:]])
+    x = layers.Concatenate(name="head")([x, maxp, center])
 
     x = layers.Dense(4*F, "relu", name="classifier")(x)
-    x = layers.Dropout(DROPOUT)(x)
+    x = layers.Dropout(DROPOUT, name="classifier_drop")(x)
 
     outputs = layers.Dense(1, activation="sigmoid", name="output")(x)
 
@@ -822,7 +820,7 @@ def train(opts:Any=None):
     cb.append(callbacks.EarlyStopping(monitor='val_weighted_accuracy', mode="max", patience=PATIENCE, restore_best_weights=True))
 
     def cosine_annealing_with_warmup(epoch, lr):
-        WARMUP = min(4, EPOCHS//12)
+        WARMUP = min(max(EPOCHS//12, 1), 4) # 1-4 epochs
         TOTAL = ceil(EPOCHS * .75)
         MAX_LR = 0.001
         MIN_LR = 0.00001 # Set your true floor here
@@ -834,7 +832,9 @@ def train(opts:Any=None):
         return min(lr, MIN_LR + (MAX_LR - MIN_LR) * 0.5 * (1 + np.cos(np.pi * progress)))
     
     cb.append(callbacks.LearningRateScheduler(cosine_annealing_with_warmup))
-    cb.append(callbacks.ReduceLROnPlateau(monitor='val_weighted_accuracy', mode="max", patience=max(3,PATIENCE-3), factor=0.5))
+    # 2+ epochs (3+ where PATIENCE allows), so it doesn't react to every noisy one, but always short of
+    # PATIENCE, or early stopping would end training before the LR was ever cut
+    cb.append(callbacks.ReduceLROnPlateau(monitor='val_weighted_accuracy', mode="max", patience=max(min(max(PATIENCE-3, 3), PATIENCE-1), 2), factor=0.5))
     
     class EpochModelCheckpoint(callbacks.ModelCheckpoint):
         def on_epoch_end(self, epoch, logs=None):
