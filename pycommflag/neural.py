@@ -71,11 +71,8 @@ DIFF_THRESHOLD = 15.0
 
 # training params
 MTYPE = ''
-EPOCHS = 100 # partial passes (see SAMPLE_STRIDE): the same number of updates as 25 full ones
+EPOCHS = 25
 BATCH_SIZE = 64
-# Each epoch trains on every SAMPLE_STRIDE-th window of each log, from a new random offset.  Windows
-# one second apart are near duplicates, so this costs little and makes an epoch SAMPLE_STRIDE times faster.
-SAMPLE_STRIDE = 4
 TEST_PERC = 0.25
 PATIENCE = floor(EPOCHS * .2)
 
@@ -622,7 +619,7 @@ def load_persistent(flogname:str,extrname=''):
 def make_data_generator(*args, **kwargs):
     from keras.utils import Sequence
     class DataGenerator(Sequence):
-        def __init__(self, data, answers=None, weights=None, groups=None):
+        def __init__(self, data, answers=None, weights=None):
             super().__init__()
             #self.data = np.array(data, dtype='float32')
             #self.answers = np.array(answers, dtype='float32') if answers else None
@@ -631,14 +628,7 @@ def make_data_generator(*args, **kwargs):
             self.answers = answers
             self.weights = weights
 
-            # [(start, count)] of each log's windows in data: when given, batches come from a
-            # SAMPLE_STRIDE subsample of each (see subsample), not from all of data
-            self.groups = groups
-            self.sel = None
-            if groups is not None:
-                self.subsample()
-
-            self.len = ceil(len(self.sel if self.sel is not None else self.data) / BATCH_SIZE)
+            self.len = ceil(len(self.data) / BATCH_SIZE)
             self.shape = (self.len, BATCH_SIZE, len(data[0]), len(data[0][0]))
             self.do_shuf = False
         
@@ -646,16 +636,11 @@ def make_data_generator(*args, **kwargs):
             return self.len
         
         def __getitem__(self, index):
-            if self.sel is not None:
-                idx = self.sel[index*BATCH_SIZE:(index+1)*BATCH_SIZE]
-                pick = lambda l: np.asarray([l[i] for i in idx], dtype='float32')
-            else:
-                pick = lambda l: np.asarray(l[index*BATCH_SIZE:(index+1)*BATCH_SIZE], dtype='float32')
-            d = pick(self.data)
+            d = np.asarray(self.data[index*BATCH_SIZE:(index+1)*BATCH_SIZE], dtype='float32')
             if self.answers is not None:
-                a = pick(self.answers)
+                a = np.asarray(self.answers[index*BATCH_SIZE:(index+1)*BATCH_SIZE], dtype='float32')
                 if self.weights is not None:
-                    w = pick(self.weights)
+                    w = np.asarray(self.weights[index*BATCH_SIZE:(index+1)*BATCH_SIZE], dtype='float32')
                     return d,a,w
                 else:
                     return d,a
@@ -667,24 +652,9 @@ def make_data_generator(*args, **kwargs):
                 self.shuffle()
             return super().on_epoch_end()
         
-        def subsample(self):
-            # every SAMPLE_STRIDE-th window of each log from a random offset, shuffled.  The count per
-            # log doesn't depend on the offset, because keras wants every epoch to be the same length;
-            # an offset that runs off the end takes the log's last window again instead.
-            sel = []
-            for (start, count) in self.groups:
-                if count > 0:
-                    n = ceil(count / SAMPLE_STRIDE)
-                    sel.append(start + np.minimum(random.randrange(SAMPLE_STRIDE) + SAMPLE_STRIDE*np.arange(n), count-1))
-            self.sel = np.concatenate(sel)
-            np.random.shuffle(self.sel)
-        
         def shuffle(self):
             #print("Doing the data generator shufflehussle")
             self.do_shuf = True
-            if self.groups is not None:
-                self.subsample() # shuffles too, and moving data around would break groups
-                return
             shuf = np.random.permutation(len(self.data))
             self.data = [self.data[i] for i in shuf]
             if self.answers is not None: self.answers = [self.answers[i] for i in shuf]
@@ -749,7 +719,6 @@ def load_data(opts, do_not_test=False) -> tuple:
     dlen = 0 # real windows only
     alen = 0 # augmented windows
     data = ([],[],[]) # both go in here
-    groups = [] # (start, count) of each log's (or variant's) windows in data
     tlen = 0 # real only, no augments in test
     test = ([],[],[])
 
@@ -766,7 +735,6 @@ def load_data(opts, do_not_test=False) -> tuple:
                     dlen += len(stuff[0])
                 else:
                     alen += len(stuff[0])
-                groups.append((len(data[0]), len(stuff[0])))
                 for x in range(3):
                     for i in range(len(stuff[x])):
                         data[x].append(stuff[x][i])
@@ -787,7 +755,7 @@ def load_data(opts, do_not_test=False) -> tuple:
             
     stuff = None
 
-    print(f"train: {dlen} real + {alen} augmented (1/{SAMPLE_STRIDE} of them per epoch), val: {tlen}" +
+    print(f"train: {dlen} real + {alen} augmented, val: {tlen}" +
           (f" ({100*tlen/(tlen+dlen):.1f}% of real)" if tlen+dlen else ""))
 
     if False: #if not do_not_test:
@@ -804,7 +772,7 @@ def load_data(opts, do_not_test=False) -> tuple:
             data = data[need:]
             data = zip(*data)
     
-    data = make_data_generator(*data, groups=groups)
+    data = make_data_generator(*data)
     data.shuffle()
 
     test = make_data_generator(*test) if test and test[0] else None
