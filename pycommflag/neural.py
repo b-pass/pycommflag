@@ -21,7 +21,7 @@ from .feature_span import *
 from . import processor
 from . import neural
 
-SEED = 121711
+SEED = int(os.environ.get('PYCF_SEED', 121711))
 
 # array indexes
 NORMTIME = 0
@@ -43,17 +43,20 @@ BLANK_UNTIL = 15
 
 GENERATED_FEATURES_START = 16
 FVOL_MAX = 16
-FVOL_STDDEV = 17
-RVOL_MAX = 18
-RVOL_STDDEV = 19
-LOGO_RUN_MIN = 20
-DIFF_90TH = 21
-DIFF_MAX = 22
+RVOL_STDDEV = 17
+DIFF_90TH = 18
+DIFF_MAX = 19
 
-FEATURE_WIDTH = 23
-TIMESTAMPS = 23
-ANSWERS = 24
-WEIGHTS = 25
+FEATURE_WIDTH = 20
+TIMESTAMPS = 20
+ANSWERS = 21
+WEIGHTS = 22
+
+# LOGO_RUN, BLANK_SINCE and BLANK_UNTIL are distances in seconds, capped here and log-scaled,
+# so the first few seconds (which matter most) aren't squashed: 5s is 0.31, where 5/300 was 0.017
+DIST_CAP = 300.0
+def _scale_dist(seconds):
+    return (np.log1p(np.clip(seconds, 0, DIST_CAP)) / np.log1p(DIST_CAP)).astype('float32')
 
 # data params, both for train and for inference
 WINDOW_BEFORE = 60
@@ -80,12 +83,13 @@ F         = 48 # TCN filter count
 K         = 5  # TCN kernel size
 DILATIONS = [1, 2, 4, 8] # TCN dilation schedule
 DROPOUT   = 0.25
-START_DROP= 0.15
-TCN_DROP  = 0.05
+START_DROP= 0.25
+TCN_DROP  = 0.15
+SQUEEZE_EXCITE = True # per-block channel gating in the TCN
 
-def build_model(input_shape=(121, 23)):
+def build_model(input_shape=(WINDOW_BEFORE+1+WINDOW_AFTER, FEATURE_WIDTH)):
     global MTYPE
-    MTYPE = 'tcn'
+    MTYPE = 'tcnln'
 
     from keras import layers, regularizers, utils, Input, Model
     random.seed(SEED)
@@ -93,12 +97,17 @@ def build_model(input_shape=(121, 23)):
 
     inputs = Input(shape=input_shape[-2:], dtype='float32', name="input")
 
-    # Normalize so that zero introduced by the dropout below is neutral
-    x = layers.BatchNormalization(center=False, scale=False, name="input_norm")(inputs)
+    # Normalize so that zero introduced by the dropout below is neutral.  The default
+    # epsilon (1e-3) is as big as the variance of DIFF and the volume spreads, and would
+    # leave those at a fraction of unit scale.
+    x = layers.BatchNormalization(center=False, scale=False, epsilon=1e-5, name="input_norm")(inputs)
     x = layers.SpatialDropout1D(START_DROP, name="input_drop")(x)
-    
+
+    # Everything below is downstream of a dropout, which inflates activation variance in
+    # training only, so a BatchNorm here would keep running stats that are wrong at inference
+    # (measured: ~12% too much variance after the input drop).  LayerNorm keeps none.
     x = layers.Dense(F, use_bias=False, name="projection")(x)
-    x = layers.BatchNormalization(name="projection_bn")(x)
+    x = layers.LayerNormalization(name="projection_ln")(x)
     x = layers.Activation("relu", name="projection_act")(x)
 
     # --- TCN Blocks ---
@@ -111,7 +120,7 @@ def build_model(input_shape=(121, 23)):
                           dilation_rate=dilation_rate,
                           use_bias=False,
                           name=f"{name_prefix}_conv1")(x)
-        x = layers.BatchNormalization(name=f"{name_prefix}_bn1")(x)
+        x = layers.LayerNormalization(name=f"{name_prefix}_ln1")(x)
         x = layers.Activation("swish", name=f"{name_prefix}_act1")(x)
         x = layers.SpatialDropout1D(TCN_DROP, name=f"{name_prefix}_drop1")(x)
 
@@ -120,18 +129,19 @@ def build_model(input_shape=(121, 23)):
                           dilation_rate=dilation_rate,
                           use_bias=False,
                           name=f"{name_prefix}_conv2")(x)
-        x = layers.BatchNormalization(name=f"{name_prefix}_bn2")(x)
+        x = layers.LayerNormalization(name=f"{name_prefix}_ln2")(x)
         x = layers.Activation("swish", name=f"{name_prefix}_act2")(x)
         x = layers.SpatialDropout1D(TCN_DROP, name=f"{name_prefix}_drop2")(x)
         
-        # Squeeze
-        se = layers.GlobalAveragePooling1D(name=f"{name_prefix}_squeeze")(x)
-        # Excite
-        se = layers.Dense(x.shape[-1]//4, activation='relu', use_bias=False, name=f"{name_prefix}_excite1")(se)
-        se = layers.Dense(x.shape[-1], activation='sigmoid', use_bias=False, name=f"{name_prefix}_excite2")(se)
-        # Apply
-        se = layers.Reshape((1, x.shape[-1]), name=f"{name_prefix}_se_reshape")(se)
-        x = layers.Multiply(name=f"{name_prefix}_se_scale")([x, se])
+        if SQUEEZE_EXCITE:
+            # Squeeze
+            se = layers.GlobalAveragePooling1D(name=f"{name_prefix}_squeeze")(x)
+            # Excite
+            se = layers.Dense(x.shape[-1]//4, activation='relu', use_bias=False, name=f"{name_prefix}_excite1")(se)
+            se = layers.Dense(x.shape[-1], activation='sigmoid', use_bias=False, name=f"{name_prefix}_excite2")(se)
+            # Apply
+            se = layers.Reshape((1, x.shape[-1]), name=f"{name_prefix}_se_reshape")(se)
+            x = layers.Multiply(name=f"{name_prefix}_se_scale")([x, se])
 
         x = layers.Add(name=f"{name_prefix}_res")([x, residual])
 
@@ -142,10 +152,10 @@ def build_model(input_shape=(121, 23)):
     # use light attention to learn to focus on the important slices
     attn = layers.Dense(1, use_bias=False, name="attn_score")(x)
     attn = layers.Softmax(axis=1, name="attn")(attn)
-    x = layers.Dot(axes=1, name="attn_pool")([x,attn])
-    x = layers.Flatten(name="attn_flat")(x)
+    attn = layers.Dot(axes=1, name="attn_pool")([x,attn])
+    attn = layers.Flatten(name="attn_flat")(attn)
 
-    x = layers.Concatenate(name="head")([x, maxp, center])
+    x = layers.Concatenate(name="head")([attn, maxp, center])
 
     x = layers.Dense(4*F, "relu", name="classifier")(x)
     x = layers.Dropout(DROPOUT, name="classifier_drop")(x)
@@ -313,10 +323,10 @@ def condense(frames: np.ndarray, timestamps: np.ndarray, answers: np.ndarray, we
 
         assert(len(res) == GENERATED_FEATURES_START)
         
-        for f in (FVOL,RVOL) :
-            res.append(np.max(a[:, :, f], axis=1)) # vol max
-            res.append(np.std(a[:, :, f], axis=1)) # vol std dev
-        res.append(np.min(a[:, :, LOGO_RUN], axis=1)) # min of the logo run feature
+        # no front std (0.87 correlated with the front max), no rear max (0.92 with the rear
+        # mean), and no min of LOGO_RUN, which only rises within a second so it duplicated it
+        res.append(np.max(a[:, :, FVOL], axis=1)) # vol max
+        res.append(np.std(a[:, :, RVOL], axis=1)) # rear vol std dev
         res.append(np.percentile(a[:, :, DIFF], 90, axis=1)) # diff 90th
         res.append(np.max(a[:, :, DIFF], axis=1)) # diff max
 
@@ -456,17 +466,14 @@ def load_nonpersistent(flog:dict, for_training=False, no_logo=False, no_blanks=F
     # change the diff column to be normalized [0,40+] -> [0,1]
     frames[:,DIFF] = np.clip(frames[:,DIFF] / 40, 0, 1.0)
 
-    # add a column for time since logo
-    run = np.zeros((len(frames),1), dtype='float32')
-    nlogo_dist = 0
-    for n in range(len(frames)):
-        if frames[n][LOGO] > 0.5:
-            nlogo_dist = 0
-        else:
-            nlogo_dist += 1
-            run[n][0] = min(nlogo_dist/(frame_rate * 300), 1.0) 
+    # add a column for time since logo.  Before the first logo frame none has been seen,
+    # which is as far from one as it gets; counting from 0 there instead told the model the
+    # logo had just been on screen during every recording's lead-in commercials.
+    n = np.arange(len(frames))
+    last_logo = np.maximum.accumulate(np.where(frames[:, LOGO] > 0.5, n, -1))
+    since_logo = np.where(last_logo >= 0, (n - last_logo) / frame_rate, DIST_CAP)
     assert(frames.shape[-1] == LOGO_RUN)
-    frames = np.append(frames, run, axis=1)
+    frames = np.append(frames, _scale_dist(since_logo)[:,np.newaxis], axis=1)
     assert(frames.shape[-1] == HAVE_LOGO)
     pres = (np.ones if have_logo else np.zeros)((len(frames),1), dtype='float32')
     frames = np.append(frames, pres, axis=1)
@@ -475,6 +482,17 @@ def load_nonpersistent(flog:dict, for_training=False, no_logo=False, no_blanks=F
     have_rvol = np.count_nonzero(frames[:, RVOL] > 0.001) >= frame_rate
     pres = (np.ones if have_rvol else np.zeros)((len(frames),1), dtype='float32')
     frames = np.append(frames, pres, axis=1)
+
+    # Extraction scales volume by the recording's loudest moment, so one spike shifts the
+    # whole recording.  Rescale both channels by the median non-silent front volume instead
+    # (one reference, so the rear/front balance survives): it makes loudness comparable
+    # across recordings, and a window sitting entirely inside a break can still tell it is
+    # louder than the show.
+    audible = frames[:, FVOL][frames[:, FVOL] > 1e-4]
+    if len(audible) >= frame_rate * 60:
+        vref = float(np.median(audible))
+        frames[:, FVOL] = np.clip(frames[:, FVOL] / vref, 0, 10)
+        frames[:, RVOL] = np.clip(frames[:, RVOL] / vref, 0, 10)
 
     # save off the times
     timestamps = frames[:,NORMTIME].copy()
@@ -491,14 +509,14 @@ def load_nonpersistent(flog:dict, for_training=False, no_logo=False, no_blanks=F
     btimes = timestamps[frames[:, BLANK] > 0.5]
     if len(btimes):
         j = np.searchsorted(btimes, timestamps, 'right')
-        since = np.where(j > 0, timestamps - btimes[np.clip(j-1, 0, len(btimes)-1)], 300.0)
+        since = np.where(j > 0, timestamps - btimes[np.clip(j-1, 0, len(btimes)-1)], DIST_CAP)
         k = np.searchsorted(btimes, timestamps, 'left')
-        until = np.where(k < len(btimes), btimes[np.clip(k, 0, len(btimes)-1)] - timestamps, 300.0)
+        until = np.where(k < len(btimes), btimes[np.clip(k, 0, len(btimes)-1)] - timestamps, DIST_CAP)
     else:
         # no blanks at all (or --no-blanks), so everything is maximally far from one
-        since = until = np.full(len(frames), 300.0, dtype='float32')
+        since = until = np.full(len(frames), DIST_CAP, dtype='float32')
     for d in (since, until):
-        frames = np.append(frames, np.clip(d/300.0, 0, 1.0).astype('float32')[:,np.newaxis], axis=1)
+        frames = np.append(frames, _scale_dist(d)[:,np.newaxis], axis=1)
     assert(frames.shape[-1] == GENERATED_FEATURES_START)
 
     # change the first column to be normalized timestamps (30 minute segments)
