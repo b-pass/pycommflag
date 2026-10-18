@@ -85,7 +85,7 @@ DILATIONS = [1, 2, 4, 8] # TCN dilation schedule
 DROPOUT   = 0.25
 START_DROP= 0.25
 TCN_DROP  = 0.15
-SQUEEZE_EXCITE = True # per-block channel gating in the TCN
+
 
 def build_model(input_shape=(WINDOW_BEFORE+1+WINDOW_AFTER, FEATURE_WIDTH)):
     global MTYPE
@@ -103,9 +103,6 @@ def build_model(input_shape=(WINDOW_BEFORE+1+WINDOW_AFTER, FEATURE_WIDTH)):
     x = layers.BatchNormalization(center=False, scale=False, epsilon=1e-5, name="input_norm")(inputs)
     x = layers.SpatialDropout1D(START_DROP, name="input_drop")(x)
 
-    # Everything below is downstream of a dropout, which inflates activation variance in
-    # training only, so a BatchNorm here would keep running stats that are wrong at inference
-    # (measured: ~12% too much variance after the input drop).  LayerNorm keeps none.
     x = layers.Dense(F, use_bias=False, name="projection")(x)
     x = layers.LayerNormalization(name="projection_ln")(x)
     x = layers.Activation("relu", name="projection_act")(x)
@@ -132,16 +129,15 @@ def build_model(input_shape=(WINDOW_BEFORE+1+WINDOW_AFTER, FEATURE_WIDTH)):
         x = layers.LayerNormalization(name=f"{name_prefix}_ln2")(x)
         x = layers.Activation("swish", name=f"{name_prefix}_act2")(x)
         x = layers.SpatialDropout1D(TCN_DROP, name=f"{name_prefix}_drop2")(x)
-        
-        if SQUEEZE_EXCITE:
-            # Squeeze
-            se = layers.GlobalAveragePooling1D(name=f"{name_prefix}_squeeze")(x)
-            # Excite
-            se = layers.Dense(x.shape[-1]//4, activation='relu', use_bias=False, name=f"{name_prefix}_excite1")(se)
-            se = layers.Dense(x.shape[-1], activation='sigmoid', use_bias=False, name=f"{name_prefix}_excite2")(se)
-            # Apply
-            se = layers.Reshape((1, x.shape[-1]), name=f"{name_prefix}_se_reshape")(se)
-            x = layers.Multiply(name=f"{name_prefix}_se_scale")([x, se])
+    
+        # Squeeze
+        se = layers.GlobalAveragePooling1D(name=f"{name_prefix}_squeeze")(x)
+        # Excite
+        se = layers.Dense(x.shape[-1]//4, activation='relu', use_bias=False, name=f"{name_prefix}_excite1")(se)
+        se = layers.Dense(x.shape[-1], activation='sigmoid', use_bias=False, name=f"{name_prefix}_excite2")(se)
+        # Apply
+        se = layers.Reshape((1, x.shape[-1]), name=f"{name_prefix}_se_reshape")(se)
+        x = layers.Multiply(name=f"{name_prefix}_se_scale")([x, se])
 
         x = layers.Add(name=f"{name_prefix}_res")([x, residual])
 
@@ -156,8 +152,8 @@ def build_model(input_shape=(WINDOW_BEFORE+1+WINDOW_AFTER, FEATURE_WIDTH)):
     attn = layers.Flatten(name="attn_flat")(attn)
 
     x = layers.Concatenate(name="head")([attn, maxp, center])
-
-    x = layers.Dense(4*F, "relu", name="classifier")(x)
+    
+    x = layers.Dense(F*3, "relu", name="classifier")(x)
     x = layers.Dropout(DROPOUT, name="classifier_drop")(x)
 
     outputs = layers.Dense(1, activation="sigmoid", name="output")(x)
@@ -1241,6 +1237,7 @@ def eval(opts:Any):
             duration = flog.get('duration',0.00001)
             real_dur = duration
             realtags = []
+            dnutags = []
 
             for (t,(b,e)) in flog.get('tags', []):
                 if t in [SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value]:
@@ -1249,10 +1246,14 @@ def eval(opts:Any):
                     if b < 10 and e > 0:
                         b = 0
                     duration -= e-b
+                    dnutags.append( (SceneType.DO_NOT_USE.value,(b,e)) )
                 elif t in [SceneType.COMMERCIAL, SceneType.COMMERCIAL.value]:
                     realtags.append( (t,(b,e)) )
 
             realtags = _adjust_tags(realtags, spans.get('blank', []), spans.get('diff', []))
+            # diff_tags only excludes the DO_NOT_USE spans it is given; without them, predictions
+            # inside those spans counted as errors while `duration` above already left them out
+            realtags = sorted(realtags + dnutags, key=lambda x: x[1][0])
             
             total_time += duration
         except Exception as e:
