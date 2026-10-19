@@ -64,11 +64,12 @@ WINDOW_AFTER = 60
 SUMMARY_RATE = 1
 RATE = 29.97
 
-# Pre-trained model downloaded when none is found locally. It is saved under MODEL_FNAME, which
-# encodes the input shape, so a feature/window change never reuses a stale download; publish a
-# new model (and update these) whenever FEATURE_WIDTH or the window sizes change.
+# Pre-trained model downloaded when none is found locally. The release asset and the local copy
+# are both named MODEL_FNAME, which encodes the input shape, so a feature/window change never
+# fetches or reuses a stale model; whenever FEATURE_WIDTH or the window sizes change, upload a
+# new model under the new name and update MODEL_SHA256.
 MODEL_FNAME = f'pycommflag-f{FEATURE_WIDTH}-w{WINDOW_BEFORE}x{WINDOW_AFTER}.keras'
-MODEL_URL = 'https://github.com/b-pass/pycommflag/releases/download/beta/'
+MODEL_URL = 'https://github.com/b-pass/pycommflag/releases/download/models/' + MODEL_FNAME
 MODEL_SHA256 = 'de0caec88492c670e078fa4fb50c85e49edbf10e7d9117b948a4baa358e08ce5'
 DIFF_THRESHOLD = 15.0
 
@@ -153,7 +154,7 @@ def build_model(input_shape=(WINDOW_BEFORE+1+WINDOW_AFTER, FEATURE_WIDTH)):
 
     x = layers.Concatenate(name="head")([attn, maxp, center])
     
-    x = layers.Dense(F*3, "relu", name="classifier")(x)
+    x = layers.Dense(F*4, "relu", name="classifier")(x)
     x = layers.Dropout(DROPOUT, name="classifier_drop")(x)
 
     outputs = layers.Dense(1, activation="sigmoid", name="output")(x)
@@ -835,7 +836,7 @@ def train(opts:Any=None):
 
     def cosine_annealing_with_warmup(epoch, lr):
         WARMUP = min(max(EPOCHS//12, 1), 4) # 1-4 epochs
-        TOTAL = ceil(EPOCHS * .75)
+        TOTAL = EPOCHS - 5
         MAX_LR = 0.001
         MIN_LR = 0.00001 # Set your true floor here
         
