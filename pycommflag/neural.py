@@ -70,7 +70,7 @@ RATE = 29.97
 # new model under the new name and update MODEL_SHA256.
 MODEL_FNAME = f'pycommflag-f{FEATURE_WIDTH}-w{WINDOW_BEFORE}x{WINDOW_AFTER}.keras'
 MODEL_URL = 'https://github.com/b-pass/pycommflag/releases/download/models/' + MODEL_FNAME
-MODEL_SHA256 = 'de0caec88492c670e078fa4fb50c85e49edbf10e7d9117b948a4baa358e08ce5'
+MODEL_SHA256 = '04e7957047ba45bda309cc8614530bfd770a237ee36cdebf2641e697cf46f08c'
 DIFF_THRESHOLD = 15.0
 
 # training params
