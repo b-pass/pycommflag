@@ -29,6 +29,7 @@ live.SETTLE_SECS = 0.5
 live.IDLE_SECS = 2
 live.HEADSTART = 50
 live.HEADSTART_POLL_SECS = 0.5
+live.INTERVAL = 30
 
 _fails = []
 
@@ -134,7 +135,8 @@ try:
     writer = Recorder(full, grow, 150, speed=5, start_frac=0.02)
     writer.start()
     live_log = os.path.join(tmp, 'live.json')
-    processor.process_video(grow, live_log, opts_for(grow), live=rec)
+    snaps = []
+    processor.process_video(grow, live_log, opts_for(grow), live=rec, on_snapshot=snaps.append)
     writer.join()
 
     # with the log already there, the normal run reuses its logo, which the live one found
@@ -153,6 +155,18 @@ try:
     check('logo', a['logo'], b['logo'])
     check('frame count', len(a['frames']), len(b['frames']))
     check('frames', a['frames'] == b['frames'], True)
+
+    # --- interim snapshots along the way
+    # the audio is final a 60s chunk at a time, so 150s gives two
+    check('snapshots', len(snaps) >= 2, True)
+    check('snapshot times', [s['duration'] for s in snaps] == sorted(s['duration'] for s in snaps), True)
+    check('snapshot spacing', all(n['duration'] - p['duration'] >= live.INTERVAL for p, n in zip(snaps, snaps[1:])), True)
+    for i, snap in enumerate(snaps):
+        fr = snap['frames']
+        check(f'snapshot {i} header', snap['frames_header'], a['frames_header'])
+        check(f'snapshot {i} stops at its duration', fr[-1][0] < snap['duration'] <= a['frames'][len(fr)][0], True)
+        # all but the volume, which is scaled by the loudest moment so far
+        check(f'snapshot {i} frames', [f[:4] + f[6:] for f in fr] == [f[:4] + f[6:] for f in a['frames'][:len(fr)]], True)
 except BaseException:
     # extraction leaves its worker threads running when it dies, so don't wait for them
     import traceback

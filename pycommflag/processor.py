@@ -5,7 +5,7 @@ import math
 import os
 from queue import Queue
 import re
-from threading import Thread
+from threading import Lock, Thread
 import time
 from typing import Any,TextIO, TextIO
 
@@ -68,8 +68,10 @@ def write_feature_log(flog:dict, log_file:str|TextIO):
     log_file.write("\n}\n")
     log_file.close()
 
-def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None, live=None) -> dict:
-    """`live` is a live.Recording when video_filename is still being recorded."""
+def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None, live=None, on_snapshot=None) -> dict:
+    """`live` is a live.Recording when video_filename is still being recorded.  Live,
+    on_snapshot(flog) is called every live.INTERVAL seconds with an in-memory log of what
+    has been extracted so far."""
 
     # yield CPU time to useful tasks, this is a background thing (even live, which lags anyway).
     os.nice(10)
@@ -144,6 +146,8 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None, liv
     report = math.ceil(ftotal/1000) if not opts.quiet else ftotal*10
     if live:
         report = math.ceil(player.frame_rate * 10)
+        from .live import INTERVAL
+        next_snapshot = INTERVAL
     mythreport = 0
     rt = time.perf_counter()
     p = 0
@@ -184,6 +188,10 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None, liv
             if mythnow != mythreport or mythnow < 0:
                 mythreport = mythnow
                 mythtv.set_job_status(opts, logmsg)
+            if live and on_snapshot and min(videoProc.lasttime, audioProc.done_until) >= next_snapshot:
+                snap = _snapshot(opts, player, logo, videoProc, audioProc)
+                next_snapshot = snap['duration'] + INTERVAL
+                on_snapshot(snap)
             #gc.collect()
             p = 0
         if fcount%audio_interval == 0:
@@ -218,48 +226,16 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None, liv
     #            frames[0][0] = 0.0
     #            break
     
-    header = videoProc.frame_header()
-    
-    header += ['fvol', 'rvol']
+    header = _frames_header(videoProc)
 
-    assert(AudioSegmentLabel.count() == 4)
-    header += ['silence', 'speech', 'music', 'noise']
-    
     # normalize with the max volume of the whole recording
-    vscale = np.max(np.array(audioProc.rms)[..., 1:3])
-    if not vscale > 0:
+    vscale = _volume_scale(audioProc.rms)
+    if vscale is None:
         # no audio stream, or the whole recording is digital silence; dividing by this
         # would put a NaN in every frame (which json writes out as a bare NaN literal)
         log.warning('No audio volume in this recording; leaving the volume features at zero')
         vscale = 1.0
-    vit = iter(audioProc.rms)
-    volume = next(vit, (player.duration,0,0))
-
-    ait = iter(audioProc.fspan.to_list())
-    audio = next(ait, (AudioSegmentLabel.SILENCE,(0,player.duration)))
-    
-    for frame in frames:
-        ft = frame[0]
-        
-        # mark up each frame with the calculated audio type and volume level
-        while ft > volume[0]:
-            try:
-                volume = next(vit)
-            except StopIteration:
-                volume = (player.duration,0,0)
-                break
-        frame += [round(float(volume[1]/vscale),6), round(float(volume[2]/vscale),6)]
-    
-        # convert audio to one-hot and then add it
-        while ft >= audio[1][1]:
-            try:
-                audio = next(ait)
-            except StopIteration:
-                audio = (AudioSegmentLabel.SILENCE,(0,player.duration))
-                break
-        x = [0] * AudioSegmentLabel.count()
-        x[audio[0].value if ft >= audio[1][0] else AudioSegmentLabel.SILENCE.value] = 1
-        frame += x
+    _merge_audio(frames, audioProc.rms, audioProc.fspan.to_list(), player.duration, vscale)
 
     feature_log.write(',\n"frames_header":')
     json.dump(header, feature_log)
@@ -282,6 +258,75 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None, liv
     
     if not opts.quiet:
         print('Extraction complete           ')
+
+def _snapshot(opts, player, logo, videoProc, audioProc) -> dict:
+    """An in-memory feature log of everything extracted so far, for interim predictions.
+
+    It stops where the audio does, which trails the video by a chunk.  The volume is scaled
+    by the loudest moment so far, not the whole recording's.
+    """
+    rms, spans, done = audioProc.snapshot()
+    edge = min(videoProc.lasttime, done)
+    frames = []
+    for f in videoProc.frames[:]:
+        if f[0] >= edge:
+            break
+        frames.append(list(f))
+    _merge_audio(frames, rms, spans, edge, _volume_scale(rms) or 1.0)
+    flog = {'file_version': 10}
+    if opts.chanid: flog['chanid'] = str(opts.chanid)
+    if opts.starttime: flog['starttime'] = str(opts.starttime)
+    flog['filename'] = os.path.realpath(opts.filename)
+    flog['duration'] = edge
+    flog['frame_rate'] = round(float(player.frame_rate),4)
+    flog['logo'] = json.loads(logo_finder.to_json(logo))
+    flog['frames_header'] = _frames_header(videoProc)
+    flog['frames'] = frames
+    return flog
+
+def _frames_header(videoProc) -> list:
+    header = videoProc.frame_header()
+    
+    header += ['fvol', 'rvol']
+
+    assert(AudioSegmentLabel.count() == 4)
+    header += ['silence', 'speech', 'music', 'noise']
+    return header
+
+def _volume_scale(rms) -> float|None:
+    vscale = np.max(np.array(rms)[..., 1:3])
+    return vscale if vscale > 0 else None
+
+def _merge_audio(frames:list, rms:list, audio_spans:list, duration:float, vscale:float) -> None:
+    """Append the volume and audio type columns to each of `frames` (in place)."""
+    vit = iter(rms)
+    volume = next(vit, (duration,0,0))
+
+    ait = iter(audio_spans)
+    audio = next(ait, (AudioSegmentLabel.SILENCE,(0,duration)))
+    
+    for frame in frames:
+        ft = frame[0]
+        
+        # mark up each frame with the calculated audio type and volume level
+        while ft > volume[0]:
+            try:
+                volume = next(vit)
+            except StopIteration:
+                volume = (duration,0,0)
+                break
+        frame += [round(float(volume[1]/vscale),6), round(float(volume[2]/vscale),6)]
+    
+        # convert audio to one-hot and then add it
+        while ft >= audio[1][1]:
+            try:
+                audio = next(ait)
+            except StopIteration:
+                audio = (AudioSegmentLabel.SILENCE,(0,duration))
+                break
+        x = [0] * AudioSegmentLabel.count()
+        x[audio[0].value if ft >= audio[1][0] else AudioSegmentLabel.SILENCE.value] = 1
+        frame += x
 
 class VideoProc(Thread):
     def __init__(self, vt_start, logo, opts):
@@ -387,6 +432,13 @@ class AudioProc(Thread):
         self.fspan = AudioFeatureSpan()
         self.fspan.start()
         self.rms = [(0,0,0)]
+        self.lock = Lock()      # held while fspan changes, for snapshot()
+        self.done_until = 0.0   # audio before this time is final
+
+    def snapshot(self) -> tuple[list, list, float]:
+        """(rms, fspan's list, done_until), consistent with each other, while running."""
+        with self.lock:
+            return list(self.rms), self.fspan.to_list(), self.done_until
 
     def add_audio(self, audio):
         for a in audio:
@@ -528,15 +580,17 @@ class AudioProc(Thread):
                 # where the previous chunk also had an opinion, splice the two together at a
                 # point they agree on rather than letting one of them win arbitrarily
                 emit_from = cur
-                if held:
-                    emit_from = self._reconcile(held, segs, cur, min(cur + self.overlap, chunk_end))
-                    for (lab, sb, se) in self._clip(held, cur, emit_from):
-                        self.fspan.add(round(sb,5), round(se,5), lab)
-
                 # hold back the tail that the next chunk will also see
                 hold_from = cur + hop/16000.0
-                for (lab, sb, se) in self._clip(segs, emit_from, hold_from):
-                    self.fspan.add(round(sb,5), round(se,5), lab)
+                with self.lock:
+                    if held:
+                        emit_from = self._reconcile(held, segs, cur, min(cur + self.overlap, chunk_end))
+                        for (lab, sb, se) in self._clip(held, cur, emit_from):
+                            self.fspan.add(round(sb,5), round(se,5), lab)
+
+                    for (lab, sb, se) in self._clip(segs, emit_from, hold_from):
+                        self.fspan.add(round(sb,5), round(se,5), lab)
+                    self.done_until = min(hold_from, chunk_end)
                 held = self._clip(segs, hold_from, chunk_end)
 
                 # advance; the final chunk can be shorter than a whole hop

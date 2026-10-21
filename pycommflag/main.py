@@ -255,11 +255,37 @@ def _cmd_flag(opts) -> int:
         rec = live.Recording(opts.filename, live.recording_check(opts))
 
     with _feature_log_path(opts) as feature_log:
-        process_video(opts.filename, feature_log, opts, live=rec)
+        process_video(opts.filename, feature_log, opts, live=rec, on_snapshot=_interim_output(opts))
         flog = read_feature_log(feature_log)
         result = predict(flog, opts, feature_log)
 
     return 1 if output(opts, result, flog) is False else 0
+
+
+def _interim_output(opts):
+    """The on_snapshot callback for a live run: predict on what we have so far and output
+    the breaks whenever they change."""
+    import logging as log
+    import time
+    from .mythtv import set_job_status
+    from .neural import predict, WINDOW_AFTER
+
+    last = None
+    def on_snapshot(flog):
+        nonlocal last
+        try:
+            # the last WINDOW_AFTER seconds' windows run off the end into padding
+            cutoff = flog['duration'] - WINDOW_AFTER
+            result = [(t, (b, min(e, cutoff))) for (t, (b, e)) in predict(flog, opts) if b < cutoff]
+            if result != last:
+                last = result
+                output(opts, result, flog, final=False)
+            set_job_status(opts, f'Live: flagged to {time.strftime("%H:%M:%S", time.gmtime(cutoff))}, '
+                                 f'{len(result)} break{"s" if len(result) != 1 else ""} so far')
+        except Exception:
+            # the final pass is what counts, so carry on extracting
+            log.exception('Interim prediction failed')
+    return on_snapshot
 
 
 @contextmanager
@@ -283,8 +309,12 @@ def _feature_log_path(opts):
 
 # --- output -------------------------------------------------------------------
 
-def output(opts, result, feature_log=None) -> None|bool:
-    """Returns False if the output could not be written (only -o channelsdvr reports that)."""
+def output(opts, result, feature_log=None, final=True) -> None|bool:
+    """Returns False if the output could not be written (only -o channelsdvr reports that).
+
+    final=False is an interim result from a live run, which leaves the MythTV job running
+    and isn't sent to Channels.
+    """
     if result is None:
         return
 
@@ -297,12 +327,14 @@ def output(opts, result, feature_log=None) -> None|bool:
 
     if opts.output_type in ['mythtv', 'myth', 'auto', '', None]:
         from .mythtv import set_breaks
-        if set_breaks(opts, result, feature_log):
+        if set_breaks(opts, result, feature_log, final=final):
             return
         if opts.output_type in ['mythtv', 'myth']:
             return # was not auto, so dont try edl or txt
 
     if opts.output_type in ['channelsdvr', 'channels']:
+        if not final:
+            return
         from .channels import set_breaks
         return set_breaks(opts, result, (feature_log or {}).get('filename') or opts.filename)
 
