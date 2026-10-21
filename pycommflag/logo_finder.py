@@ -331,6 +331,28 @@ def _analyze(logo_sum:np.ndarray, fcount:int, shape:tuple) -> tuple|None:
 # nothing, so the line sits closer to the show tail than to the QR code.
 _LOGO_MAX_OFF_EDGES = .75
 
+SAME_LOGO_IOU = .8
+
+def same_logo(a:tuple|None, b:tuple|None) -> bool:
+    """Whether two search results are the same logo, near enough that frames checked
+    against one would come out the same against the other.
+
+    For a live run, whose logo came from the start of the recording, against a search of
+    the whole thing: their masks agree pixel for pixel only when the two saw the same frames.
+    """
+    if a is None or b is None:
+        return a is None and b is None
+    bottom = max(a[1][0], b[1][0])
+    right = max(a[1][1], b[1][1])
+    def place(logo):
+        ((top,left),(bot,rgt),lmask,*_) = logo
+        m = np.zeros((bottom, right), bool)
+        m[top:bot, left:rgt] = lmask
+        return m
+    ma, mb = place(a), place(b)
+    union = np.count_nonzero(ma | mb)
+    return union > 0 and np.count_nonzero(ma & mb) / union >= SAME_LOGO_IOU
+
 def check_frame(frame :VideoFrame, logo :tuple) -> bool:
     if not logo:
         return False

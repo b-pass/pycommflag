@@ -312,7 +312,10 @@ already playing the recording picks up new breaks without restarting playback.
 They trail the live recording by about 2 to 4 minutes: the audio is analyzed a
 minute at a time, and each second is judged by the minute on either side of
 it. When the recording ends, pycommflag flags the whole recording again, the
-same way as one that had already finished.
+same way as one that had already finished. It also searches the whole
+recording for the logo, and if that finds a different one than the first 10
+minutes did, it extracts everything again with it, which takes as long as
+flagging a finished recording.
 
 ## 🔄 Coming from comskip
 
