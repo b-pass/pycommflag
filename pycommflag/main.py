@@ -255,7 +255,7 @@ def _cmd_flag(opts) -> int:
         rec = live.Recording(opts.filename, live.recording_check(opts))
 
     with _feature_log_path(opts) as feature_log:
-        process_video(opts.filename, feature_log, opts, live=rec, on_snapshot=_interim_output(opts))
+        process_video(opts.filename, feature_log, opts, live=rec, on_snapshot=_interim_output(opts) if rec else None)
         if rec is not None and not opts.no_logo:
             _recheck_logo(opts, feature_log)
         flog = read_feature_log(feature_log)
