@@ -248,9 +248,14 @@ def _cmd_flag(opts) -> int:
 
     from .processor import process_video, read_feature_log
     from .neural import predict
+    from . import live
+
+    rec = None
+    if live.is_live(opts):
+        rec = live.Recording(opts.filename, live.recording_check(opts))
 
     with _feature_log_path(opts) as feature_log:
-        process_video(opts.filename, feature_log, opts)
+        process_video(opts.filename, feature_log, opts, live=rec)
         flog = read_feature_log(feature_log)
         result = predict(flog, opts, feature_log)
 

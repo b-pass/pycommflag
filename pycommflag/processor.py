@@ -68,10 +68,10 @@ def write_feature_log(flog:dict, log_file:str|TextIO):
     log_file.write("\n}\n")
     log_file.close()
 
-def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> dict:
-    # if we ever implement "live" processing then don't do this...
-    
-    # yield CPU time to useful tasks, this is a background thing.
+def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None, live=None) -> dict:
+    """`live` is a live.Recording when video_filename is still being recorded."""
+
+    # yield CPU time to useful tasks, this is a background thing (even live, which lags anyway).
     os.nice(10)
 
     logo = None
@@ -81,7 +81,14 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
             if logo and not opts.quiet:
                 log.info(f"{feature_log} exists, re-using logo {logo[0]},{logo[1]}")
 
-    player = Player(video_filename, no_deinterlace=opts.no_deinterlace)
+    if live:
+        from .live import wait_for_headstart
+        mythtv.set_job_status(opts, 'Waiting for the recording to get started')
+        wait_for_headstart(live, opts)
+
+    # live: the Player stops at the end of what has been recorded until we turn on live.follow,
+    # so the logo search only sees the head start
+    player = Player(video_filename, no_deinterlace=opts.no_deinterlace, source=live)
 
     if opts.no_logo:
         logo = None
@@ -91,6 +98,8 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
         mythtv.set_job_status(opts,'Searching for logo')
         logo = logo_finder.search(player, opts=opts)
         player.seek(0)
+    if live:
+        live.follow = True
     
     if type(feature_log) is str:
         log_path = feature_log
@@ -118,7 +127,9 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
     except:
         pass
 
-    feature_log.write(f',\n"duration":{float(player.duration)}')
+    if not live:
+        # live, this is only how much had been recorded when we opened it; see the end
+        feature_log.write(f',\n"duration":{float(player.duration)}')
     feature_log.write(f',\n"frame_rate":{round(float(player.frame_rate),4)}')
 
     feature_log.write(',\n"logo":')
@@ -131,6 +142,8 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
 
     percent = ftotal/100.0
     report = math.ceil(ftotal/1000) if not opts.quiet else ftotal*10
+    if live:
+        report = math.ceil(player.frame_rate * 10)
     mythreport = 0
     rt = time.perf_counter()
     p = 0
@@ -157,12 +170,19 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
         if p >= report:
             ro = rt
             rt = time.perf_counter()
-            perc = min(fcount/percent,100.0)
-            timeleft = round( (100.0 - perc) * ((time.time() - start) / perc) )+1
-            logmsg = "Extracting, %5.1f%% @%5.1f fps, %4d seconds left" % (perc, p/(rt - ro), timeleft)
-            print(logmsg + "               ", end='\r')
-            if int(perc//5) != mythreport or perc >= 99:
-                mythreport = int(perc//5)
+            if live:
+                # the recording's length isn't known yet, so report where we are (each minute)
+                at = fcount/float(player.frame_rate)
+                logmsg = "Extracting live, at %s @%5.1f fps" % (time.strftime('%H:%M:%S', time.gmtime(at)), p/(rt - ro))
+                mythnow = int(at//60)
+            else:
+                perc = min(fcount/percent,100.0)
+                timeleft = round( (100.0 - perc) * ((time.time() - start) / perc) )+1
+                logmsg = "Extracting, %5.1f%% @%5.1f fps, %4d seconds left" % (perc, p/(rt - ro), timeleft)
+                mythnow = int(perc//5) if perc < 99 else -1
+            if not opts.quiet: print(logmsg + "               ", end='\r')
+            if mythnow != mythreport or mythnow < 0:
+                mythreport = mythnow
                 mythtv.set_job_status(opts, logmsg)
             #gc.collect()
             p = 0
@@ -180,6 +200,12 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
 
     videoProc.join()
     audioProc.join()
+
+    if live:
+        # what a Player opened on the finished recording would have said
+        import av
+        with av.open(video_filename) as c:
+            player.duration = c.duration / av.time_base
 
     frames = videoProc.frames
 
@@ -240,6 +266,9 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
     feature_log.write(',\n"frames":')
     json.dump(frames, feature_log)
     
+    if live:
+        feature_log.write(f',\n"duration":{float(player.duration)}')
+
     if die:
         feature_log.write("\n\n,\"EARLY_STOP_TRUNCATION\":true")
 
