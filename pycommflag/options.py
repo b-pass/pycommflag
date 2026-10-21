@@ -44,6 +44,9 @@ def get_options():
                         help="Pull configuration from a yaml file and overwrite commandline configuration and default with that.")
     parser.add_argument('--deinterlace', dest='no_deinterlace', action='store_false',
                         help="Use a deinterlacing filter during video processing")
+    parser.add_argument('--live', dest='live', action='store_true',
+                        help="The video is still being recorded: follow it until it stops growing. "
+                             "Recordings MythTV is still making are followed without this.")
     parser.add_argument('--diff-threshold', dest='diff_threshold', type=float, default=15.0,
                         help="Threshold (column/bar) for marking an image difference/change [8-30 is sane].")
     

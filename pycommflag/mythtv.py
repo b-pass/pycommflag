@@ -57,6 +57,25 @@ def is_rebuild_job(jobid)->bool:
         row = c.fetchone()
     return row is not None and (int(row[0] or 0) & JOB_REBUILD) != 0
 
+def recording_in_progress(chanid, starttime)->bool|None:
+    """Whether mythtv is still recording this; None if we can't ask it."""
+    conn = _open()
+    if conn is None:
+        return None
+    try:
+        with conn.cursor() as c:
+            # the recorder holds an inuseprograms row for as long as it records, refreshing it
+            # every 15 minutes, and deletes it when it stops (mythtv's own "in use" test
+            # ignores rows over an hour old). Times in the DB are UTC.
+            c.execute("SELECT COUNT(*) FROM inuseprograms "
+                      "WHERE chanid = %s AND starttime = %s AND recusage = 'recorder' "
+                      "AND lastupdatetime > UTC_TIMESTAMP() - INTERVAL 61 MINUTE",
+                      (chanid, starttime))
+            return int(c.fetchone()[0]) > 0
+    except Exception:
+        log.exception("Could not check whether the recording is in progress")
+        return None
+
 def get_filename(opts)->str|None:
     if not opts.chanid or not opts.starttime:
         if opts.mythjob:

@@ -7,8 +7,9 @@ import numpy as np
 import os
 
 class Player:
-    def __init__(self, filename:str, no_deinterlace:bool=False):
+    def __init__(self, filename:str, no_deinterlace:bool=False, source=None):
         self.filename = filename
+        self.source = source  # if given, a callable returning a file object to av.open instead
         self.graph = None
         self.trouble = False
         self.streams = {'video':0}
@@ -18,7 +19,8 @@ class Player:
 
         self._resync(None)
         
-        self.duration = self.container.duration / av.time_base
+        # a recording still being made may not have one yet
+        self.duration = self.container.duration / av.time_base if self.container.duration else 0.0
         self.frame_rate = round(self.container.streams.video[0].guessed_rate,3)
         self.vt_start = self.container.streams.video[0].start_time * self.container.streams.video[0].time_base
         self.vpts = self.container.streams.video[0].start_time
@@ -194,7 +196,7 @@ class Player:
 
     def _resync(self, pts):
         old = getattr(self, 'container', None)
-        self.container:av.container.InputContainer = av.open(self.filename)#, options={'probesize':'10000000'})
+        self.container:av.container.InputContainer = av.open(self.source() if self.source else self.filename)#, options={'probesize':'10000000'})
         if old is not None:
             # av.open() again without this leaks the file descriptor every resync
             try:

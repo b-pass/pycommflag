@@ -181,6 +181,10 @@ Other useful options (`pycommflag --help` lists them all):
 - `--output-dir DIR` / `--output-name NAME`: write the `.edl`/`.txt` as
   `DIR/NAME.edl` instead of next to the video.
 - `--no-logo`: skip the station logo search.
+- `--live`: the video is still being recorded. pycommflag waits for 10 minutes
+  of it, follows the file as it grows, and finishes once the file has stopped
+  growing for 2 minutes. MythTV recordings that are still recording are
+  followed without this (see [While it records](#while-it-records)).
 - `--deinterlace`: turn on deinterlacing (off by default).
 - `-q` / `--noprogress`: don't print progress.
 - `--yaml FILE`: load options from a YAML file. Keys are the option names as
@@ -288,6 +292,16 @@ same arguments. Likewise, if the job queue hands pycommflag a job that
 `mythcommflag --queue --rebuild` created, pycommflag passes the whole job to the
 real `mythcommflag`. For these reasons, don't replace the `mythcommflag` binary
 itself with pycommflag. Use the setting above instead.
+
+### While it records
+
+With pycommflag as the mythcommflag replacement, it can flag recordings while
+they are still recording. In **Job Queue (Global)**, turn on **Start Auto
+Commercial Detection Jobs when the Recording Starts** (the
+`AutoCommflagWhileRecording` setting). MythTV then starts the job as soon as a
+recording begins, and pycommflag follows the file as it grows. It first waits
+for 10 minutes of the recording, because it finds the station logo in those,
+and it finishes once MythTV has stopped recording.
 
 ## 🔄 Coming from comskip
 
@@ -563,5 +577,4 @@ are applied.
 
 - Publish to PyPI.
 - Per-channel settings or models. So far, one model trained on enough varied data seems to generalize well.
-- Live/streaming flagging ... would need to lag at least a couple minutes behind live TV, but could be done.  Would this require integration with the recorder, or could it be accomplished just with access to the file on disk?
 - Training logs from other countries might help?  Or fine tuning for those?  Should we have a SILENCE_SINCE/SILENCE_UNIT feature for UK?  Or the existing audio classes already work well enough for UK?
