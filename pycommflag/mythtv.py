@@ -195,7 +195,11 @@ def _frame_for_time(cursor, chanid, starttime, when, rate)->int:
         frame = int(m) + round((when - float(o)/1000) * rate)
     return frame if frame > 0 else 0
 
-def set_breaks(opts, marks, flog=None)->bool:
+COMM_FLAG_DONE = 1        # recorded.commflagged values, from mythtv's programtypes.h
+COMM_FLAG_PROCESSING = 2
+
+def set_breaks(opts, marks, flog=None, final=True)->bool:
+    """final=False writes an interim result: the job keeps running."""
     chanid = opts.chanid
     starttime = opts.starttime
     if not chanid or not starttime:
@@ -253,8 +257,11 @@ def set_breaks(opts, marks, flog=None)->bool:
                     log.exception("error adding break segment")
         
         c.execute("UPDATE recorded SET commflagged = %s "\
-                  "WHERE chanid = %s AND starttime = %s", (1 if nbreaks else 0, chanid, starttime))
-        
+                  "WHERE chanid = %s AND starttime = %s",
+                  ((COMM_FLAG_DONE if nbreaks else 0) if final else COMM_FLAG_PROCESSING, chanid, starttime))
+    
+    if not final:
+        return True
     set_job_status(opts, msg=f'Found {nbreaks} commercial break{"s" if nbreaks != 1 else ""}', status='success')
     if opts.exitcode:
         sys.exit(nbreaks) # yes, this is dumb, but its what the jobqueue code looks for when we run as the CommercialFlag command

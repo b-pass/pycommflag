@@ -183,8 +183,10 @@ Other useful options (`pycommflag --help` lists them all):
 - `--no-logo`: skip the station logo search.
 - `--live`: the video is still being recorded. pycommflag waits for 10 minutes
   of it, follows the file as it grows, and finishes once the file has stopped
-  growing for 2 minutes. MythTV recordings that are still recording are
-  followed without this (see [While it records](#while-it-records)).
+  growing for 2 minutes. Every 2 minutes it writes the breaks found so far
+  (MythTV, `.edl` or `.txt`, but not Channels DVR). MythTV recordings that are
+  still recording are followed without this (see
+  [While it records](#while-it-records)).
 - `--deinterlace`: turn on deinterlacing (off by default).
 - `-q` / `--noprogress`: don't print progress.
 - `--yaml FILE`: load options from a YAML file. Keys are the option names as
@@ -302,6 +304,13 @@ Commercial Detection Jobs when the Recording Starts** (the
 recording begins, and pycommflag follows the file as it grows. It first waits
 for 10 minutes of the recording, because it finds the station logo in those,
 and it finishes once MythTV has stopped recording.
+
+While the recording goes on, pycommflag writes the breaks it has found so far
+to the database every 2 minutes, so they are there when you start watching.
+They trail the live recording by about 2 to 4 minutes: the audio is analyzed a
+minute at a time, and each second is judged by the minute on either side of
+it. When the recording ends, pycommflag flags the whole recording again, the
+same way as one that had already finished.
 
 ## 🔄 Coming from comskip
 
