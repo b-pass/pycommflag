@@ -256,6 +256,8 @@ def _cmd_flag(opts) -> int:
 
     with _feature_log_path(opts) as feature_log:
         process_video(opts.filename, feature_log, opts, live=rec, on_snapshot=_interim_output(opts))
+        if rec is not None and not opts.no_logo:
+            _recheck_logo(opts, feature_log)
         flog = read_feature_log(feature_log)
         result = predict(flog, opts, feature_log)
 
@@ -286,6 +288,26 @@ def _interim_output(opts):
             # the final pass is what counts, so carry on extracting
             log.exception('Interim prediction failed')
     return on_snapshot
+
+
+def _recheck_logo(opts, feature_log) -> bool:
+    """A live run found its logo in the head start.  Search the whole recording now, and if
+    that finds a different logo, extract again with it.  True if it did."""
+    import logging as log
+    from . import logo_finder
+    from .mythtv import set_job_status
+    from .player import Player
+    from .processor import process_video, read_logo
+
+    set_job_status(opts, 'Checking the logo against the whole recording')
+    logo = logo_finder.search(Player(opts.filename, no_deinterlace=opts.no_deinterlace), opts=opts)
+    old = read_logo(feature_log)
+    if logo_finder.same_logo(logo, old):
+        return False
+    log.info(f'The whole recording has a different logo ({logo[:2] if logo else None}) than its start '
+             f'({old[:2] if old else None}), extracting again')
+    process_video(opts.filename, feature_log, opts, use_logo=logo)
+    return True
 
 
 @contextmanager

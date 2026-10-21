@@ -112,6 +112,27 @@ for name, s, fc, shape, e in fixtures():
           lf._analyze(s.copy(), fc, shape) is not None,
           f'largest core {largest}px, {len(remove)} stuck region(s)')
 
+print('\n=== same_logo: the end-of-recording re-check of a live run\'s logo ===')
+logos = {name: lf._analyze(s.copy(), fc, shape) for name, s, fc, shape, e in fixtures()}
+found = {name: l for name, l in logos.items() if l is not None}
+check('no logo is the same as no logo', lf.same_logo(None, None))
+for name, s, fc, shape, e in fixtures():
+    l = logos[name]
+    if l is None:
+        continue
+    check(f'{name} is the same as itself', lf.same_logo(l, l))
+    check(f'{name} is not the same as no logo', not lf.same_logo(l, None) and not lf.same_logo(None, l))
+    # a search that saw more frames without the logo: every count drops a little.  (Not the
+    # weather alerts: what the search makes of those really does change, so it should re-check.)
+    less = lf._analyze((s.astype(float) * .95).astype(np.uint32), fc, shape)
+    if less is not None and not name.startswith('alert-'):
+        check(f'{name} is the same with 5% fewer sightings', lf.same_logo(l, less),
+              f'{summarize(l)["bbox"]} vs {summarize(less)["bbox"]}')
+others = [n for n in found]
+for x, y in zip(others, others[1:] + others[:1]):
+    if x != y and summarize(found[x])['bbox'] != summarize(found[y])['bbox']:
+        check(f'{x} is not the same as {y}', not lf.same_logo(found[x], found[y]))
+
 print('\n=== the hand-flagged recording, scored against its true tags ===')
 z = np.load(os.path.join(FX, 'logo-handflagged.counts.npz'), allow_pickle=True)
 frac = z['counts'] / int(z['lmc'])

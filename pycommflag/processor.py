@@ -68,16 +68,22 @@ def write_feature_log(flog:dict, log_file:str|TextIO):
     log_file.write("\n}\n")
     log_file.close()
 
-def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None, live=None, on_snapshot=None) -> dict:
+_SEARCH = object()
+
+def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None, live=None, on_snapshot=None,
+                  use_logo=_SEARCH) -> dict:
     """`live` is a live.Recording when video_filename is still being recorded.  Live,
     on_snapshot(flog) is called every live.INTERVAL seconds with an in-memory log of what
-    has been extracted so far."""
+    has been extracted so far.  `use_logo` is a logo (or None) to use instead of reusing the
+    log's or searching."""
 
     # yield CPU time to useful tasks, this is a background thing (even live, which lags anyway).
     os.nice(10)
 
     logo = None
-    if type(feature_log) is str:
+    if use_logo is not _SEARCH:
+        pass
+    elif type(feature_log) is str:
         if os.path.exists(feature_log) and not opts.no_logo:
             logo = logo_finder.from_json(read_feature_log(feature_log).get('logo', None))
             if logo and not opts.quiet:
@@ -92,7 +98,9 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None, liv
     # so the logo search only sees the head start
     player = Player(video_filename, no_deinterlace=opts.no_deinterlace, source=live)
 
-    if opts.no_logo:
+    if use_logo is not _SEARCH:
+        logo = use_logo
+    elif opts.no_logo:
         logo = None
     elif logo is not None:
         pass

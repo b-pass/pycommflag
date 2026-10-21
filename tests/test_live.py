@@ -39,10 +39,10 @@ def check(name, got, want):
     if not ok:
         _fails.append(name)
 
-def make_ts(path, seconds, fps=30, w=320, h=180):
+def make_ts(path, seconds, fps=30, w=320, h=180, logo_from=None):
     """Segments of different brightness and tone, a black silent gap between them, and a
     white box in the corner for the logo search to find (it goes away for 15s of every 40,
-    or the search would take it for a stuck overlay)."""
+    or the search would take it for a stuck overlay; or it is there from `logo_from` on)."""
     out = av.open(path, 'w', format='mpegts')
     vs = out.add_stream('mpeg2video', rate=fps)
     vs.width, vs.height, vs.pix_fmt, vs.bit_rate = w, h, 'yuv420p', 800000
@@ -58,7 +58,7 @@ def make_ts(path, seconds, fps=30, w=320, h=180):
             img[:] = (seg*40)%200 + 30
             x = int((t*40) % (w-40))
             img[60:100, x:x+40] = 250
-            if t % 40 < 25:
+            if (t % 40 < 25) if logo_from is None else (t >= logo_from):
                 img[20:45, w-60:w-20] = 255
         f = av.VideoFrame.from_ndarray(img, format='rgb24')
         f.pts, f.time_base = i, fractions.Fraction(1, fps)
@@ -167,6 +167,28 @@ try:
         check(f'snapshot {i} stops at its duration', fr[-1][0] < snap['duration'] <= a['frames'][len(fr)][0], True)
         # all but the volume, which is scaled by the loudest moment so far
         check(f'snapshot {i} frames', [f[:4] + f[6:] for f in fr] == [f[:4] + f[6:] for f in a['frames'][:len(fr)]], True)
+
+    # --- at the end, the logo is checked against a search of the whole recording
+    from pycommflag import main
+    before = open(live_log).read()
+    check('same logo: not extracted again', main._recheck_logo(opts_for(grow), live_log), False)
+    check('same logo: log untouched', open(live_log).read() == before, True)
+
+    late = os.path.join(tmp, 'late.ts')
+    make_ts(late, 150, logo_from=live.HEADSTART)
+    grow = os.path.join(tmp, 'growlate.ts')
+    rec = live.Recording(grow, lambda r: r.idle_for() < live.IDLE_SECS)
+    writer = Recorder(late, grow, 150, speed=5, start_frac=0.02)
+    writer.start()
+    late_log = os.path.join(tmp, 'late.json')
+    processor.process_video(grow, late_log, opts_for(grow), live=rec)
+    writer.join()
+    check('head start has no logo', processor.read_feature_log(late_log)['logo'], None)
+    check('new logo: extracted again', main._recheck_logo(opts_for(grow), late_log), True)
+    c = processor.read_feature_log(late_log)
+    check('new logo: in the log', c['logo'] is not None, True)
+    check('new logo: frames', len(c['frames']), len(a['frames']))
+    check('new logo: seen', 0 < sum(f[1] for f in c['frames']) < len(c['frames']), True)
 except BaseException:
     # extraction leaves its worker threads running when it dies, so don't wait for them
     import traceback
