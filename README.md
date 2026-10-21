@@ -306,7 +306,9 @@ for 10 minutes of the recording, because it finds the station logo in those,
 and it finishes once MythTV has stopped recording.
 
 While the recording goes on, pycommflag writes the breaks it has found so far
-to the database every 2 minutes, so they are there when you start watching.
+to the database every 2 minutes, so they are there when you start watching. It
+also tells mythbackend each time, as mythcommflag does, so a frontend that is
+already playing the recording picks up new breaks without restarting playback.
 They trail the live recording by about 2 to 4 minutes: the audio is analyzed a
 minute at a time, and each second is judged by the minute on either side of
 it. When the recording ends, pycommflag flags the whole recording again, the

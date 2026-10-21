@@ -217,6 +217,7 @@ def set_breaks(opts, marks, flog=None, final=True)->bool:
         log.debug(f"Set breaks in myth DB for {chanid}_{starttime}")
 
         nbreaks = 0
+        sent = []
         rate = None
         duration = 0
         if flog:
@@ -248,6 +249,7 @@ def set_breaks(opts, marks, flog=None, final=True)->bool:
             
             if st == SceneType.COMMERCIAL:
                 nbreaks += 1
+                sent += [(fb, 4), (fe, 5)]
                 log.debug(f".... {st} {fb} {fe}")
                 try:
                     c.execute("INSERT INTO recordedmarkup (chanid,starttime,mark,type) "\
@@ -259,6 +261,9 @@ def set_breaks(opts, marks, flog=None, final=True)->bool:
         c.execute("UPDATE recorded SET commflagged = %s "\
                   "WHERE chanid = %s AND starttime = %s",
                   ((COMM_FLAG_DONE if nbreaks else 0) if final else COMM_FLAG_PROCESSING, chanid, starttime))
+
+        # a frontend already playing the recording only hears about new breaks this way
+        send_commflag_update(c, chanid, starttime, sent)
     
     if not final:
         return True
@@ -309,3 +314,133 @@ def check_method(chanid):
     except:
         pass
     return True
+
+
+# --- the backend protocol, just enough to send COMMFLAG_UPDATE --------------------------
+
+# Each protocol version has its own token, and the backend hangs up on a wrong one; these are
+# from mythtv's libs/libmythbase/mythversion.h.in (the bindings/python/MythTV/static.py copy).
+PROTO_TOKENS = {
+    '91': 'BuzzOff',
+    '90': 'BuzzCut',
+    '89': 'BuzzKill',
+    '88': 'XmasGift',
+    '87': '(ノಠ益ಠ)ノ彡┻━┻_No_entiendo!)',
+}
+PROTO_SEP = '[]:[]'
+
+class _Backend:
+    def __init__(self, host:str, port:int, version:str='91', timeout:float=10):
+        import socket
+        self.sock = socket.create_connection((host, port), timeout=timeout)
+        try:
+            res = self.command(f'MYTH_PROTO_VERSION {version} {PROTO_TOKENS.get(version, "")}')
+            if res[0] != 'ACCEPT':
+                raise _ProtoMismatch(res[1] if len(res) > 1 else '')
+            res = self.command(f'ANN Monitor {socket.gethostname()} 0')
+            if res[0] != 'OK':
+                raise IOError(f'Backend refused ANN: {res}')
+        except BaseException:
+            self.close()
+            raise
+
+    def command(self, *parts:str) -> list[str]:
+        data = PROTO_SEP.join(parts).encode('utf-8')
+        self.sock.sendall(b'%-8d' % len(data) + data)
+        size = int(self._recv(8))
+        return self._recv(size).decode('utf-8', 'replace').split(PROTO_SEP)
+
+    def _recv(self, n:int) -> bytes:
+        buf = b''
+        while len(buf) < n:
+            chunk = self.sock.recv(n - len(buf))
+            if not chunk:
+                raise EOFError('Backend closed the connection')
+            buf += chunk
+        return buf
+
+    def close(self):
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+class _ProtoMismatch(Exception):
+    pass
+
+g_backend = None
+g_backend_off = False
+
+def _backend_address(cursor) -> tuple[str,int]:
+    def setting(name, host=None):
+        if host is None:
+            cursor.execute("SELECT data FROM settings WHERE value = %s AND (hostname IS NULL OR hostname = '')", (name,))
+        else:
+            cursor.execute("SELECT data FROM settings WHERE value = %s AND hostname = %s", (name, host))
+        row = cursor.fetchone()
+        return row[0] if row and row[0] else None
+    master = setting('MasterServerName')
+    # BackendServerAddr since mythtv 0.27; before that BackendServerIP, or the global MasterServerIP
+    host = (master and (setting('BackendServerAddr', master) or setting('BackendServerIP', master))) \
+           or setting('MasterServerIP') or 'localhost'
+    port = (master and setting('BackendServerPort', master)) or setting('MasterServerPort') or 6543
+    return host, int(port)
+
+def _connect_backend(cursor):
+    global g_backend, g_backend_off
+    if g_backend is not None or g_backend_off:
+        return g_backend
+    try:
+        host, port = _backend_address(cursor)
+        try:
+            g_backend = _Backend(host, port)
+        except _ProtoMismatch as e:
+            if str(e) not in PROTO_TOKENS:
+                raise IOError(f'mythbackend speaks protocol {e}, which pycommflag does not know the token for')
+            g_backend = _Backend(host, port, str(e))
+    except Exception as e:
+        log.warning(f'Cannot send updates to frontends: {e}')
+        g_backend_off = True
+    return g_backend
+
+def _unique_key(chanid, starttime) -> str:
+    """mythtv's ProgramInfo::MakeUniqueKey: chanid_<recording start as ISO 8601 UTC>."""
+    import datetime
+    if isinstance(starttime, datetime.datetime):
+        st = starttime.strftime('%Y-%m-%dT%H:%M:%SZ')
+    else:
+        st = str(starttime).strip()
+        if len(st) == 14 and st.isdigit():
+            st = f'{st[0:4]}-{st[4:6]}-{st[6:8]}T{st[8:10]}:{st[10:12]}:{st[12:14]}Z'
+        else:
+            st = st.replace(' ', 'T')
+            if not st.endswith('Z'):
+                st += 'Z'
+    return f'{chanid}_{st}'
+
+def send_commflag_update(cursor, chanid, starttime, marks:list[tuple[int,int]]) -> bool:
+    """Tell frontends playing this recording about its breaks, as mythcommflag does.
+
+    marks are (frame, mark type) pairs.  Never fatal: frontends just won't see the change
+    until playback restarts.
+    """
+    global g_backend
+    msg = f'COMMFLAG_UPDATE {_unique_key(chanid, starttime)}'
+    if marks:
+        msg += ' ' + ','.join(f'{f}:{t}' for (f,t) in marks)
+    for attempt in range(2):
+        be = _connect_backend(cursor)
+        if be is None:
+            return False
+        try:
+            res = be.command('MESSAGE', msg)
+            if res[0] == 'OK':
+                return True
+            log.warning(f'Backend did not take COMMFLAG_UPDATE: {res}')
+            return False
+        except Exception as e:
+            # it may have restarted since we connected; try a fresh connection once
+            log.debug(f'COMMFLAG_UPDATE failed ({e}), reconnecting')
+            be.close()
+            g_backend = None
+    return False
