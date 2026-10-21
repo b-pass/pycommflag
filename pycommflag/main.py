@@ -201,7 +201,7 @@ def _reprocess_one(opts, fl, allow_archive:bool) -> bool:
 
     old = flog.get('tags', [])
     result = predict(flog, opts)
-    (missing, extra, all) = diff_tags(result, old)
+    (missing, extra, all) = diff_tags(old, result)
 
     chng = ''
     for (t,b,e) in all:
