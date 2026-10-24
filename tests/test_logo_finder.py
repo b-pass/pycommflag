@@ -244,6 +244,21 @@ for name, img, expect in (('the logo over a flat picture', paint(np.full(art.sha
 check('a QR code lights the mask well past the match threshold (so only the off-mask test rejects it)',
       np.count_nonzero(lf._edges(qr) & lmask) >= logo[3])
 
+# An overlay found on a recording with no usable logo must still reach the blank check.  It
+# used to ride only on the logo, so with no logo the banner (or the stuck bug) stayed in the
+# blank statistics and no frame of the recording could read as blank.
+for name, s, fc, shape, e in fixtures():
+    stuck = []
+    got = lf._analyze(s.copy(), fc, shape, stuck)
+    if got is None and stuck:
+        keep = lf.keep_mask(shape, None, stuck)
+        (t_, l_), (b_, r_) = stuck[0]
+        check(f'{name}: no logo, but its overlay is kept out of the blank check',
+              keep is not None and not keep[t_:b_, l_:r_].any() and keep.any())
+    elif got is not None:
+        check(f'{name}: a logo carries the same overlays it reports', list(got[4:]) == stuck)
+check('no logo and no overlay leaves the blank check alone', lf.keep_mask((10, 10), None) is None)
+
 print()
 if _fails:
     print(f'{len(_fails)} FAILED: ' + ', '.join(_fails))

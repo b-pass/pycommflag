@@ -75,6 +75,7 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
     os.nice(10)
 
     logo = None
+    stuck = []  # overlays for the blank check to ignore, even when no logo is found
     if type(feature_log) is str:
         if os.path.exists(feature_log) and not opts.no_logo:
             logo = logo_finder.from_json(read_feature_log(feature_log).get('logo', None))
@@ -89,9 +90,10 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
         pass
     else:
         mythtv.set_job_status(opts,'Searching for logo')
-        logo = logo_finder.search(player, opts=opts)
+        logo = logo_finder.search(player, opts=opts, stuck_out=stuck)
         player.seek(0)
     
+    log_path = None
     if type(feature_log) is str:
         log_path = feature_log
         if feature_log.endswith('.gz'):
@@ -118,8 +120,17 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
     except:
         pass
 
+    # before the header: it sets the at_start written there
+    player.enable_audio()
+
     feature_log.write(f',\n"duration":{float(player.duration)}')
     feature_log.write(f',\n"frame_rate":{round(float(player.frame_rate),4)}')
+    # Audio is timed from the video start (see Player._queue_audio).  Logs made before that fix
+    # have their audio late by video_start - audio_start; repaired ones say by how much they
+    # were shifted, and audio_shift 0 marks a log that never needed it.
+    feature_log.write(f',\n"audio_shift":0')
+    feature_log.write(f',\n"video_start":{round(float(player.vt_start),6)}')
+    feature_log.write(f',\n"audio_start":{round(float(player.at_start),6)}')
 
     feature_log.write(',\n"logo":')
     feature_log.write(logo_finder.to_json(logo))
@@ -135,12 +146,11 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
     rt = time.perf_counter()
     p = 0
     
-    player.enable_audio()
     audio_interval = round(player.frame_rate)
     audioProc = AudioProc()
     audioProc.start()
 
-    videoProc = VideoProc(player.vt_start, logo, opts)
+    videoProc = VideoProc(player.vt_start, logo, opts, stuck)
     videoProc.start()
 
     if not opts.quiet: print('\nExtracting features...', end='\r') 
@@ -148,6 +158,23 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
 
     # not doing format/aspect because everything is widescreen all the time now
     # that was very early '00s... except ultra wide screen movies, and sometimes ultra-wide commercials?
+
+    def finish_workers():
+        # Whatever happened, let the workers finish: they block on their queues, so
+        # leaving them running would hold the process open forever.
+        videoProc.stop()
+        audioProc.add_audio(player.move_audio())
+        audioProc.stop()
+        videoProc.join()
+        audioProc.join()
+
+    def abandon_log():
+        # The header is already out, so what's there can't be read back, and the next run
+        # would choke on it trying to re-use its logo.
+        feature_log.close()
+        if log_path:
+            try: os.remove(log_path)
+            except OSError: pass
 
     die = False
     try:
@@ -169,17 +196,21 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
         if fcount%audio_interval == 0:
             audioProc.add_audio(player.move_audio())
         videoProc.add_frame(frame)
+        if videoProc.error is not None or audioProc.error is not None:
+            break
     except KeyboardInterrupt:
         print('\nInterrupt!!\n\n')
         die = True
+    except BaseException:
+        finish_workers()
+        abandon_log()
+        raise
 
-    videoProc.stop()
-
-    audioProc.add_audio(player.move_audio())
-    audioProc.stop()
-
-    videoProc.join()
-    audioProc.join()
+    finish_workers()
+    for proc in (videoProc, audioProc):
+        if proc.error is not None:
+            abandon_log()
+            raise RuntimeError(f'Feature extraction failed in {proc.name}') from proc.error
 
     frames = videoProc.frames
 
@@ -255,12 +286,16 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
         print('Extraction complete           ')
 
 class VideoProc(Thread):
-    def __init__(self, vt_start, logo, opts):
-        super().__init__(name="videoProc")
+    def __init__(self, vt_start, logo, opts, stuck=()):
+        # daemon: a worker that somehow never gets its stop must not keep the process alive
+        super().__init__(name="videoProc", daemon=True)
         self.queue = Queue(300)
+        self.error = None
+        self.shape = None  # the frame size the logo was found at
         self.vt_start = vt_start
         self.fcount = 0
         self.logo = logo
+        self.stuck = stuck
         self.opts = opts
         self.prev_col = None
         self.lasttime = 0
@@ -272,16 +307,25 @@ class VideoProc(Thread):
         self.queue.put(None)
     
     def run(self):
-        while True:
-            x = self.queue.get()
-            if x is not None:
-                self._proc(*x)
-            else:
-                break
+        try:
+            while True:
+                x = self.queue.get()
+                if x is not None:
+                    self._proc(*x)
+                else:
+                    break
+        except BaseException as e:
+            log.exception('Video feature extraction failed')
+            self.error = e
+            _drain(self.queue)
 
     def add_frame(self, frame):
         fcolor = frame.to_ndarray(format="rgb24")#, height=720, width=frame.width*(720/frame.height))
-        logo_present = logo_finder.check_frame(frame, self.logo)
+        if self.shape is None:
+            self.shape = fcolor.shape
+        # the logo's box and mask are in the first frame's pixels; after a resolution change
+        # they point at the wrong place, so don't claim to see it there
+        logo_present = fcolor.shape == self.shape and logo_finder.check_frame(frame, self.logo)
         self.queue.put((frame.time,fcolor,logo_present))
     
     def _proc(self, ftime, fcolor, logo_present):
@@ -291,7 +335,7 @@ class VideoProc(Thread):
         self.fcount += 1
 
         column = mean_axis1(fcolor, dtype='int16')
-        if self.prev_col is not None:
+        if self.prev_col is not None and self.prev_col.shape == column.shape:
             diff = column - self.prev_col
             diff = np.mean(np.std(np.abs(diff), (0)))
             #is_diff = diff >= self.opts.diff_threshold 
@@ -306,8 +350,8 @@ class VideoProc(Thread):
         if x < 45:
             # the logo and any stuck overlay stay lit while the picture goes black, so
             # leave those pixels out of the statistics rather than counting them
-            if self.keep is False:
-                self.keep = logo_finder.keep_mask(fcolor.shape, self.logo)
+            if self.keep is False or (self.keep is not None and self.keep.shape != fcolor.shape[:2]):
+                self.keep = logo_finder.keep_mask(fcolor.shape, self.logo, self.stuck)
             px = fcolor if self.keep is None else fcolor[self.keep]
             m = np.median(px, (0,1) if self.keep is None else 0)
             #print("median=",m,"maxmediam=",max(m),"stdmedian=",np.std(m),"allstd=",np.std(px))
@@ -322,6 +366,12 @@ class VideoProc(Thread):
     
     def frame_header(self):
         return ["time","logo_present","is_blank","diff"]
+
+def _drain(queue:Queue):
+    """For a worker that has failed: keep taking items until the producer says stop, so it
+    never blocks on a full queue before it notices the failure."""
+    while queue.get() is not None:
+        pass
 
 def mean_axis1(fcolor:np.ndarray, dtype='uint8')->np.ndarray:
     # Per-row, per-channel mean of an (H, W, 3) rgb24 frame -> (H, 3), in R,G,B order.
@@ -341,7 +391,9 @@ def mean_axis1(fcolor:np.ndarray, dtype='uint8')->np.ndarray:
 
 class AudioProc(Thread):
     def __init__(self, volume_window=.05, work_rate=60.0, overlap=5.0):
-        super().__init__(name="audioProc")
+        super().__init__(name="audioProc", daemon=True)
+        self.error = None
+        self._stopped = False  # has the stop (None) come off the queue yet
         import tensorflow as tf
         tf.config.threading.set_intra_op_parallelism_threads(1)
         tf.config.threading.set_inter_op_parallelism_threads(1)
@@ -417,6 +469,15 @@ class AudioProc(Thread):
         return float(grid[(starts[best] + ends[best]) // 2])
 
     def run(self):
+        try:
+            self._run()
+        except BaseException as e:
+            log.exception('Audio feature extraction failed')
+            self.error = e
+            if not self._stopped:  # it may have failed in the last chunks, after the stop
+                _drain(self.queue)
+
+    def _run(self):
         import scipy.signal as spsig
         self.spsig = spsig
         
@@ -438,23 +499,32 @@ class AudioProc(Thread):
                 (st,sm,ss) = self._resample(*segment)
 
                 missing = int(round((st - nexttime)*16000))
-                nexttime = st + len(sm)/16000
+                seg_end = st + len(sm)/16000
 
                 if missing > 0:
                     # these are LEADING missing values, the last frame actually didnt have enough but we only tell by the NEXT pts
-                    log.info(f'Missing {missing} audio samples before time {st} (got {len(sm)}, nexttime={nexttime})')
+                    log.info(f'Missing {missing} audio samples before time {st} (got {len(sm)}, nexttime={seg_end})')
                     sm = np.append(np.zeros(missing, 'float32'), sm)
+                    if ss is not None:
+                        # pad the surround at the same end, or it would sit `missing` samples early
+                        ss = np.append(np.zeros(missing, 'float32'), ss)
                 elif missing < -1:
                     # these are LEADING extra samples
                     # sometimes we get bad PTS for audio where drops 512 and then the next one has the dropped samples
                     # BUT the PTS was wrong, and the hole isn't in the same place... a 1/32 hole was created and we can't fill it
+                    # (audio from before the video start lands here too, since times are
+                    # measured from the video start: nexttime starts at 0)
                     extra = -missing
-                    log.info(f'Extra audio samples at time {st}? Got {len(sm)}, dropping {extra} of them... nexttime={nexttime}')
+                    log.info(f'Extra audio samples at time {st}? Got {len(sm)}, dropping {extra} of them... nexttime={seg_end}')
                     if extra >= len(sm):
+                        # nothing appended, so `main` still ends at the old nexttime; moving it
+                        # back to this segment's end would let the next segment append without
+                        # trimming and shift all later audio
                         continue
                     sm = sm[extra:]
                     if ss is not None:
                         ss = ss[extra:]
+                nexttime = seg_end
 
                 # resample code might leave TRAILING holes in ss; so pad it if needed
                 if ss is None:
@@ -466,6 +536,7 @@ class AudioProc(Thread):
                 surr = np.append(surr, ss)
             else:
                 done = True
+                self._stopped = True
                 # whatever is left is one last (short) chunk; below half a second there is
                 # not enough for the segmenter to say anything useful
                 min_work = 8000

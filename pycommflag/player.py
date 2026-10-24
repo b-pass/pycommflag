@@ -159,7 +159,12 @@ class Player:
 
         surr = np.sum(d[3:,...], 0) / (d.shape[0]-3) if d.shape[0] >= 4 else None
 
-        when = af.time - self.at_start
+        # Measured from the VIDEO start, the same origin the video frames use.  Audio and video
+        # PTS share one clock, but the streams start at different times (video typically
+        # 0.2-1s after audio in OTA .ts), so subtracting at_start here put every audio
+        # feature that much late.  Audio before the video start comes out negative and
+        # AudioProc drops it.
+        when = af.time - self.vt_start
 
         if self.aq and \
             self.aq[-1][3] == af.sample_rate and \
@@ -179,6 +184,8 @@ class Player:
             self.aq.append((main,surr,when,af.sample_rate))
 
     def _flush(self):
+        # in case a frames_stride() was abandoned without being closed
+        self._keyframes_only(False)
         if self.graph:
             self._create_graph()
         self.aq = [] if 'audio' in self.streams else None
@@ -309,7 +316,24 @@ class Player:
 
         return #raise StopIteration()
 
+    def _keyframes_only(self, on:bool):
+        """Have the video decoder throw away everything but keyframes (or stop doing so)."""
+        try:
+            self._video_stream().codec_context.skip_frame = 'NONKEY' if on else 'DEFAULT'
+        except Exception:
+            log.debug("could not set skip_frame", exc_info=True)
+
     def frames_stride(self, skip) -> iter:
+        """About one frame in every `skip`, each decoded correctly.
+
+        With no deinterlace graph or audio in the way, only keyframes are decoded.  Any other
+        frame needs everything back to the previous keyframe decoded first, and decoding it
+        without them builds it on stale references: the old packet-skipping version of this
+        did that, and most of its samples came out wrong (29 of 40 on an MPEG-2 recording).
+        So the samples land on keyframes, thinned to at most one per `skip` frames; where
+        keyframes are further apart than that (GOPs run 0.4-4s), every one is taken and there
+        are fewer samples.
+        """
         if self.graph or 'audio' in self.streams:
             count = 0
             for frame in self.frames():
@@ -318,49 +342,51 @@ class Player:
                 count += 1
             return
 
+        # half a frame of slack so timestamp jitter can't drop a keyframe that is due
+        interval = (skip - 0.5) / float(self.frame_rate)
+        last_time = None
         rec = None
         last_pts = None
         ahead = 0
-        packets = self.container.demux(**self.streams)
-        to_skip = 0
-        while True:
-            try:
-                pkt = next(packets)
-                if pkt is None:
+        self._keyframes_only(True)
+        try:
+            packets = self.container.demux(**self.streams)
+            while True:
+                try:
+                    pkt = next(packets)
+                    if pkt is None:
+                        continue
+                    frames = pkt.decode()
+                except Exception as e:
+                    rec, action = _Recovery.handle(rec, self, e, max_fail=500)
+                    if action is None:
+                        raise
+                    if action is _Recovery.STOP:
+                        break
+                    # a resync opens a new container, and its decoder decodes everything
+                    self._keyframes_only(True)
+                    packets = self.container.demux(**self.streams)
                     continue
-                if to_skip > 0:
-                    # don't decode packets just to throw away the frames
-                    to_skip -= len(pkt.decode()) if pkt.is_keyframe else 1
-                    continue
-                frames = pkt.decode()
-                if not frames:
-                    continue
-                # countdown rather than a modulo so a multi-frame packet can't step over
-                # the next sample point and make the stride uneven
-                to_skip = skip - len(frames)
-                frame = frames[0]
-            except Exception as e:
-                rec, action = _Recovery.handle(rec, self, e, max_fail=500)
-                if action is None:
-                    raise
-                if action is _Recovery.STOP:
-                    break
-                packets = self.container.demux(**self.streams)
-                continue
 
-            use, last_pts, ahead = self._check_pts(frame.pts, last_pts, ahead)
-            if not use:
-                to_skip = 0
-                continue
+                for frame in frames:
+                    if type(frame) is not av.VideoFrame:
+                        continue
+                    use, last_pts, ahead = self._check_pts(frame.pts, last_pts, ahead)
+                    if not use:
+                        continue
 
-            if rec is not None:
-                rec.done()
-                rec = None
+                    if rec is not None:
+                        rec.done()
+                        rec = None
 
-            if type(frame) is av.VideoFrame:
-                if frame.pts is not None:
-                    self.vpts = frame.pts
-                yield frame
+                    if frame.pts is not None:
+                        self.vpts = frame.pts
+                    if last_time is not None and frame.time is not None and frame.time - last_time < interval:
+                        continue
+                    last_time = frame.time
+                    yield frame
+        finally:
+            self._keyframes_only(False)
 
         return #raise StopIteration()
 
