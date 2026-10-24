@@ -159,10 +159,9 @@ class Player:
 
         surr = np.sum(d[3:,...], 0) / (d.shape[0]-3) if d.shape[0] >= 4 else None
 
-        # Measured from the VIDEO start, the same origin the video frames use.  Audio and video
+        # Measured from the video start, the same origin the video frames use: audio and video
         # PTS share one clock, but the streams start at different times (video typically
-        # 0.2-1s after audio in OTA .ts), so subtracting at_start here put every audio
-        # feature that much late.  Audio before the video start comes out negative and
+        # 0.2-1s after audio in OTA .ts).  Audio before the video start comes out negative and
         # AudioProc drops it.
         when = af.time - self.vt_start
 
@@ -185,7 +184,7 @@ class Player:
 
     def _flush(self):
         # in case a frames_stride() was abandoned without being closed
-        self._keyframes_only(False)
+        self._skip_frames('DEFAULT')
         if self.graph:
             self._create_graph()
         self.aq = [] if 'audio' in self.streams else None
@@ -316,23 +315,23 @@ class Player:
 
         return #raise StopIteration()
 
-    def _keyframes_only(self, on:bool):
-        """Have the video decoder throw away everything but keyframes (or stop doing so)."""
+    def _skip_frames(self, mode:str):
+        """Set which frames the video decoder throws away: 'NONREF' (those no other frame
+        is decoded from) or 'DEFAULT' (none)."""
         try:
-            self._video_stream().codec_context.skip_frame = 'NONKEY' if on else 'DEFAULT'
+            self._video_stream().codec_context.skip_frame = mode
         except Exception:
             log.debug("could not set skip_frame", exc_info=True)
 
     def frames_stride(self, skip) -> iter:
         """About one frame in every `skip`, each decoded correctly.
 
-        With no deinterlace graph or audio in the way, only keyframes are decoded.  Any other
-        frame needs everything back to the previous keyframe decoded first, and decoding it
-        without them builds it on stale references: the old packet-skipping version of this
-        did that, and most of its samples came out wrong (29 of 40 on an MPEG-2 recording).
-        So the samples land on keyframes, thinned to at most one per `skip` frames; where
-        keyframes are further apart than that (GOPs run 0.4-4s), every one is taken and there
-        are fewer samples.
+        With no deinterlace graph or audio in the way, only the reference frames (I and P)
+        are decoded.  A frame decoded without the frames it is predicted from is garbage, so
+        this never skips packets itself; skipping the frames nothing is predicted from is
+        safe, leaves ~8-11 frames a second, and costs ~40% of a full decode.  (Keyframes alone
+        would be cheaper, but some channels send one only every 4s.)  What comes out is
+        thinned to at most one per `skip` frames.
         """
         if self.graph or 'audio' in self.streams:
             count = 0
@@ -348,7 +347,11 @@ class Player:
         rec = None
         last_pts = None
         ahead = 0
-        self._keyframes_only(True)
+        self._skip_frames('NONREF')
+        # Until a keyframe has been decoded, the P frames NONREF lets through are predicted
+        # from frames that weren't: at the start (recordings begin mid-GOP) and after every
+        # recovery seek.
+        need_key = True
         try:
             packets = self.container.demux(**self.streams)
             while True:
@@ -364,13 +367,18 @@ class Player:
                     if action is _Recovery.STOP:
                         break
                     # a resync opens a new container, and its decoder decodes everything
-                    self._keyframes_only(True)
+                    self._skip_frames('NONREF')
+                    need_key = True
                     packets = self.container.demux(**self.streams)
                     continue
 
                 for frame in frames:
                     if type(frame) is not av.VideoFrame:
                         continue
+                    if need_key:
+                        if not frame.key_frame:
+                            continue
+                        need_key = False
                     use, last_pts, ahead = self._check_pts(frame.pts, last_pts, ahead)
                     if not use:
                         continue
@@ -386,7 +394,7 @@ class Player:
                     last_time = frame.time
                     yield frame
         finally:
-            self._keyframes_only(False)
+            self._skip_frames('DEFAULT')
 
         return #raise StopIteration()
 

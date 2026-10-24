@@ -125,9 +125,8 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
 
     feature_log.write(f',\n"duration":{float(player.duration)}')
     feature_log.write(f',\n"frame_rate":{round(float(player.frame_rate),4)}')
-    # Audio is timed from the video start (see Player._queue_audio).  Logs made before that fix
-    # have their audio late by video_start - audio_start; repaired ones say by how much they
-    # were shifted, and audio_shift 0 marks a log that never needed it.
+    # audio_shift: seconds tools/repair_audio_shift.py moved this log's audio columns by; 0
+    # here, since audio is already timed from the video start (see Player._queue_audio)
     feature_log.write(f',\n"audio_shift":0')
     feature_log.write(f',\n"video_start":{round(float(player.vt_start),6)}')
     feature_log.write(f',\n"audio_start":{round(float(player.at_start),6)}')
