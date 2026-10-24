@@ -108,7 +108,7 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
         feature_log.seek(0)
         feature_log.truncate()
 
-    feature_log.write('{ "file_version":10')
+    feature_log.write('{ "file_version":11')
 
     # these go through json.dumps because a " or \ in the value would otherwise
     # produce a log that cannot be read back -- and we would not find out until after
@@ -229,6 +229,9 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
 
     assert(AudioSegmentLabel.count() == 4)
     header += ['silence', 'speech', 'music', 'noise']
+
+    # not a model input (yet): kept so a dataset flagged from these logs can use it later
+    header += ['cc_text']
     
     # normalize with the max volume of the whole recording
     vscale = np.max(np.array(audioProc.rms)[..., 1:3])
@@ -243,7 +246,7 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
     ait = iter(audioProc.fspan.to_list())
     audio = next(ait, (AudioSegmentLabel.SILENCE,(0,player.duration)))
     
-    for frame in frames:
+    for (frame, cc) in zip(frames, videoProc.cc):
         ft = frame[0]
         
         # mark up each frame with the calculated audio type and volume level
@@ -265,6 +268,7 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
         x = [0] * AudioSegmentLabel.count()
         x[audio[0].value if ft >= audio[1][0] else AudioSegmentLabel.SILENCE.value] = 1
         frame += x
+        frame.append(cc)
 
     feature_log.write(',\n"frames_header":')
     json.dump(header, feature_log)
@@ -300,6 +304,7 @@ class VideoProc(Thread):
         self.prev_col = None
         self.lasttime = 0
         self.frames = []
+        self.cc = []  # caption characters per frame, parallel to self.frames
         self.keep = False  # False until the first frame tells us the frame size; then
                            # a mask, or None when there is nothing to leave out
 
@@ -326,9 +331,9 @@ class VideoProc(Thread):
         # the logo's box and mask are in the first frame's pixels; after a resolution change
         # they point at the wrong place, so don't claim to see it there
         logo_present = fcolor.shape == self.shape and logo_finder.check_frame(frame, self.logo)
-        self.queue.put((frame.time,fcolor,logo_present))
+        self.queue.put((frame.time,fcolor,logo_present,_cc_text(frame)))
     
-    def _proc(self, ftime, fcolor, logo_present):
+    def _proc(self, ftime, fcolor, logo_present, cc):
         if ftime is None or fcolor is None:
             return
         
@@ -362,10 +367,31 @@ class VideoProc(Thread):
 
         self.lasttime = round(ftime-self.vt_start,5)
         self.frames.append([self.lasttime, int(logo_present), int(frame_blank), round(diff, 6)])
+        self.cc.append(cc)
         #f",[{self.lasttime},{int(logo_present)},{int(frame_blank)},{int(is_diff)}]\n"
     
     def frame_header(self):
         return ["time","logo_present","is_blank","diff"]
+
+def _cc_text(frame) -> int:
+    """How many CEA-608 caption characters this frame carries (field 1: CC1/CC2).
+
+    Shows are captioned nearly throughout and many ads aren't, so the amount of caption text
+    tells them apart on most channels.  Control codes, padding and field 2 don't count.
+    """
+    n = 0
+    for sd in frame.side_data:
+        if 'A53' not in str(getattr(sd.type, 'name', sd.type)):
+            continue
+        b = bytes(sd)
+        for i in range(0, len(b) - 2, 3):
+            if not (b[i] & 0x04) or (b[i] & 3) != 0:
+                continue  # not cc_valid, or not 608 field 1
+            c1, c2 = b[i+1] & 0x7f, b[i+2] & 0x7f
+            if 0x10 <= c1 <= 0x1f:
+                continue  # a control code (both bytes)
+            n += (c1 >= 0x20) + (c2 >= 0x20)
+    return n
 
 def _drain(queue:Queue):
     """For a worker that has failed: keep taking items until the producer says stop, so it

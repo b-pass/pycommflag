@@ -453,6 +453,8 @@ def load_nonpersistent(flog:dict, for_training=False, no_logo=False, no_blanks=F
     
     # ok now we can numpy....
     frames = np.array(frames, dtype='float32')
+    # extraction records more than the model reads (cc_text, from file_version 11)
+    frames = frames[:, :NOISE+1]
 
     if not have_logo or no_logo:
         frames[:, LOGO] = 0

@@ -46,6 +46,7 @@ class FakeFrame:
         self.pts = n
         self.height, self.width = shape
         self.format = types.SimpleNamespace(is_planar=False)
+        self.side_data = []
         self._n = n
     def to_ndarray(self, format=None):
         x = np.full((self.height, self.width, 3), 60 + (self._n % 50), 'uint8')
@@ -148,6 +149,8 @@ if done and err is None:
     flog = processor.read_feature_log(path)
     f = np.array(flog['frames'])
     check('...all frames logged', len(f) == FakePlayer.count, f'{len(f)} frames')
+    check('...with the caption count as the last column', flog['frames_header'][-1] == 'cc_text'
+          and f.shape[1] == len(flog['frames_header']), str(flog['frames_header']))
     check('...logo seen before the change', f[:600, 1].all())
     check('...and not claimed after it', not f[600:, 1].any())
 check('...and no worker threads', not workers_alive(), str(workers_alive()))
