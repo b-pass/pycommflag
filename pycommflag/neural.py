@@ -838,7 +838,7 @@ def train(opts:Any=None):
 
     def cosine_annealing_with_warmup(epoch, lr):
         WARMUP = min(max(EPOCHS//12, 1), 4) # 1-4 epochs
-        TOTAL = EPOCHS - 5
+        TOTAL = ceil(EPOCHS * .75)
         MAX_LR = 0.001
         MIN_LR = 0.00001 # Set your true floor here
         
@@ -851,7 +851,7 @@ def train(opts:Any=None):
     cb.append(callbacks.LearningRateScheduler(cosine_annealing_with_warmup))
     # 2+ epochs (3+ where PATIENCE allows), so it doesn't react to every noisy one, but always short of
     # PATIENCE, or early stopping would end training before the LR was ever cut
-    cb.append(callbacks.ReduceLROnPlateau(monitor='val_weighted_accuracy', mode="max", patience=max(min(max(PATIENCE-3, 3), PATIENCE-1), 2), factor=0.5))
+    cb.append(callbacks.ReduceLROnPlateau(monitor='val_weighted_accuracy', mode="max", patience=max(min(max(PATIENCE-5, 5), PATIENCE-1), 2), factor=0.5))
     
     class EpochModelCheckpoint(callbacks.ModelCheckpoint):
         def on_epoch_end(self, epoch, logs=None):

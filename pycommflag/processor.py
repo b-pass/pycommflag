@@ -8,13 +8,14 @@ import re
 from threading import Thread
 import time
 from typing import Any,TextIO, TextIO
+import gzip
 
 from . import logo_finder, mythtv
 from .player import Player
 from .extern import ina_foss
 from .feature_span import *
 
-def read_feature_log(feature_log_file:str|TextIO|dict) -> dict:
+def read_feature_log(feature_log_file:str|TextIO|dict|gzip.GzipFile) -> dict:
     if type(feature_log_file) is dict:
         return feature_log_file
     elif type(feature_log_file) is str:
@@ -27,19 +28,19 @@ def read_feature_log(feature_log_file:str|TextIO|dict) -> dict:
         feature_log_file.seek(0)
     return json.load(feature_log_file)
 
-def write_feature_log(flog:dict, log_file:str|TextIO):
+def write_feature_log(flog:dict, log_file:str|TextIO|gzip.GzipFile):
 
     class FancyEncoder(json.JSONEncoder):
-        def default(self, obj):
-            if isinstance(obj, SceneType):
-                return obj.value
-            if isinstance(obj, np.ndarray):
-                return obj.tolist()
-            if isinstance(obj, np.floating):
-                return float(obj)
-            if isinstance(obj, np.integer):
-                return int(obj)
-            return json.JSONEncoder.default(self, obj)
+        def default(self, o):
+            if isinstance(o, SceneType):
+                return o.value
+            if isinstance(o, np.ndarray):
+                return o.tolist()
+            if isinstance(o, np.floating):
+                return float(o)
+            if isinstance(o, np.integer):
+                return int(o)
+            return json.JSONEncoder.default(self, o)
         
     if type(log_file) is str:
         log_path = log_file
