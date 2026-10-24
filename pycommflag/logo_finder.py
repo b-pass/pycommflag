@@ -154,7 +154,7 @@ def _find_stuck(persist:np.ndarray, shape:tuple) -> tuple[list, list]:
                  f"{persist[t:b,l:r].max()*100:.0f}% persistent")
     return remove, report
 
-def search(player:Player, opts:Any=None) -> tuple|None:
+def search(player:Player, opts:Any=None, stuck_out:list|None=None) -> tuple|None:
     player.disable_audio()
     player.seek(0)
 
@@ -162,33 +162,39 @@ def search(player:Player, opts:Any=None) -> tuple|None:
 
     skip = round(float(player.frame_rate / opts.logo_samples))
     if skip < 1: skip = 1
-    ftotal = int(min(3600, player.duration) * player.frame_rate / skip)
-    percent = ftotal/100.0
-    report = math.ceil(percent/4) if not opts.quiet else ftotal * 2
+    # the first hour, by time: samples sit on keyframes, so how many there are per second
+    # depends on the recording's GOP length
+    limit = min(3600, player.duration)
+    vt_start = float(player.vt_start)
+    report = 100 if not opts.quiet else math.inf
     
     fcount = 0
     r = 0
     if not opts.quiet: print("Logo Searching          ", end='\r')
     for frame in player.frames_stride(skip):
+        at = (frame.time - vt_start) if frame.time is not None else 0
         r += 1
         if r >= report:
             r = 0
-            print("Logo Searching, %3.1f%%    " % (min(fcount/percent,100.0)), end='\r')
+            print("Logo Searching, %3.1f%%    " % (min(at*100/limit,100.0)), end='\r')
         data = _gray(frame)
         logo_sum += _edges(data)
         fcount += 1
-        if fcount >= ftotal: 
+        if at >= limit:
             break
     
     if not opts.quiet: print("Logo Searching is complete.\n")
 
-    return _analyze(logo_sum, fcount, player.shape)
+    return _analyze(logo_sum, fcount, player.shape, stuck_out)
 
-def _analyze(logo_sum:np.ndarray, fcount:int, shape:tuple) -> tuple|None:
+def _analyze(logo_sum:np.ndarray, fcount:int, shape:tuple, stuck_out:list|None=None) -> tuple|None:
     """Turn a per-pixel count of "was an edge in this frame" into a logo, or None.
 
     Split out of search() so the same decision logic can be re-run over an accumulation
     gathered at a different edge threshold, without decoding the video again.
+
+    A logo carries the stuck overlays for blank detection; `stuck_out` also gets them when
+    there is no logo, which is when they are most likely (an overlay up the whole time).
     """
     if fcount < 1:
         log.info("No logo found (no frames were sampled)")
@@ -208,6 +214,8 @@ def _analyze(logo_sum:np.ndarray, fcount:int, shape:tuple) -> tuple|None:
     # and that is not knowable from this map.  The abutment check below is what keeps an
     # unbounded fragment from standing in for a logo.
     remove, stuck = _find_stuck(logo_sum / fcount, shape)
+    if stuck_out is not None:
+        stuck_out.extend(stuck)
     for (t,l),(b,r) in remove:
         logo_sum[t:b, l:r] = 0
 
@@ -388,19 +396,22 @@ def toimage(logo):
         return None
     return Image.fromarray(np.where(logo[2], 255, 0).astype('uint8'), mode="L")
 
-def keep_mask(shape:tuple, logo:tuple)->np.ndarray|None:
+def keep_mask(shape:tuple, logo:tuple, stuck:list=())->np.ndarray|None:
     """True where a pixel should count toward whole-frame statistics, or None for all of them.
 
     Blank detection has to ignore the logo and any stuck overlay: during a break the
     picture goes black but those stay lit, and the frame only reads as blank once they are
     out of the sample.  Excluding the pixels rather than blacking them out keeps the
-    median and standard deviation honest -- forced zeros would drag both.
+    median and standard deviation honest -- forced zeros would drag both.  `stuck` adds
+    overlay boxes found without a logo to carry them.
     """
-    if logo is None:
+    boxes = list(stuck)
+    if logo is not None:
+        ((top,left),(bottom,right),lmask,thresh,*more) = logo
+        boxes += [((top,left),(bottom,right))] + more
+    if not boxes:
         return None
-    ((top,left),(bottom,right),lmask,thresh,*stuck) = logo
     keep = np.ones(shape[:2], bool)
-    keep[top:bottom,left:right] = False
-    for ((top,left),(bottom,right)) in stuck:
+    for ((top,left),(bottom,right)) in boxes:
         keep[top:bottom,left:right] = False
     return keep
