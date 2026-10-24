@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Checks that Player.frames_stride hands back correctly decoded frames, often enough.
 
-frames_stride decodes only the reference frames (I and P).  Each sample must be identical
-to the same frame from a full decode, and a long-GOP recording must still give at least one
-sample a second.  The test videos are synthesized here (MPEG-2, as on most OTA channels), so this
+frames_stride decodes only the reference frames (I and P), or only keyframes once the
+first few show those come often enough.  Each sample must be identical to the same frame
+from a full decode, and a long-GOP recording must still give at least one sample a second.  The test videos are synthesized here (MPEG-2, as on most OTA channels), so this
 needs no recordings.
 
 Run it directly; it exits non-zero if anything fails.
@@ -54,7 +54,7 @@ def luma(f):
     return f.to_ndarray()[:f.height].astype('int16')
 
 tmp = tempfile.mkdtemp(prefix='pycf-stride-')
-for label, gop in (('3s GOP', 3 * FPS), ('0.5s GOP', FPS // 2)):
+for label, gop, want_mode in (('3s GOP', 3 * FPS, 'NONREF'), ('0.5s GOP', FPS // 2, 'NONKEY')):
     path = os.path.join(tmp, f'gop{gop}.ts')
     make_video(path, gop)
 
@@ -67,6 +67,7 @@ for label, gop in (('3s GOP', 3 * FPS), ('0.5s GOP', FPS // 2)):
     for f in q.frames():
         if f.pts in samples:
             full[f.pts] = luma(f)
+    check(f'{label}: decodes {want_mode}', p.stride_mode == want_mode, p.stride_mode)
     rate = len(samples) / SECS
     check(f'{label}: at least one sample a second', rate >= 1.0, f'{rate:.2f}/s')
     check(f'{label}: no more than the 2/s asked for', rate <= 2.1, f'{rate:.2f}/s')

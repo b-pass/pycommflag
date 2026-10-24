@@ -316,22 +316,26 @@ class Player:
         return #raise StopIteration()
 
     def _skip_frames(self, mode:str):
-        """Set which frames the video decoder throws away: 'NONREF' (those no other frame
-        is decoded from) or 'DEFAULT' (none)."""
+        """Set which frames the video decoder throws away: 'NONKEY' (all but keyframes),
+        'NONREF' (those no other frame is decoded from) or 'DEFAULT' (none)."""
         try:
             self._video_stream().codec_context.skip_frame = mode
         except Exception:
             log.debug("could not set skip_frame", exc_info=True)
 
+    # keyframes at least this close together are samples enough on their own (>= ~1/s)
+    MAX_KEYFRAME_GAP = 1.1 # seconds
+
     def frames_stride(self, skip) -> iter:
         """About one frame in every `skip`, each decoded correctly.
 
-        With no deinterlace graph or audio in the way, only the reference frames (I and P)
-        are decoded.  A frame decoded without the frames it is predicted from is garbage, so
-        this never skips packets itself; skipping the frames nothing is predicted from is
-        safe, leaves ~8-11 frames a second, and costs ~40% of a full decode.  (Keyframes alone
-        would be cheaper, but some channels send one only every 4s.)  What comes out is
-        thinned to at most one per `skip` frames.
+        With no deinterlace graph or audio in the way, the decoder skips whole classes of
+        frame instead of decoding everything: a frame decoded without the frames it is
+        predicted from is garbage, so this never skips packets itself.  It starts on the
+        reference frames (I and P: ~8-11 a second, ~40% of a full decode), and if the first
+        three keyframes are no more than MAX_KEYFRAME_GAP apart, drops to keyframes alone
+        (~1-2.5 a second, nearly free).  Some channels send a keyframe only every 4s, which is
+        why it doesn't start there.  What comes out is thinned to at most one per `skip` frames.
         """
         if self.graph or 'audio' in self.streams:
             count = 0
@@ -347,7 +351,9 @@ class Player:
         rec = None
         last_pts = None
         ahead = 0
-        self._skip_frames('NONREF')
+        self.stride_mode = 'NONREF'
+        self._skip_frames(self.stride_mode)
+        key_times = []
         # Until a keyframe has been decoded, the P frames NONREF lets through are predicted
         # from frames that weren't: at the start (recordings begin mid-GOP) and after every
         # recovery seek.
@@ -359,6 +365,14 @@ class Player:
                     pkt = next(packets)
                     if pkt is None:
                         continue
+                    if len(key_times) < 3 and pkt.is_keyframe and pkt.pts is not None:
+                        key_times.append(float(pkt.pts * pkt.time_base))
+                        # Going from NONREF to NONKEY is safe at any point, since a keyframe
+                        # needs nothing decoded before it.  (The other way is not.)
+                        if len(key_times) == 3 and all(abs(b - a) <= self.MAX_KEYFRAME_GAP
+                                                       for a, b in zip(key_times, key_times[1:])):
+                            self.stride_mode = 'NONKEY'
+                            self._skip_frames(self.stride_mode)
                     frames = pkt.decode()
                 except Exception as e:
                     rec, action = _Recovery.handle(rec, self, e, max_fail=500)
@@ -367,7 +381,7 @@ class Player:
                     if action is _Recovery.STOP:
                         break
                     # a resync opens a new container, and its decoder decodes everything
-                    self._skip_frames('NONREF')
+                    self._skip_frames(self.stride_mode)
                     need_key = True
                     packets = self.container.demux(**self.streams)
                     continue
