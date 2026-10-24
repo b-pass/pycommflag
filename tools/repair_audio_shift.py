@@ -10,9 +10,14 @@ logs don't record either start, so the offset comes from one of:
             reads them, which is exactly what the fixed extractor corrects for
   estimate  the log itself: at break boundaries the picture goes black and the sound
             goes quiet together, so the lag that best lines up blank frames with low
-            volume is the offset (within ~0.1s of the probe on 15 recordings)
-  default   too few blanks, an implausible estimate, or an ambiguous one (two lags that
-            line up nearly equally well): DEFAULT_SHIFT, the median offset
+            volume is the offset (within 0.1s of the probe on 93% of 1197 recordings,
+            0.2s on 98%; overriding it with the channel's typical offset only did worse)
+  channel   too few blanks, an implausible estimate, or an ambiguous one (two lags that
+            line up nearly equally well): the median probed offset of other recordings of
+            the same channel still beside the log's own (offsets are set by the station's
+            encoder; this beat DEFAULT_SHIFT on the same 1197)
+  default   the same, where no other recordings of the channel are left: DEFAULT_SHIFT,
+            the median offset overall
 
 A probe that disagrees with the estimate by more than PROBE_TRUST is not used, since it
 can be thrown off by a hole in the audio at the start of the recording.
@@ -22,10 +27,16 @@ and where it came from in "audio_shift_from".  Logs that already have "audio_shi
 or made by the fixed extractor, which writes 0) are left alone.  The neural caches beside a
 repaired log (<stem>.data.npy, <stem>.nologo.data.npy) are deleted so they rebuild.
 
-    tools/repair_audio_shift.py [--dry-run] LOG...
+With --redo-from BACKUP_DIR, already repaired logs are repaired again from the original audio
+columns in their backup (found under BACKUP_DIR by the log's path, .json or .json.gz), keeping
+everything else in the current log, such as tags edited since.
+
+    tools/repair_audio_shift.py [--dry-run] [--redo-from BACKUP_DIR] LOG...
 """
 import argparse
+import glob
 import os
+import re
 import sys
 
 import numpy as np
@@ -39,6 +50,7 @@ PLAUSIBLE = (0.0, 1.3)       # probed offsets ran 0.18-0.96s; outside this, dist
 MIN_BLANK_FRAMES = 10
 MAX_LAG = 2.0                # seconds searched either way
 PROBE_TRUST = 0.5            # seconds
+CHANNEL_PROBES = 25          # other recordings probed for a channel's typical offset
 AMBIGUOUS_SPACING = 0.2      # seconds; a rival peak this far from the best...
 AMBIGUOUS_RATIO = 0.95       # ...and this nearly as strong makes the estimate a guess
 
@@ -85,6 +97,24 @@ def probe(filename:str) -> float|None:
     except Exception:
         return None
 
+_channel_offsets = {}
+
+def channel_offset(flog:dict) -> float|None:
+    """Median probed offset of other recordings of the log's channel in the directory its
+    own recording was in (up to CHANNEL_PROBES, spread across them), or None."""
+    fn = flog.get('filename') or ''
+    m = re.match(r'(\d{4,6})_\d{12,}', os.path.basename(fn))
+    ch = str(flog.get('chanid') or (m.group(1) if m else ''))
+    d = os.path.dirname(fn)
+    if not ch or not d:
+        return None
+    if (d, ch) not in _channel_offsets:
+        files = sorted(f for f in glob.glob(os.path.join(d, f'{ch}_*.ts')) if f != fn)
+        picks = [files[int(i)] for i in np.linspace(0, len(files) - 1, min(CHANNEL_PROBES, len(files)))] if files else []
+        offs = [o for o in map(probe, dict.fromkeys(picks)) if o is not None and PLAUSIBLE[0] <= o <= PLAUSIBLE[1]]
+        _channel_offsets[(d, ch)] = float(np.median(offs)) if len(offs) >= 3 else None
+    return _channel_offsets[(d, ch)]
+
 def choose_shift(flog:dict, frames:np.ndarray) -> tuple[float, str, str]:
     est, why = estimate(frames, flog.get('frame_rate', 29.97))
     est_ok = est is not None and PLAUSIBLE[0] <= est <= PLAUSIBLE[1]
@@ -94,6 +124,9 @@ def choose_shift(flog:dict, frames:np.ndarray) -> tuple[float, str, str]:
         return prb, 'probe', note
     if est_ok:
         return est, 'estimate', note
+    ch = channel_offset(flog)
+    if ch is not None:
+        return ch, 'channel', note
     return DEFAULT_SHIFT, 'default', note
 
 def source_rows(t:np.ndarray, shift:float) -> np.ndarray:
@@ -106,36 +139,65 @@ def source_rows(t:np.ndarray, shift:float) -> np.ndarray:
     lo = np.maximum(hi - 1, 0)
     return np.where(np.abs(t[lo] - target) <= np.abs(t[hi] - target), lo, hi)
 
-def shift_audio(rows:list, shift:float) -> None:
-    """In place: each frame takes the audio columns of the frame `shift` seconds later; the
-    last `shift` seconds, whose audio isn't in the log, repeat the last frame's."""
-    t = np.array([r[0] for r in rows], dtype='float64')
+def shift_audio(rows:list, shift:float, original:list|None=None) -> None:
+    """In place: each frame takes the audio columns of the frame `shift` seconds later in
+    `original` (by default `rows` itself, which must have the same timestamps); the last
+    `shift` seconds, whose audio isn't in the log, repeat the last frame's."""
+    original = rows if original is None else original
+    t = np.array([r[0] for r in original], dtype='float64')
     src = source_rows(t, shift)
-    audio = [r[4:10] for r in rows]
+    audio = [list(r[4:10]) for r in original]
     for r, j in zip(rows, src):
         r[4:10] = audio[j]
 
-def repair(path:str, dry_run:bool) -> str:
-    flog = processor.read_feature_log(path)
-    if 'audio_shift' in flog:
-        return f"skip (already has audio_shift={flog['audio_shift']})"
-    if flog.get('frames_header', [])[4:10] != AUDIO_COLS or not flog.get('frames'):
-        return f"skip (unexpected frames_header {flog.get('frames_header')})"
+def _backup_of(path:str, backup_dir:str) -> str|None:
+    """The log's original under backup_dir: the longest trailing part of its path that
+    exists there, with or without .gz."""
+    parts = os.path.normpath(path).split(os.sep)
+    for k in range(len(parts), 0, -1):
+        rel = os.path.join(*parts[-k:])
+        for cand in (rel, rel[:-3] if rel.endswith('.gz') else rel + '.gz'):
+            if os.path.exists(os.path.join(backup_dir, cand)):
+                return os.path.join(backup_dir, cand)
+    return None
 
+def _body(flog:dict) -> list:
     rows = flog['frames']
-    lead = 1 if rows[0] is None else 0
-    body = rows[lead:]
-    shift, source, note = choose_shift(flog, np.array(body, dtype='float64'))
+    return rows[1:] if rows and rows[0] is None else rows
+
+def repair(path:str, dry_run:bool, redo_from:str|None=None) -> str:
+    flog = processor.read_feature_log(path)
+    if redo_from is None:
+        if 'audio_shift' in flog:
+            return f"skip (already has audio_shift={flog['audio_shift']})"
+        orig = flog
+    else:
+        if 'audio_shift' not in flog:
+            return "skip (never repaired; repair it without --redo-from)"
+        backup = _backup_of(path, redo_from)
+        if backup is None:
+            return f"skip (no original under {redo_from})"
+        orig = processor.read_feature_log(backup)
+    if orig.get('frames_header', [])[4:10] != AUDIO_COLS or not orig.get('frames'):
+        return f"skip (unexpected frames_header {orig.get('frames_header')})"
+
+    body, obody = _body(flog), _body(orig)
+    if obody is not body and [r[0] for r in body] != [r[0] for r in obody]:
+        return "skip (frame times differ from the original's)"
+    shift, source, note = choose_shift(orig, np.array(obody, dtype='float64'))
     shift = round(shift, 4)  # applied exactly as recorded
-    msg = f"shift {shift:+.3f}s from {source:8s} ({note})"
+    was = f" (was {flog['audio_shift']:+.3f} from {flog.get('audio_shift_from')})" if redo_from else ''
+    msg = f"shift {shift:+.3f}s from {source:8s}{was} ({note})"
     if dry_run:
         return msg
 
-    shift_audio(body, shift)
+    shift_audio(body, shift, obody if obody is not body else None)
 
     # put the new keys up with the other timing fields rather than after the frames
     out = {}
     for k, v in flog.items():
+        if k in ('audio_shift', 'audio_shift_from'):
+            continue
         out[k] = v
         if k == 'frame_rate':
             out['audio_shift'] = shift
@@ -163,12 +225,14 @@ def repair(path:str, dry_run:bool) -> str:
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     ap.add_argument('--dry-run', action='store_true', help='report the shifts, change nothing')
+    ap.add_argument('--redo-from', metavar='BACKUP_DIR',
+                    help='repair already repaired logs again, from the originals in this directory')
     ap.add_argument('logs', nargs='+')
     args = ap.parse_args()
     failed = 0
     for path in args.logs:
         try:
-            print(f'{path}: {repair(path, args.dry_run)}', flush=True)
+            print(f'{path}: {repair(path, args.dry_run, args.redo_from)}', flush=True)
         except Exception as e:
             failed += 1
             print(f'{path}: FAILED {e!r}', flush=True)
