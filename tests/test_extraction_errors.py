@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Checks that feature extraction fails cleanly instead of hanging.
 
-process_video feeds two worker threads through bounded queues.  A worker that died used to
-leave the producer blocked on a full queue forever, and an exception in the producer left
-the workers waiting on theirs, so the process never exited.  Each case here runs
+process_video feeds two worker threads through bounded queues.  A worker that dies must not
+leave the producer blocked on a full queue, and an exception in the producer must not leave
+the workers waiting on theirs, or the process never exits.  Each case here runs
 process_video against a fake player (no video, no TensorFlow) under a timeout.
 
 Run it directly; it exits non-zero if anything fails.

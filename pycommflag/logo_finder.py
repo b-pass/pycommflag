@@ -162,8 +162,7 @@ def search(player:Player, opts:Any=None, stuck_out:list|None=None) -> tuple|None
 
     skip = round(float(player.frame_rate / opts.logo_samples))
     if skip < 1: skip = 1
-    # the first hour, by time: samples sit on keyframes, so how many there are per second
-    # depends on the recording's GOP length
+    # the first hour, by time (frames_stride's thinning makes the sample count approximate)
     limit = min(3600, player.duration)
     vt_start = float(player.vt_start)
     report = 100 if not opts.quiet else math.inf
