@@ -138,9 +138,11 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
     start = time.time()
     
     fcount = 0
+    # only sets how often progress is reported: frames per second vary (soft pulldown), so
+    # the progress itself goes by the frames' times
     ftotal = int(player.duration * player.frame_rate)+1
+    done = 0.0
 
-    percent = ftotal/100.0
     report = math.ceil(ftotal/1000) if not opts.quiet else ftotal*10
     mythreport = 0
     rt = time.perf_counter()
@@ -181,11 +183,13 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
       for frame in player.frames():
         p += 1
         fcount += 1
+        if frame.time is not None:
+            done = frame.time - player.vt_start
         if p >= report:
             ro = rt
             rt = time.perf_counter()
-            perc = min(fcount/percent,100.0)
-            timeleft = round( (100.0 - perc) * ((time.time() - start) / perc) )+1
+            perc = min(max(float(done), 0.0) * 100.0 / player.duration, 100.0) if player.duration > 0 else 100.0
+            timeleft = round( (100.0 - perc) * ((time.time() - start) / max(perc, 0.1)) )+1
             logmsg = "Extracting, %5.1f%% @%5.1f fps, %4d seconds left" % (perc, p/(rt - ro), timeleft)
             print(logmsg + "               ", end='\r')
             if int(perc//5) != mythreport or perc >= 99:

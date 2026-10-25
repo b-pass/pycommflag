@@ -62,7 +62,6 @@ def _scale_dist(seconds):
 WINDOW_BEFORE = 60
 WINDOW_AFTER = 60
 SUMMARY_RATE = 1
-RATE = 29.97
 
 # Pre-trained model downloaded when none is found locally. The release asset and the local copy
 # are both named MODEL_FNAME, which encodes the input shape, so a feature/window change never
@@ -299,75 +298,69 @@ def _split_lead_in(tags: list, flog: dict) -> list:
 
     return list(tags[:i]) + pieces + list(tags[i+1:])
 
-def condense(frames: np.ndarray, timestamps: np.ndarray, answers: np.ndarray, weights: np.ndarray, step: int) -> np.ndarray:
+def condense(frames: np.ndarray, timestamps: np.ndarray, answers: np.ndarray, weights: np.ndarray, seconds: float) -> np.ndarray:
     """
-    Summarize video features by aggregating the specified step size.
+    Summarize the per-frame features over each `seconds` of the recording, binned by timestamp
+    rather than by frame count: film sent with soft 3:2 pulldown decodes to ~24 frames a second,
+    unevenly spaced, on channels whose nominal rate is 29.97.  A bin no frame falls in (a gap in
+    the decode) gets no row.
     """
-    def doit(a, atimestamps, aanswers, aweights):
-        res = []
+    timestamps = timestamps.reshape(-1)
+    answers = answers.reshape(-1)
+    weights = weights.reshape(-1)
 
-        res.append(a[:, a.shape[1]//2, NORMTIME]) # middle relative timestamp
-        res.append(np.average(a[:, :, LOGO], axis=1))
-        res.append(np.average(a[:, :, BLANK], axis=1))
-        res.append(np.count_nonzero(a[:, :, DIFF] >= 0.5, axis=1) / a.shape[1])  # Diff count above 0.5
-        for x in (FVOL,RVOL,SILENCE,SPEECH,MUSIC,NOISE):
-            res.append(np.average(a[:, :, x], axis=1))
-        for x in (LOGO_RUN, HAVE_LOGO, HAVE_RVOL):
-            res.append(a[:, a.shape[1]-1, x]) # end of the logo run feature
-        res.append(a[:, a.shape[1]//2, PERCTIME]) # middle percentage timestamp
-        for x in (BLANK_SINCE, BLANK_UNTIL):
-            res.append(a[:, a.shape[1]//2, x]) # blank distance, from this sample's own centre
+    # frames are in time order, so each bin is one contiguous run of them
+    b = np.floor((timestamps - timestamps[0]) / seconds).astype('int64')
+    starts = np.concatenate(([0], np.flatnonzero(np.diff(b)) + 1))
+    counts = np.diff(np.append(starts, len(frames)))
+    mid = starts + counts//2
+    last = starts + counts - 1
 
-        assert(len(res) == GENERATED_FEATURES_START)
-        
-        # no front std (0.87 correlated with the front max), no rear max (0.92 with the rear
-        # mean), and no min of LOGO_RUN, which only rises within a second so it duplicated it
-        res.append(np.max(a[:, :, FVOL], axis=1)) # vol max
-        res.append(np.std(a[:, :, RVOL], axis=1)) # rear vol std dev
-        res.append(np.percentile(a[:, :, DIFF], 90, axis=1)) # diff 90th
-        res.append(np.max(a[:, :, DIFF], axis=1)) # diff max
+    def mean(x):
+        return np.add.reduceat(x.astype('float64'), starts) / counts
 
-        assert(len(res) == FEATURE_WIDTH)
+    res = []
 
-        res.append(atimestamps[:, a.shape[1]//2]) # center timestamp
-        # the answer belongs to the centre frame, the same one the timestamp above refers to.
-        # np.max() here instead used to label the whole second commercial if ANY frame in it
-        # was, which widened every break outward by up to a second and put a label on the
-        # sample that contradicted its own timestamp.
-        res.append(aanswers[:, a.shape[1]//2]) # answer
-        res.append(np.where( (aweights < 0.1).any(axis=1), 0, np.max(aweights, axis=1) )) # weight (unless there's a zero in there)
-        
-        #res = [np.average(a[:, :, 0:6], axis=1)] + [x.reshape(x.shape[0], 1) for x in res] + [np.average(a[:, :, 6:], axis=1)]
-        #res[-1][:, -2] = (np.count_nonzero(a[:, :, -2] >= 0.5, axis=1) >= a.shape[1]/2).astype('float32')
-        
-        return np.concatenate([x.reshape((x.shape[0], 1)) if len(x.shape) == 1 else x for x in res], axis=1)
-    
-    n_frames = len(frames)
-    remaining = n_frames % step
-    if n_frames >= step:
-        # Reshape the array to group frames by step size
-        condensed = doit( 
-            frames[:(n_frames//step)*step].reshape(-1, step, frames.shape[1]),
-            timestamps[:(n_frames//step)*step].reshape(-1, step, 1),
-            answers[:(n_frames//step)*step].reshape(-1, step, 1),
-            weights[:(n_frames//step)*step].reshape(-1, step, 1),
-        )
-    else:
-        condensed = None
-    
-    if remaining > 0:
-        # Do the final, partial condensing
-        partial = doit( 
-            frames[-remaining:].reshape(-1, remaining, frames.shape[1]),
-            timestamps[-remaining:].reshape(-1, remaining, 1),
-            answers[-remaining:].reshape(-1, remaining, 1),
-            weights[-remaining:].reshape(-1, remaining, 1),
-        )
+    res.append(frames[mid, NORMTIME]) # middle relative timestamp
+    res.append(mean(frames[:, LOGO]))
+    res.append(mean(frames[:, BLANK]))
+    res.append(mean(frames[:, DIFF] >= 0.5))  # Diff count above 0.5
+    for x in (FVOL,RVOL,SILENCE,SPEECH,MUSIC,NOISE):
+        res.append(mean(frames[:, x]))
+    for x in (LOGO_RUN, HAVE_LOGO, HAVE_RVOL):
+        res.append(frames[last, x]) # end of the logo run feature
+    res.append(frames[mid, PERCTIME]) # middle percentage timestamp
+    for x in (BLANK_SINCE, BLANK_UNTIL):
+        res.append(frames[mid, x]) # blank distance, from this sample's own centre
 
-        if condensed is None:
-            return partial
-        return np.vstack((condensed, partial))
-    return condensed
+    assert(len(res) == GENERATED_FEATURES_START)
+
+    # no front std (0.87 correlated with the front max), no rear max (0.92 with the rear
+    # mean), and no min of LOGO_RUN, which only rises within a second so it duplicated it
+    res.append(np.maximum.reduceat(frames[:, FVOL], starts)) # vol max
+    rvol = frames[:, RVOL].astype('float64')
+    rdev = rvol - np.repeat(mean(rvol), counts)
+    res.append(np.sqrt(np.add.reduceat(rdev*rdev, starts) / counts)) # rear vol std dev
+    # diff 90th, interpolated the way np.percentile does: sort each bin's diffs in place
+    # (by bin, then by value) and read between the two nearest ranks
+    sdiff = frames[np.lexsort((frames[:, DIFF], b)), DIFF].astype('float64')
+    rank = 0.9 * (counts - 1)
+    lo = np.floor(rank).astype('int64')
+    hi = np.minimum(lo + 1, counts - 1)
+    res.append(sdiff[starts+lo] + (rank - lo) * (sdiff[starts+hi] - sdiff[starts+lo])) # diff 90th
+    res.append(np.maximum.reduceat(frames[:, DIFF], starts)) # diff max
+
+    assert(len(res) == FEATURE_WIDTH)
+
+    res.append(timestamps[mid]) # center timestamp
+    # the answer belongs to the centre frame, the same one the timestamp above refers to.
+    # np.max() here instead used to label the whole second commercial if ANY frame in it
+    # was, which widened every break outward by up to a second and put a label on the
+    # sample that contradicted its own timestamp.
+    res.append(answers[mid]) # answer
+    res.append(np.where(np.minimum.reduceat(weights, starts) < 0.1, 0, np.maximum.reduceat(weights, starts))) # weight (unless there's a zero in there)
+
+    return np.stack([np.asarray(x, dtype='float64') for x in res], axis=1)
 
 def load_nonpersistent(flog:dict, for_training=False, no_logo=False, no_blanks=False)->np.ndarray:
     version = flog.get('file_version', 10)
@@ -448,7 +441,7 @@ def load_nonpersistent(flog:dict, for_training=False, no_logo=False, no_blanks=F
             del frames[:b]
         del tags[0]
 
-    if len(frames) < (WINDOW_BEFORE + WINDOW_AFTER) * 2 * round(RATE):
+    if frames[-1][0] - frames[0][0] < (WINDOW_BEFORE + WINDOW_AFTER) * 2:
         return None
     
     # ok now we can numpy....
@@ -465,12 +458,16 @@ def load_nonpersistent(flog:dict, for_training=False, no_logo=False, no_blanks=F
     # change the diff column to be normalized [0,40+] -> [0,1]
     frames[:,DIFF] = np.clip(frames[:,DIFF] / 40, 0, 1.0)
 
+    # save off the times; frames aren't evenly spaced at frame_rate (soft pulldown), so every
+    # distance below is measured with these
+    timestamps = frames[:,NORMTIME].copy()
+
     # add a column for time since logo.  Before the first logo frame none has been seen,
     # which is as far from one as it gets; counting from 0 there instead told the model the
     # logo had just been on screen during every recording's lead-in commercials.
     n = np.arange(len(frames))
     last_logo = np.maximum.accumulate(np.where(frames[:, LOGO] > 0.5, n, -1))
-    since_logo = np.where(last_logo >= 0, (n - last_logo) / frame_rate, DIST_CAP)
+    since_logo = np.where(last_logo >= 0, timestamps - timestamps[np.maximum(last_logo, 0)], DIST_CAP)
     assert(frames.shape[-1] == LOGO_RUN)
     frames = np.append(frames, _scale_dist(since_logo)[:,np.newaxis], axis=1)
     assert(frames.shape[-1] == HAVE_LOGO)
@@ -492,9 +489,6 @@ def load_nonpersistent(flog:dict, for_training=False, no_logo=False, no_blanks=F
         vref = float(np.median(audible))
         frames[:, FVOL] = np.clip(frames[:, FVOL] / vref, 0, 10)
         frames[:, RVOL] = np.clip(frames[:, RVOL] / vref, 0, 10)
-
-    # save off the times
-    timestamps = frames[:,NORMTIME].copy()
 
     # add a column for time percentage
     assert(frames.shape[-1] == PERCTIME)
@@ -540,28 +534,17 @@ def load_nonpersistent(flog:dict, for_training=False, no_logo=False, no_blanks=F
     # massively up weight near boundaries. however, _adjust_tags makes this only really matter outside of 5
     # within 5, it can be wrong ... so we only upweight the closest ones to the boundary
     # the others that are a little farther are not upweighted at all because they are in "dont care" territory
+    window = float(max(WINDOW_BEFORE,WINDOW_AFTER))
     for (tt,(st,et)) in tags:
-        window = int(round(max(WINDOW_BEFORE,WINDOW_AFTER)*frame_rate))
-        def upweight(t):
-            #if t < frame_rate*3.5:
-            #    return 1.1
-            #else:
-                return 1 + 1 * ((((window - t) / float(window)) ** 2))
-        
         if tt in [SceneType.COMMERCIAL, SceneType.SHOW, SceneType.COMMERCIAL.value, SceneType.SHOW.value]:
-            si = np.searchsorted(timestamps, st)
-            ei = np.searchsorted(timestamps, et)
-            for i in (si,ei):
-                for t in range(0, window):
-                    w = upweight(t)
-                    if i-t >= 0 and i-t < len(weights) and weights[i-t] >= 1.0:
-                        weights[i-t] = max(weights[i-t], w)
-                    if i+t < len(weights) and weights[i+t] >= 1.0:
-                        weights[i+t] = max(weights[i+t], w)
+            for edge in (st,et):
+                dt = np.abs(timestamps - edge)
+                near = (dt < window) & (weights[:,0] >= 1.0)
+                weights[near,0] = np.maximum(weights[near,0], 1 + ((window - dt[near]) / window) ** 2)
     
     #print("pre condense weights",len(weights),np.count_nonzero(weights),np.count_nonzero(weights == 0),np.count_nonzero(weights > 1.0))
 
-    condensed = condense(frames, timestamps, answers, weights, round(frame_rate/SUMMARY_RATE))
+    condensed = condense(frames, timestamps, answers, weights, 1/SUMMARY_RATE)
 
     #cw = condensed[:,WEIGHTS]
     #print("post condense weights",len(cw),np.count_nonzero(cw),np.count_nonzero(cw < 0), np.count_nonzero(cw == 0),np.count_nonzero(cw > 1))
