@@ -1,6 +1,7 @@
 import sys
 import os
 import logging as log
+from bisect import bisect_right
 import av
 from .feature_span import SceneType
 
@@ -129,20 +130,10 @@ def get_breaks(chanid, starttime)->list[tuple[float,float]]:
                   "WHERE chanid = %s AND starttime = %s AND (type = 4 OR type = 5) "\
                   "ORDER BY mark ASC",
                   (chanid, starttime))
-        for (m,t) in c.fetchall():
-            guess = None
-            with conn.cursor() as tc:
-                tc.execute("SELECT `offset`,mark FROM recordedseek "\
-                           "WHERE chanid = %s and starttime = %s AND type = 33 "\
-                           "ORDER BY ABS(CAST(mark AS SIGNED) - "+str(int(m))+") ASC "\
-                           "LIMIT 1",
-                           (chanid,starttime))
-                for (o,om) in tc.fetchall():
-                    guess = float(o)/1000 + (int(m) - int(om))/rate
-                    break
-            if guess is None:
-                guess = int(m)/rate
-            marks.append((guess,t))
+        rows = c.fetchall()
+        dmap = _duration_map(c, chanid, starttime)
+        for (m,t) in rows:
+            marks.append((_time_for_frame(dmap, int(m), rate),t))
         
         if not marks:
             return []
@@ -159,22 +150,39 @@ def get_breaks(chanid, starttime)->list[tuple[float,float]]:
 # Which is from like 1999
 # But we're using times instead.
 # MythTV stores the time associated with each keyframe in the DB as type 33.
-# So we find the frame number of the timestamp closest to the one we want and 
-# then use the frame rate to skip to the exact frame number we have flagged.
+# Frames aren't evenly spaced at the nominal rate (soft 3:2 pulldown decodes to ~24 frames a
+# second on a 29.97 channel), so between two keyframes we interpolate through that table, which
+# gives the real local rate; the frame rate is only used past either end of it.
 # Recordings with no type 33 seek table at all just get the frame rate applied.
-def _frame_for_time(cursor, chanid, starttime, when, rate)->int:
+def _duration_map(cursor, chanid, starttime)->tuple[list[float],list[int]]:
+    """The type 33 seek table as (seconds, frame numbers), in frame order."""
     cursor.execute("SELECT `offset`,mark FROM recordedseek "\
                    "WHERE chanid = %s AND starttime = %s AND type = 33 "\
-                   "ORDER BY ABS(CAST(`offset` AS SIGNED) - "+str(int(when*1000))+") ASC "\
-                   "LIMIT 1",
+                   "ORDER BY mark ASC",
                    (chanid, starttime))
-    row = cursor.fetchone()
-    if row is None:
-        frame = round(when * rate)
-    else:
-        (o,m) = row
-        frame = int(m) + round((when - float(o)/1000) * rate)
+    rows = cursor.fetchall()
+    return ([float(o)/1000 for (o,_) in rows], [int(m) for (_,m) in rows])
+
+def _interp(x, xs, ys, rate)->float:
+    """y at x, linear between the rows of (xs, ys) around it, and at `rate` y per x beyond them."""
+    if not xs:
+        return x * rate
+    i = bisect_right(xs, x)
+    if i == 0:
+        return ys[0] + (x - xs[0]) * rate
+    if i >= len(xs):
+        return ys[-1] + (x - xs[-1]) * rate
+    (x0, x1, y0, y1) = (xs[i-1], xs[i], ys[i-1], ys[i])
+    return y0 + (x - x0) * (y1 - y0) / (x1 - x0) if x1 > x0 else y0
+
+def _frame_for_time(dmap, when, rate)->int:
+    (secs, frames) = dmap
+    frame = round(_interp(when, secs, frames, rate))
     return frame if frame > 0 else 0
+
+def _time_for_frame(dmap, frame, rate)->float:
+    (secs, frames) = dmap
+    return _interp(frame, frames, secs, 1/rate)
 
 def set_breaks(opts, marks, flog=None)->bool:
     chanid = opts.chanid
@@ -209,6 +217,7 @@ def set_breaks(opts, marks, flog=None)->bool:
         c.execute("DELETE FROM recordedmarkup "\
                   "WHERE chanid = %s AND starttime = %s AND (type = 4 OR type = 5) ",
                   (chanid, starttime))
+        dmap = _duration_map(c, chanid, starttime)
         
         for (st,(b,e)) in marks:
             if not isinstance(st, SceneType):
@@ -217,8 +226,8 @@ def set_breaks(opts, marks, flog=None)->bool:
                 continue
             #print(st,b,e)
 
-            fb = _frame_for_time(c, chanid, starttime, b, rate)
-            fe = _frame_for_time(c, chanid, starttime, e, rate)
+            fb = _frame_for_time(dmap, b, rate)
+            fe = _frame_for_time(dmap, e, rate)
             
             if fb >= fe: # sanity
                 continue

@@ -337,17 +337,18 @@ class Player:
         (~1-2.5 a second, nearly free).  Some channels send a keyframe only every 4s, which is
         why it doesn't start there.  What comes out is thinned to at most one per `skip` frames.
         """
-        if self.graph or 'audio' in self.streams:
-            count = 0
-            for frame in self.frames():
-                if (count%skip) == 0:
-                    yield frame
-                count += 1
-            return
-
+        # thinned by time, since frames aren't evenly spaced at frame_rate (soft pulldown);
         # half a frame of slack so timestamp jitter can't drop a keyframe that is due
         interval = (skip - 0.5) / float(self.frame_rate)
         last_time = None
+        if self.graph or 'audio' in self.streams:
+            for frame in self.frames():
+                if last_time is not None and frame.time is not None and frame.time - last_time < interval:
+                    continue
+                last_time = frame.time
+                yield frame
+            return
+
         rec = None
         last_pts = None
         ahead = 0

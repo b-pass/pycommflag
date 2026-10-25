@@ -72,6 +72,63 @@ if c is not None:
     c11 = neural.load_nonpersistent(flog11)
     check('an extra cc_text column changes nothing the model sees', c11 is not None and np.array_equal(c, c11))
 
+    # condensing goes by time, one row a second (the last second can be a partial one)
+    body = c[neural.WINDOW_BEFORE:-neural.WINDOW_AFTER]
+    step = np.diff(body[:-1, neural.TIMESTAMPS])
+    check('one condensed row per second', np.abs(step - 1).max() < .05,
+          f'steps {step.min():.3f}..{step.max():.3f}')
+
+# All film: 24 frames a second (gaps alternating 50/33ms) at a nominal 29.97, the logo on until
+# 100s, and a break from 150s to 210s.
+times, t = [], 0.0
+while t < 300:
+    times.append(round(t, 5))
+    t += 0.05005 if len(times) % 2 else 0.03337
+film = [[t, int(t < 100), 0, 1.0, .1, 0, 0, 1, 0, 0] for t in times]
+flog = dict(flog, logo=[1], tags=[(3, (150.0, 210.0))])
+c = neural.load_nonpersistent(dict(flog, frames=[list(r) for r in film]))
+if c is not None:
+    body = c[neural.WINDOW_BEFORE:-neural.WINDOW_AFTER]
+    ts = body[:, neural.TIMESTAMPS]
+    check('all-film log condenses to one row a second', abs(len(body) - 300) <= 1, f'{len(body)} rows')
+    k = int(np.flatnonzero((ts >= 110) & (ts < 111))[0])
+    # LOGO_RUN is taken at a row's last frame, which is just short of 111s
+    want = neural._scale_dist(np.array([110.96 - 99.98]))[0]
+    check('LOGO_RUN counts seconds, not frames at the nominal rate', abs(body[k, neural.LOGO_RUN] - want) < .005,
+          f'{body[k, neural.LOGO_RUN]:.3f} vs {want:.3f}')
+else:
+    check('all-film log condenses', False)
+
+c = neural.load_nonpersistent(dict(flog, frames=[list(r) for r in film]), for_training=True)
+if c is not None:
+    body = c[neural.WINDOW_BEFORE:-neural.WINDOW_AFTER]
+    ts, w = body[:, neural.TIMESTAMPS], body[:, neural.WEIGHTS]
+    def weight_at(t): return float(w[np.argmin(np.abs(ts - t))])
+    # 1 + ((60 - dt)/60)^2, maxed over the second: dt reaches 29.5 inside the row centred at 120.5
+    check('boundary upweighting reaches 60s out by time', abs(weight_at(120.5) - (1 + (30.5/60)**2)) < .02,
+          f'{weight_at(120.5):.3f}')
+    check('...and stops there', weight_at(85) == 1.0 and weight_at(275) == 1.0,
+          f'{weight_at(85):.3f} {weight_at(275):.3f}')
+else:
+    check('all-film log condenses for training', False)
+
+# condense's per-second stats against plain numpy over each second's frames
+rng = np.random.default_rng(7)
+t = np.cumsum(rng.choice([0.03337, 0.05005], 4000))
+fr = rng.random((len(t), neural.GENERATED_FEATURES_START)).astype('float32')
+w = rng.choice([0, .75, 1, 1.5], (len(t), 1)).astype('float32')
+got = neural.condense(fr, t, np.zeros((len(t), 1), 'float32'), w, 1.0)
+sec = np.floor(t - t[0]).astype(int)
+bad = []
+for k, s in enumerate(np.unique(sec)):
+    f, ww = fr[sec == s], w[sec == s, 0]
+    want = {neural.DIFF_90TH: np.percentile(f[:, neural.DIFF], 90), neural.DIFF_MAX: f[:, neural.DIFF].max(),
+            neural.RVOL_STDDEV: np.std(f[:, neural.RVOL]), neural.FVOL_MAX: f[:, neural.FVOL].max(),
+            neural.LOGO: f[:, neural.LOGO].mean(), neural.LOGO_RUN: f[-1, neural.LOGO_RUN],
+            neural.WEIGHTS: 0 if ww.min() < .1 else ww.max()}
+    bad += [col for col, v in want.items() if abs(got[k, col] - v) > 1e-5]
+check("condense's per-second stats match numpy's", len(got) == len(np.unique(sec)) and not bad, str(sorted(set(bad))))
+
 if _fails:
     print(f'{len(_fails)} failed')
     sys.exit(1)
