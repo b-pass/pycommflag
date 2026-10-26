@@ -21,7 +21,7 @@ from .feature_span import *
 from . import processor
 from . import neural
 
-SEED = int(os.environ.get('PYCF_SEED', 121711))
+SEED = int(os.environ.get('PYCF_SEED', 171112))
 
 # array indexes
 NORMTIME = 0
@@ -52,16 +52,13 @@ TIMESTAMPS = 20
 ANSWERS = 21
 WEIGHTS = 22
 
-# LOGO_RUN, BLANK_SINCE and BLANK_UNTIL are distances in seconds, capped here and log-scaled,
-# so the first few seconds (which matter most) aren't squashed: 5s is 0.31, where 5/300 was 0.017
-DIST_CAP = 300.0
-def _scale_dist(seconds):
-    return (np.log1p(np.clip(seconds, 0, DIST_CAP)) / np.log1p(DIST_CAP)).astype('float32')
-
 # data params, both for train and for inference
 WINDOW_BEFORE = 60
 WINDOW_AFTER = 60
 SUMMARY_RATE = 1
+
+# LOGO_RUN, BLANK_SINCE and BLANK_UNTIL are distances in seconds, capped here 
+DIST_CAP = 300.0
 
 # Pre-trained model downloaded when none is found locally. The release asset and the local copy
 # are both named MODEL_FNAME, which encodes the input shape, so a feature/window change never
@@ -141,18 +138,17 @@ def build_model(input_shape=(WINDOW_BEFORE+1+WINDOW_AFTER, FEATURE_WIDTH)):
 
         x = layers.Add(name=f"{name_prefix}_res")([x, residual])
 
-    # the second being classified (a layer rather than x[:,60,:], so that it has a name)
-    center = layers.Cropping1D((WINDOW_BEFORE, WINDOW_AFTER), name="center_crop")(x)
-    center = layers.Flatten(name="center")(center)
-    maxp = layers.GlobalMaxPooling1D(name="maxpool")(x)
+    # learned per-channel weighting of each second in the window
+    pos = layers.DepthwiseConv1D(x.shape[1], use_bias=False, name="pos_pool")(x)
     # use light attention to learn to focus on the important slices
     attn = layers.Dense(1, use_bias=False, name="attn_score")(x)
     attn = layers.Softmax(axis=1, name="attn")(attn)
-    attn = layers.Dot(axes=1, name="attn_pool")([x,attn])
-    attn = layers.Flatten(name="attn_flat")(attn)
+    attn = layers.Dot(axes=1, name="attn_pool")([attn, x])
+    maxp = layers.GlobalMaxPooling1D(keepdims=True, name="max_pool")(x)
 
-    x = layers.Concatenate(name="head")([attn, maxp, center])
-    
+    x = layers.Concatenate(name="pools")([pos, attn, maxp])
+    x = layers.Flatten(name="final_flatten")(x)
+
     x = layers.Dense(F*4, "relu", name="classifier")(x)
     x = layers.Dropout(DROPOUT, name="classifier_drop")(x)
 
@@ -160,6 +156,10 @@ def build_model(input_shape=(WINDOW_BEFORE+1+WINDOW_AFTER, FEATURE_WIDTH)):
 
     return Model(inputs, outputs)
 
+
+def _scale_dist(seconds):
+    # log-scaled so the first few seconds (which matter most) aren't squashed: 5s is 0.31, where 5/300 is 0.017
+    return (np.log1p(np.clip(seconds, 0, DIST_CAP)) / np.log1p(DIST_CAP)).astype('float32')
 
 def _snap_distance(tt) -> float:
     # human show/commercial boundaries are looser than the rest, so search further
