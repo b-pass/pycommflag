@@ -361,7 +361,7 @@ def _gray(frame:VideoFrame,box:tuple=None) -> np.ndarray:
         else:
             return x[:frame.planes[0].height]
     else:
-        x = frame.to_ndarray(format="rgb24")
+        x = frame.to_ndarray(format="rgb24", threads=1) # see VideoProc.add_frame
         if box:
             x = x[box[0]:box[1],box[2]:box[3]]
         x = np.dot(x[...,:3], [0.2989, 0.5870, 0.1140])

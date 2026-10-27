@@ -329,7 +329,9 @@ class VideoProc(Thread):
             _drain(self.queue)
 
     def add_frame(self, frame):
-        fcolor = frame.to_ndarray(format="rgb24")#, height=720, width=frame.width*(720/frame.height))
+        # threads=1: by default each frame gets its own swscale context with a thread per CPU,
+        # alive until the frame is freed -- thousands of threads (8MB of stack each) at once
+        fcolor = frame.to_ndarray(format="rgb24", threads=1)#, height=720, width=frame.width*(720/frame.height))
         if self.shape is None:
             self.shape = fcolor.shape
         # the logo's box and mask are in the first frame's pixels; after a resolution change
