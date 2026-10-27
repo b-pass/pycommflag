@@ -48,7 +48,7 @@ class FakeFrame:
         self.format = types.SimpleNamespace(is_planar=False)
         self.side_data = []
         self._n = n
-    def to_ndarray(self, format=None):
+    def to_ndarray(self, format=None, threads=None):
         x = np.full((self.height, self.width, 3), 60 + (self._n % 50), 'uint8')
         x[4:20, 4:20] = 255  # a bright square where the test logo is
         return x
