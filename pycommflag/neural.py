@@ -386,6 +386,14 @@ def load_nonpersistent(flog:dict, for_training=False, no_logo=False, no_blanks=F
     assert('diff' in frames_header[DIFF])
 
     if tags and for_training:
+        # INTRO/TRANSITION/CREDITS train as plain show: they are not commercials, and the model gets
+        # them wrong far more often than other show, so they need full weight. Dropping the tags
+        # (rather than relabelling them SHOW) makes them exactly what an unlabelled stretch of show
+        # is, for the small-gap merging and boundary upweights below too, so logs where humans
+        # skipped them agree.
+        tags = [(t,(b,e)) for (t,(b,e)) in tags
+                if (t.value if isinstance(t, SceneType) else t) in
+                   (SceneType.SHOW.value, SceneType.COMMERCIAL.value, SceneType.DO_NOT_USE.value)]
         spans = processor.read_feature_spans(flog, 'blank', 'diff')
         tags = _adjust_tags(tags, spans.get('blank', []), spans.get('diff', []))
         
@@ -528,8 +536,6 @@ def load_nonpersistent(flog:dict, for_training=False, no_logo=False, no_blanks=F
             weights[si:ei] = 0 # ignore this entire section
         elif tt == SceneType.COMMERCIAL.value:
             answers[si:ei] = 1.0
-        elif tt != SceneType.SHOW.value:
-            weights[si:ei] = 0.75 # weight these areas as less important because they might be confusing
 
     # massively up weight near boundaries. however, _adjust_tags makes this only really matter outside of 5
     # within 5, it can be wrong ... so we only upweight the closest ones to the boundary
