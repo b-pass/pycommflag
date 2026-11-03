@@ -34,8 +34,12 @@ def get_options():
                         help="Channels DVR server, for -o channelsdvr")
     parser.add_argument('-r', '--reprocess', dest="reprocess", type=str, nargs='+',
                         help="Input location of feature data log to be reprocessed.")
-    parser.add_argument('-g', '--gui', dest='gui', type=str, 
-                        help="Display this feature log for GUI editing.")
+    parser.add_argument('-g', '--gui', dest='gui', type=str, nargs='?', const='',
+                        help="Edit a recording's tags: a feature log, a video (or a link to one), a <chanid>_<starttime>, "
+                             "or nothing/search text to pick one from a list")
+    parser.add_argument('--log-dir', dest='log_dir', type=str, action='append',
+                        help="Where -g looks for feature logs (and in its old/); repeatable. "
+                             "Default: $PYCOMMFLAG_LOG_DIR and the temp dir")
     parser.add_argument('-q', '--quiet', dest='quiet', action='store_true',
                         help="Do not print progress during processing")
     parser.add_argument('--loglevel', dest='loglevel', type=str,
@@ -128,7 +132,8 @@ def resolve_mode(cfg) -> Mode:
         return Mode.REPROCESS
     if cfg.eval:
         return Mode.EVAL
-    if cfg.gui:
+    # -g with no value is '', which still means the editor (via the picker)
+    if cfg.gui is not None:
         return Mode.GUI
     return Mode.FLAG
 

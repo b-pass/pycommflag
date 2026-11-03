@@ -64,12 +64,9 @@ def _resolve_inputs(opts) -> None:
     Mutates opts in place, which is also what mythtv.get_filename does when it
     resolves a job id into a recording.
     """
-    if opts.gui:
-        if not opts.feature_log:
-            opts.feature_log = opts.gui
-        if not opts.filename:
-            from .processor import read_feature_log
-            opts.filename = _find_video(read_feature_log(opts.feature_log).get('filename', ''))
+    # -g finds its own log (and through it the video and chanid/starttime), see _cmd_gui
+    if opts.gui is not None:
+        return
 
     if opts.mythjob:
         from .mythtv import get_filename
@@ -116,11 +113,36 @@ def _cmd_eval(opts) -> int:
 
 
 def _cmd_gui(opts) -> int:
+    from . import picker
+
+    dirs = picker.log_dirs(opts)
+    try:
+        (log, video, search) = picker.resolve_gui_arg(opts.gui, dirs)
+    except LookupError as e:
+        print(e)
+        return 1
+    if search is None:
+        return _edit(opts, log, video)
+
+    log = picker.pick(dirs, search)
+    if log is None:
+        return 0
+    print(f'Editing {log}')
+    return _edit(opts, log, None)
+
+
+def _edit(opts, log:str, video:str|None) -> int:
+    """Run the editor on one feature log, saving it back (to -l if given) and outputting the tags."""
+    from datetime import datetime
     from . import gui, processor
 
-    flog = processor.reprocess(opts.gui, opts=opts)
+    if not opts.feature_log:
+        opts.feature_log = log
+    flog = processor.reprocess(log, opts=opts)
     if not opts.filename:
-        opts.filename = flog.get('filename','')
+        opts.filename = video or _find_video(flog.get('filename', ''))
+    if not opts.chanid or not opts.starttime:
+        _infer_chanid_starttime(opts)
 
     if err := _require_video(opts):
         print(err)
@@ -132,7 +154,11 @@ def _cmd_gui(opts) -> int:
         return 1
 
     flog['tags'] = res
+    # -r leaves these alone, and the picker shows them as done
+    flog = processor.set_header_key(flog, 'edited', datetime.now().isoformat(timespec='seconds'))
     processor.write_feature_log(flog, opts.feature_log)
+    # the humans rename hand-edited logs into the training data, so they need to know which file it was
+    print(f'Saved {os.path.abspath(opts.feature_log)}')
     return 1 if output(opts, res, flog) is False else 0
 
 
@@ -181,11 +207,20 @@ def _reprocess_one(opts, fl, allow_archive:bool) -> bool:
 
     if vf and not os.path.exists(vf):
         old = os.path.join(os.path.dirname(fl), 'old')
+        if not os.path.isdir(os.path.dirname(vf)):
+            # the whole recordings directory is missing (unmounted?), which says nothing about this one
+            print(f'Skipped ({os.path.dirname(vf)} does not exist)')
+            return False
         if allow_archive and os.path.exists(old):
             print(f'Archived ({vf} does not exist)')
             os.rename(fl, os.path.join(old, os.path.basename(fl)))
             return True
         print(f'Skipped ({vf} does not exist)')
+        return False
+
+    if flog.get('edited'):
+        # its tags are a human's, not a prediction to refresh
+        print(f'Skipped (hand-edited {flog["edited"]})')
         return False
 
     if opts.chanid:

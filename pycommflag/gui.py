@@ -1,7 +1,10 @@
 import tkinter as tk
 import tkinter.font as tkfont
 import bisect
+import logging as log
 import math
+import queue
+import threading
 import time
 import numpy as np
 from PIL import ImageTk, Image
@@ -14,10 +17,162 @@ from .feature_span import *
 INFO_LINES = 16 # in the info box, which must not change height
 LOGO_DEBOUNCE = 3 # log frames a new logo state must last before Logo |</>| count it as a change
 
+# the review queue (see review_items)
+REVIEW_UNSURE = (0.15, 0.85) # model probabilities it asks about wherever they are
+REVIEW_EDGE_GAP = 10 # seconds; other reasons to stop this close to an edge are left to the edge's own stop
+REVIEW_MERGE = 30 # seconds; reasons to stop this close together (away from edges) make one stop
+REVIEW_LOGO_OFF = 10 # seconds the logo must be gone, inside show, to ask about it
+REVIEW_LOGO_ON = 20 # seconds the logo must be up, inside a break, to ask about it
+REVIEW_DOUBT_LEN = 3 # seconds the model must be unsure for, when it doesn't disagree with the tags outright
+REVIEW_BLANK_SAME = 5 # seconds; blanks this close together are one fade (or flicker), not the ends of ads
+REVIEW_BLANK_GAP = 65 # seconds; blanks inside show this close together are spaced like the ends of ads
+REVIEW_BLANKS = 3 # blanks spaced like that before it asks (a missed break of two ads has three)
+REVIEW_TOL = 0.5 # seconds; a stop this close to the position (or to an edge just flagged) has been seen
+
+# the contact sheet
+SHEET_STEP = 10 # seconds per thumbnail
+SHEET_COLS = 12 # thumbnails per row, so a row is two minutes
+SHEET_THUMB = (96, 54)
+
+def _review_kind(t):
+    # intro and credits train as show (see load_nonpersistent), so the queue counts them as show
+    if isinstance(t, int):
+        t = SceneType(t)
+    return t if t in (SceneType.COMMERCIAL, SceneType.DO_NOT_USE) else SceneType.SHOW
+
+def review_items(tags, raw, logo_spans, blank_mids, opts) -> list:
+    """Where the editor's review queue stops, as (time, why, is_edge) in time order.
+
+    It stops at the start and end of the recording, at every edge between show, break and
+    ignored, and, away from those, wherever the tags might be missing a break (or a piece of show
+    inside one): the model unsure of or disagreeing with the tags, the logo gone from show or up in
+    a break, and blanks clustered inside show the way they fall between ads.
+
+    `tags` cover the whole recording, as Window.tags do; `raw` is raw_predict's (time, probability)
+    list, `logo_spans` the debounced (on, (b,e)) logo runs (empty without a logo) and `blank_mids`
+    the sorted middles of the blanks.
+    """
+    names = Window.TAG_NAMES
+    runs = []
+    for (t,(b,e)) in tags:
+        k = _review_kind(t)
+        if runs and runs[-1][0] == k:
+            runs[-1] = (k, (runs[-1][1][0], e))
+        else:
+            runs.append((k, (b, e)))
+    if not runs:
+        return []
+    starts = np.array([b for (_,(b,_)) in runs], dtype='float64')
+    edges = starts[1:]
+    # the recording's first and last second are always stops, and count as edges for what is near one
+    (first, last) = (float(starts[0]), max(float(starts[0]), runs[-1][1][1] - 1))
+    bounds = np.concatenate(([first], edges, [last]))
+    def run_at(t):
+        return max(0, int(np.searchsorted(starts, t, 'right')) - 1)
+    def far(t):
+        return float(np.min(np.abs(bounds - t))) > REVIEW_EDGE_GAP
+
+    # lengths post_predict wouldn't produce go with the edge that starts them (or ends the first)
+    notes = [[] for _ in edges]
+    for (j,(k,(b,e))) in enumerate(runs):
+        n = None
+        if k == SceneType.COMMERCIAL and e - b < opts.break_min_len:
+            n = f'short break {e-b:.0f}s'
+        elif k == SceneType.COMMERCIAL and e - b > opts.break_max_len:
+            n = f'long break {e-b:.0f}s'
+        elif (k == SceneType.SHOW and 0 < j < len(runs)-1 and e - b < opts.show_min_len
+              and runs[j-1][0] == runs[j+1][0] == SceneType.COMMERCIAL):
+            n = f'short show {e-b:.0f}s'
+        if n and len(edges):
+            notes[j-1 if j > 0 else 0].append(n)
+    items = [(float(edges[i]), '; '.join([f'{names[runs[i][0]]} -> {names[runs[i+1][0]]}'] + notes[i]), True)
+             for i in range(len(edges))]
+    items += [(first, 'start of recording', True), (last, 'end of recording', True)]
+
+    # (start, end, reason, value): value is the model's probability (worst one wins when merged),
+    # or seconds of logo, or a count of blanks (both added up)
+    other = []
+    if raw:
+        rt = np.array([t for (t,_) in raw], dtype='float64')
+        p = np.array([v for (_,v) in raw], dtype='float64')
+        idx = np.clip(np.searchsorted(starts, rt, 'right') - 1, 0, len(runs)-1)
+        brk = np.array([runs[i][0] == SceneType.COMMERCIAL for i in idx])
+        dnu = np.array([runs[i][0] == SceneType.DO_NOT_USE for i in idx])
+        doubt = (((p > REVIEW_UNSURE[0]) & (p < REVIEW_UNSURE[1])) | ((p >= 0.5) != brk)) & ~dnu
+        doubt &= np.abs(rt[:,None] - bounds[None,:]).min(axis=1) > REVIEW_EDGE_GAP
+        i = 0
+        while i < len(rt):
+            if not doubt[i]:
+                i += 1
+                continue
+            j = i
+            while j+1 < len(rt) and doubt[j+1] and idx[j+1] == idx[i]:
+                j += 1
+            seg = p[i:j+1]
+            # a second or two of mild doubt is everywhere; disagreeing with the tags is not
+            if j - i >= REVIEW_DOUBT_LEN - 1 or np.any((seg >= 0.5) != brk[i]):
+                if brk[i]:
+                    other.append((float(rt[i]), float(rt[j]) + 1, 'down', float(seg.min())))
+                else:
+                    other.append((float(rt[i]), float(rt[j]) + 1, 'up', float(seg.max())))
+            i = j + 1
+
+    for (on,(b,e)) in logo_spans:
+        k = runs[run_at(b)][0]
+        if run_at(b) != run_at(e) or not far(b):
+            continue
+        if not on and k == SceneType.SHOW and e - b >= REVIEW_LOGO_OFF:
+            other.append((float(b), float(e), 'logo off', float(e - b)))
+        elif on and k == SceneType.COMMERCIAL and e - b >= REVIEW_LOGO_ON:
+            other.append((float(b), float(e), 'logo on', float(e - b)))
+
+    # blanks inside show, away from edges; one fade can read as several blanks a few frames apart
+    events = []
+    for m in blank_mids:
+        if runs[run_at(m)][0] != SceneType.SHOW or not far(m):
+            continue
+        if events and m - events[-1] <= REVIEW_BLANK_SAME and run_at(m) == run_at(events[-1]):
+            continue
+        events.append(float(m))
+    group = []
+    for m in events + [None]:
+        if m is not None and (not group or (m - group[-1] <= REVIEW_BLANK_GAP and run_at(m) == run_at(group[0]))):
+            group.append(m)
+            continue
+        if len(group) >= REVIEW_BLANKS:
+            other.append((group[0], group[-1], 'blanks', float(len(group))))
+        group = [m]
+
+    merged = [] # [start, end, {reason: value}]
+    for (b, e, why, v) in sorted(other):
+        if merged and b - merged[-1][1] <= REVIEW_MERGE:
+            m = merged[-1]
+            m[1] = max(m[1], e)
+            if why not in m[2]:
+                m[2][why] = v
+            elif why == 'up':
+                m[2][why] = max(m[2][why], v)
+            elif why == 'down':
+                m[2][why] = min(m[2][why], v)
+            else:
+                m[2][why] += v
+        else:
+            merged.append([b, e, {why: v}])
+    fmt = {'up': lambda v: f'model up to {v*100:.0f}% in Show',
+           'down': lambda v: f'model down to {v*100:.0f}% in Break',
+           'logo off': lambda v: f'logo off {v:.0f}s in Show',
+           'logo on': lambda v: f'logo on {v:.0f}s in Break',
+           'blanks': lambda v: f'{v:.0f} blanks in Show'}
+    for (b, e, whys) in merged:
+        items.append((b, '; '.join(fmt[w](v) for (w,v) in whys.items()) + f' (over {e-b:.0f}s)', False))
+    return sorted(items)
+
 class Window(tk.Tk):
     def __init__(self, opts, video, flog):
         tk.Tk.__init__(self)
         self.title("pycommflag editor")
+        # Tk's own close would destroy the window without going through destroy() below
+        self.protocol('WM_DELETE_WINDOW', self.destroy)
         self.player = Player(video, no_deinterlace=True)
         # the main frames and the -5s/+5s thumbnails each get their own decoder, so they never
         # seek each other's position away (which is what makes small steps cheap)
@@ -34,6 +189,10 @@ class Window(tk.Tk):
         self.next_frame_time = 1/self.frame_rate
         self.settype = None
         self.setpos = 0
+        self.opts = opts
+        self.reviewed = [] # times of review stops already seen
+        self.review_at = None # the stop the review buttons last went to
+        self.review_cache = None
         
         self.logo = processor.read_logo(flog)
         self.spans = processor.read_feature_spans(flog)
@@ -163,38 +322,36 @@ class Window(tk.Tk):
         skips = tk.Frame(self)
         skips.grid(row=5, column=0, columnspan=5)
         self.misc.append(skips)
-        
-        b = tk.Button(skips, text="|< Break", command=lambda:self.prev('break'))
-        b.grid(row=0, column=0, padx=5)
-        self.misc.append(b)
 
-        b = tk.Button(skips, text="|< Blank", command=lambda:self.prev('blank'))
-        b.grid(row=0, column=1, padx=5)
-        self.misc.append(b)
+        # packed rather than gridded, so the review line below can't stretch the buttons apart
+        line = tk.Frame(skips)
+        line.pack()
+        for (text, cmd, pad) in (("|< Break", lambda:self.prev('break'), 5),
+                                 ("|< Blank", lambda:self.prev('blank'), 5),
+                                 ("|< Logo", lambda:self.prev('logo'), 5),
+                                 ("|< Diff", lambda:self.prev('diff'), (5,20)),
+                                 ("Diff >|", lambda:self.next('diff'), (20,5)),
+                                 ("Logo >|", lambda:self.next('logo'), 5),
+                                 ("Blank >|", lambda:self.next('blank'), 5),
+                                 ("Break >|", lambda:self.next('break'), 5)):
+            b = tk.Button(line, text=text, command=cmd)
+            b.pack(side=tk.LEFT, padx=pad)
+            self.misc.append(b)
 
-        b = tk.Button(skips, text="|< Logo", command=lambda:self.prev('logo'))
-        b.grid(row=0, column=2, padx=5)
-        self.misc.append(b)
+        line = tk.Frame(skips)
+        line.pack(pady=(5,0))
+        for (text, cmd) in (("|< Review", lambda:self.review(-1)),
+                            ("Contact sheet", lambda:self.sheet.show()),
+                            ("Review >|", lambda:self.review(1))):
+            b = tk.Button(line, text=text, command=cmd)
+            b.pack(side=tk.LEFT, padx=5)
+            self.misc.append(b)
+        # a fixed width, so the changing text can't widen the window
+        self.review_label = tk.Label(skips, width=100)
+        self.review_label.pack()
 
-        b = tk.Button(skips, text="|< Diff", command=lambda:self.prev('diff'))
-        b.grid(row=0, column=3, padx=(5,10))
-        self.misc.append(b)
-
-        b = tk.Button(skips, text="Diff >|", command=lambda:self.next('diff'))
-        b.grid(row=0, column=5, padx=(10,5))
-        self.misc.append(b)
-
-        b = tk.Button(skips, text="Logo >|", command=lambda:self.next('logo'))
-        b.grid(row=0, column=6, padx=5)
-        self.misc.append(b)
-        
-        b = tk.Button(skips, text="Blank >|", command=lambda:self.next('blank'))
-        b.grid(row=0, column=7, padx=5)
-        self.misc.append(b)
-        
-        b = tk.Button(skips, text="Break >|", command=lambda:self.next('break'))
-        b.grid(row=0, column=8, padx=5)
-        self.misc.append(b)
+        self.bind('n', lambda e:self.review(1))
+        self.bind('p', lambda e:self.review(-1))
         
         tags = tk.Frame(self)
         tags.grid(row=6, column=0, columnspan=5)
@@ -206,9 +363,6 @@ class Window(tk.Tk):
 
         self.taggers.append((tk.Button(tags), SceneType.COMMERCIAL, 'Break'))
         self.taggers.append((tk.Button(tags), SceneType.SHOW, 'Show'))
-        #self.taggers.append((tk.Button(tags), SceneType.TRANSITION, 'Transition'))
-        self.taggers.append((tk.Button(tags), SceneType.INTRO, 'Intro'))
-        self.taggers.append((tk.Button(tags), SceneType.CREDITS, 'Credits'))
         self.taggers.append((tk.Button(tags), SceneType.DO_NOT_USE, 'Ignore'))
 
         c = 0
@@ -249,6 +403,15 @@ class Window(tk.Tk):
         self.info = tk.Label(self, text=f'File: {video}; Length:{self.duration/60.0:0.1f} mins; {float(self.frame_rate)} fps')
         self.info.grid(row=10, column=0, sticky="se", columnspan=5)
 
+        # extraction before 2026-10-23 timed the audio from the audio stream's own start, so in a log
+        # without audio_shift every audio column is late (0.2-1s); training on it as-is teaches that
+        if 'audio_shift' not in flog and 'fvol' in flog.get('frames_header', ()):
+            msg = (f"This log's audio is late (it has no audio_shift). Before training on it, close this and run "
+                   f"tools/repair_audio_shift.py {getattr(opts, 'gui', None) or 'on the log'} (it keeps the tags).")
+            log.warning(msg)
+            tk.Label(self, text=msg, bg='red', fg='white',
+                     wraplength=self.map_width, pady=4).grid(row=0, column=0, columnspan=5, sticky='we')
+
         limg = logo_finder.toimage(self.logo)
         if limg:
             self.misc.append(limg)
@@ -282,9 +445,60 @@ class Window(tk.Tk):
         self.vMapPos = None
         self.vMaybe = None
         self.tag_canvas_items = []
+        self.sheet = _ContactSheet(self, video)
         self.drawMap()
 
         self.move(abs=0)
+
+    def _review_items(self):
+        # recomputed only when the tags change
+        if self.review_cache is None:
+            self.review_cache = review_items(self.tags, self.raw, self.logo_spans if self.logo else [],
+                                             self.blank_mids, self.opts)
+        return self.review_cache
+
+    def _is_reviewed(self, t):
+        return any(math.fabs(r - t) <= REVIEW_TOL for r in self.reviewed)
+
+    def _mark_reviewed(self, t):
+        if not self._is_reviewed(t):
+            self.reviewed.append(t)
+
+    def review(self, step):
+        """Go to the next review stop not yet seen (step 1), or to the previous stop (step -1)."""
+        items = self._review_items()
+        if step > 0:
+            # leaving a stop is what marks it seen: the one the buttons went to, unless we've
+            # wandered well away from it since, and any we happen to be sitting on
+            if self.review_at is not None and math.fabs(self.review_at - self.position) <= 60:
+                self._mark_reviewed(self.review_at)
+            for (t,_,_) in items:
+                if math.fabs(t - self.position) <= REVIEW_TOL:
+                    self._mark_reviewed(t)
+            todo = [t for (t,_,_) in items if not self._is_reviewed(t)]
+            ahead = [t for t in todo if t > self.position + REVIEW_TOL]
+            # past the last one, go back round for any skipped over
+            target = ahead[0] if ahead else todo[0] if todo else None
+        else:
+            behind = [t for (t,_,_) in items if t < self.position - REVIEW_TOL]
+            target = behind[-1] if behind else None
+        self.review_at = target
+        if target is not None:
+            self.move(abs=target)
+        else:
+            self.updatePosIndicators()
+        self.drawReviewMarks()
+
+    def updateReview(self):
+        items = self._review_items()
+        done = sum(1 for (t,_,_) in items if self._is_reviewed(t))
+        here = [why for (t,why,_) in items if math.fabs(t - self.position) <= REVIEW_TOL]
+        text = f'Review: {done} of {len(items)} seen'
+        if done == len(items):
+            text += ' (all done)'
+        if here:
+            text += ' -- ' + '; '.join(here)
+        self.review_label.configure(text=text)
     
     def _targets(self, key):
         """Where the |< and >| buttons for `key` jump to, in order."""
@@ -367,6 +581,8 @@ class Window(tk.Tk):
     def updatePosIndicators(self):
         self.pos_label.configure(text=f'{int(self.position/60):02}:{self.position%60:06.03f}')
         self.updateInfo()
+        self.updateReview()
+        self.sheet.update_position()
         
         self.scale_pos.set(self.position/60) #self.scroller.set(self.position/60)
         x = math.ceil(self.position / (self.duration / self.map_width))
@@ -532,6 +748,22 @@ class Window(tk.Tk):
             if color is not None:
                 self.vMaybe = self.mapCanvas.create_rectangle(0, 0, 0, self.map_height, width=0, fill=color, stipple='gray50')
 
+        self.review_cache = None
+        self.drawReviewMarks()
+        self.sheet.recolor()
+
+    def drawReviewMarks(self):
+        # a tick at the top of the tags row for each review stop, orange until it has been seen
+        self.mapCanvas.delete('review')
+        sec_per_pix = self.duration / self.map_width
+        for (t,_,_) in self._review_items():
+            x = math.floor(t / sec_per_pix)
+            self.mapCanvas.create_line(x, 0, x, self.map_height/12, width=2, tags=('review',),
+                                       fill='grey40' if self._is_reviewed(t) else 'orange')
+        if self.vMapPos is not None:
+            self.mapCanvas.tag_raise(self.vMapPos)
+        self.sheet.mark_review()
+
     def drawMap(self):
         for x in self.mapCanvas.find_all():
             self.mapCanvas.delete(x)
@@ -629,6 +861,10 @@ class Window(tk.Tk):
             
             # and now replace all of that stuff with this new tag
             self.tags[b:e] = [(settype, (startpos, endpos))]
+
+            # the edges just placed by hand need no review
+            self._mark_reviewed(self.setpos)
+            self._mark_reviewed(self.position)
             
         self.settype = None
         self.setpos = 0
@@ -668,9 +904,195 @@ class Window(tk.Tk):
         print('RESULT', self.result)
         self.destroy()
 
+    def destroy(self):
+        # however the window goes (Save, the window manager's close), nothing may be left pending
+        if getattr(self, 'sheet', None) is not None:
+            self.sheet.close()
+        if getattr(self, 'thumb_job', None) is not None:
+            self.after_cancel(self.thumb_job)
+            self.thumb_job = None
+        tk.Tk.destroy(self)
+
     def run(self):
         tk.mainloop()
         return self.result
+
+    def tag_at(self, t):
+        """The tag type at time `t`."""
+        i = bisect.bisect_right([b for (_,(b,_)) in self.tags], t) - 1
+        return self.tags[max(0, i)][0] if self.tags else SceneType.SHOW
+
+class _ContactSheet:
+    """A window of one thumbnail every SHEET_STEP seconds of the whole recording, each framed in the
+    colour of its tag with the model's highest commercial probability in it as a bar underneath;
+    clicking one moves the editor there.  A run of ads stands out from the show at a glance, which
+    is the quick way to find a break the tags miss altogether."""
+
+    LABEL_W = 50
+    CELL_W = SHEET_THUMB[0] + 8
+    CELL_H = SHEET_THUMB[1] + 14
+
+    def __init__(self, win, video):
+        self.win = win
+        self.video = video
+        self.n = max(1, int(math.ceil(win.duration / SHEET_STEP)))
+        self.times = [k*SHEET_STEP for k in range(self.n)] # each thumbnail's time, once it is decoded
+        self.photos = [None]*self.n
+        self.prob = [0.0]*self.n
+        for (t,v) in win.raw:
+            k = int(t // SHEET_STEP)
+            if 0 <= k < self.n:
+                self.prob[k] = max(self.prob[k], float(v))
+        self.top = None
+        self.canvas = None
+        self.frames = {} # canvas item ids, per slot
+        self.cursor = None
+        self.done = queue.Queue()
+        self.stop = threading.Event()
+        self.poll_job = None
+
+    def _start(self):
+        # decoding waits for the window to be asked for
+        threading.Thread(target=self._decode, daemon=True).start()
+        self.poll_job = self.win.after(100, self._poll)
+
+    def _decode(self):
+        # its own Player, on this thread; seeking to each slot and decoding just the keyframe
+        # there is far cheaper than decoding the recording through
+        try:
+            player = Player(self.video, no_deinterlace=True)
+            player._skip_frames('NONKEY')
+            vt_start = float(player.vt_start)
+            for k in range(self.n):
+                if self.stop.is_set():
+                    return
+                # in a .ts this lands on the first keyframe after the slot's start, a GOP into it
+                player.seek(k*SHEET_STEP)
+                frames = player.frames()
+                try:
+                    f = next(frames, None)
+                finally:
+                    frames.close()
+                if f is None or f.time is None:
+                    continue
+                self.done.put((k, f.time - vt_start, f.to_image(width=SHEET_THUMB[0], height=SHEET_THUMB[1])))
+        except Exception:
+            log.exception('contact sheet decoding failed')
+
+    def close(self):
+        # a pending after() whose window is destroyed fails with "invalid command name" when it fires
+        self.stop.set()
+        if self.poll_job is not None:
+            self.win.after_cancel(self.poll_job)
+            self.poll_job = None
+
+    def _poll(self):
+        self.poll_job = None
+        try:
+            while True:
+                (k, t, img) = self.done.get_nowait()
+                self.times[k] = t
+                self.photos[k] = ImageTk.PhotoImage(img)
+                if self.canvas is not None:
+                    self.canvas.itemconfigure(self.frames[k]['img'], image=self.photos[k])
+                    self._color(k)
+        except queue.Empty:
+            pass
+        except tk.TclError:
+            return # the editor has gone
+        if not self.stop.is_set():
+            self.poll_job = self.win.after(200, self._poll)
+
+    def _xy(self, k):
+        return (self.LABEL_W + (k % SHEET_COLS) * self.CELL_W, (k // SHEET_COLS) * self.CELL_H)
+
+    def show(self):
+        if self.top is not None:
+            self.top.deiconify()
+            self.top.lift()
+            return
+        self._start()
+        self.top = tk.Toplevel(self.win)
+        self.top.title('pycommflag contact sheet')
+        self.top.protocol('WM_DELETE_WINDOW', self.top.withdraw)
+        rows = int(math.ceil(self.n / SHEET_COLS))
+        width = self.LABEL_W + SHEET_COLS * self.CELL_W
+        height = rows * self.CELL_H
+        self.canvas = tk.Canvas(self.top, width=width, height=min(height, 900), scrollregion=(0, 0, width, height),
+                                yscrollincrement=self.CELL_H)
+        bar = tk.Scrollbar(self.top, orient=tk.VERTICAL, command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=bar.set)
+        self.canvas.grid(row=0, column=0, sticky='nswe')
+        bar.grid(row=0, column=1, sticky='ns')
+        self.top.rowconfigure(0, weight=1)
+        self.canvas.bind('<Button-1>', self._click)
+        self.canvas.bind('<Button-4>', lambda e: self.canvas.yview_scroll(-1, 'units'))
+        self.canvas.bind('<Button-5>', lambda e: self.canvas.yview_scroll(1, 'units'))
+        self.canvas.bind('<MouseWheel>', lambda e: self.canvas.yview_scroll(-1 if e.delta > 0 else 1, 'units'))
+        self.top.bind('n', lambda e: self.win.review(1))
+        self.top.bind('p', lambda e: self.win.review(-1))
+
+        (tw, th) = SHEET_THUMB
+        for r in range(rows):
+            m = r * SHEET_COLS * SHEET_STEP / 60
+            self.canvas.create_text(self.LABEL_W - 6, r * self.CELL_H + 4, anchor='ne', text=f'{int(m)}:{int(m*60)%60:02}')
+        for k in range(self.n):
+            (x, y) = self._xy(k)
+            ids = {}
+            ids['frame'] = self.canvas.create_rectangle(x+1, y+1, x+tw+7, y+th+7, width=0)
+            ids['img'] = self.canvas.create_image(x+4, y+4, anchor='nw')
+            if self.photos[k] is not None:
+                self.canvas.itemconfigure(ids['img'], image=self.photos[k])
+            ids['prob'] = self.canvas.create_rectangle(x+4, y+th+9, x+4+max(1, round(self.prob[k]*tw)), y+th+12,
+                                                        width=0, fill='darkred')
+            ids['review'] = self.canvas.create_oval(x+tw-4, y+6, x+tw+2, y+12, width=0, fill='orange', state='hidden')
+            self.frames[k] = ids
+        self.cursor = self.canvas.create_rectangle(0, 0, 0, 0, outline='orange', width=3)
+        self.recolor()
+        self.mark_review()
+        self.update_position()
+
+    def _click(self, e):
+        x = self.canvas.canvasx(e.x) - self.LABEL_W
+        y = self.canvas.canvasy(e.y)
+        if x < 0:
+            return
+        k = int(y // self.CELL_H) * SHEET_COLS + int(x // self.CELL_W)
+        if 0 <= k < self.n and int(x // self.CELL_W) < SHEET_COLS:
+            self.win.move(abs=self.times[k])
+
+    def _color(self, k):
+        c = SceneType.color_map().get(self.win.tag_at(self.times[k] + 0.5))
+        self.canvas.itemconfigure(self.frames[k]['frame'], fill=c if c is not None else 'grey50')
+
+    def recolor(self):
+        if self.canvas is None:
+            return
+        for k in range(self.n):
+            self._color(k)
+
+    def mark_review(self):
+        # a dot on each thumbnail holding a review stop not seen yet
+        if self.canvas is None:
+            return
+        todo = set()
+        for (t,_,_) in self.win._review_items():
+            if not self.win._is_reviewed(t):
+                todo.add(int(t // SHEET_STEP))
+        for k in range(self.n):
+            self.canvas.itemconfigure(self.frames[k]['review'], state='normal' if k in todo else 'hidden')
+
+    def update_position(self):
+        if self.canvas is None:
+            return
+        k = min(self.n - 1, max(0, int(self.win.position // SHEET_STEP)))
+        (x, y) = self._xy(k)
+        self.canvas.coords(self.cursor, x, y, x + self.CELL_W - 1, y + self.CELL_H - 1)
+        # keep it in view
+        height = int(math.ceil(self.n / SHEET_COLS)) * self.CELL_H
+        (top, bottom) = self.canvas.yview()
+        if y < top * height or y + self.CELL_H > bottom * height:
+            self.canvas.yview_moveto(max(0, (y - (bottom - top) * height / 2) / height))
 
 class _Cursor:
     """Decoded frames around a position in a Player, decoding forward rather than seeking when it can."""

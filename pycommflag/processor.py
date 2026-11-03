@@ -28,6 +28,18 @@ def read_feature_log(feature_log_file:str|TextIO|dict|gzip.GzipFile) -> dict:
         feature_log_file.seek(0)
     return json.load(feature_log_file)
 
+def set_header_key(flog:dict, key:str, value, after:str='filename') -> dict:
+    """A copy of flog with `key` set and placed just after `after`, so it is written within the
+    file's first lines (write_feature_log keeps the dict's order), where picker.read_header looks."""
+    out = {} if after in flog else {key: value}
+    for (k,v) in flog.items():
+        if k == key:
+            continue
+        out[k] = v
+        if k == after:
+            out[key] = value
+    return out
+
 def write_feature_log(flog:dict, log_file:str|TextIO|gzip.GzipFile):
 
     class FancyEncoder(json.JSONEncoder):

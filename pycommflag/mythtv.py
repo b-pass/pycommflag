@@ -108,6 +108,16 @@ def _probe_video(filename)->tuple[float|None,float]:
         log.exception(f"Could not probe '{filename}'")
         return (None, 0)
 
+def list_recordings()->list[tuple]|None:
+    """(chanid, starttime, title, subtitle, basename, recgroup) for every recording, or None
+    without MythTV.  starttime is UTC, as the database keeps it."""
+    conn = _open()
+    if conn is None:
+        return None
+    with conn.cursor() as c:
+        c.execute("SELECT chanid, starttime, title, subtitle, basename, recgroup FROM recorded")
+        return list(c.fetchall())
+
 def get_breaks(chanid, starttime)->list[tuple[float,float]]:
     marks = []
     filename = None
