@@ -80,7 +80,7 @@ MIN_LR = 0.00001
 F         = 48 # TCN filter count
 K         = 5  # TCN kernel size
 DILATIONS = [1, 2, 4, 8] # TCN dilation schedule
-DROPOUT   = 0.3
+DROPOUT   = 0.25
 START_DROP= 0.25
 TCN_DROP  = 0.15
 
