@@ -8,6 +8,8 @@ logs don't record either start, so the offset comes from one of:
 
   probe     the log's video still exists: its stream start times, read the way Player
             reads them, which is exactly what the fixed extractor corrects for
+  probe-mkv the same, from the .mkv the .ts was transcoded to (the transcode keeps the
+            streams' relative start, but whether exactly hasn't been checked)
   estimate  the log itself: at break boundaries the picture goes black and the sound
             goes quiet together, so the lag that best lines up blank frames with low
             volume is the offset (within 0.1s of the probe on 93% of 1197 recordings,
@@ -118,10 +120,14 @@ def channel_offset(flog:dict) -> float|None:
 def choose_shift(flog:dict, frames:np.ndarray) -> tuple[float, str, str]:
     est, why = estimate(frames, flog.get('frame_rate', 29.97))
     est_ok = est is not None and PLAUSIBLE[0] <= est <= PLAUSIBLE[1]
-    prb = probe(flog.get('filename'))
-    note = f"estimate={why or f'{est:+.3f}'} probe={'none' if prb is None else f'{prb:+.3f}'}"
+    fn = flog.get('filename') or ''
+    prb, src = probe(fn), 'probe'
+    if prb is None and fn.endswith('.ts'):
+        prb, src = probe(fn[:-3] + '.mkv'), 'probe-mkv'
+    shown = 'none' if prb is None else f"{prb:+.3f}{' (mkv)' if src == 'probe-mkv' else ''}"
+    note = f"estimate={why or f'{est:+.3f}'} probe={shown}"
     if prb is not None and (not est_ok or abs(prb - est) <= PROBE_TRUST) and PLAUSIBLE[0] <= prb <= PLAUSIBLE[1]:
-        return prb, 'probe', note
+        return prb, src, note
     if est_ok:
         return est, 'estimate', note
     ch = channel_offset(flog)

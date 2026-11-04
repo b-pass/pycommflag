@@ -3,7 +3,7 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' # shut up, tf
 
 import logging as log
 import gc
-from math import ceil, floor, isqrt
+from math import ceil, isqrt
 from queue import Empty as QueueEmpty
 from multiprocessing import Process, Queue
 
@@ -71,15 +71,16 @@ DIFF_THRESHOLD = 15.0
 
 # training params
 MTYPE = ''
-EPOCHS = 50
+EPOCHS = 40 # always all of them: the cosine LR reaches MIN_LR only on the last one
 BATCH_SIZE = 64
 TEST_PERC = 0.25
-PATIENCE = max(floor(EPOCHS * .2), 3) # early stopping; at least 3 so the LR cut (2+ epochs) can come first
+MAX_LR = 0.001
+MIN_LR = 0.00001
 
 F         = 48 # TCN filter count
 K         = 5  # TCN kernel size
 DILATIONS = [1, 2, 4, 8] # TCN dilation schedule
-DROPOUT   = 0.25
+DROPOUT   = 0.35
 START_DROP= 0.25
 TCN_DROP  = 0.15
 
@@ -804,12 +805,20 @@ def train(opts:Any=None):
     
     epoch = 0
 
-    #model_path = '/tmp/x.keras'
-    #epoch = 10
+    #model_path = '/tmp/train-bxjn6htw.pycf.model.keras'
+    #epoch = 16
+
+    # the best epoch goes to model_path, the latest to last_path, which is what a resume continues from
+    last_path = model_path[:-len('.keras')] + '.last.keras'
 
     model:keras.models.Model = None
+    best_val = None
     if epoch > 0:
-        model = keras.models.load_model(model_path)
+        if test is not None:
+            # a fresh ModelCheckpoint would otherwise overwrite the best epoch with the first resumed one
+            best_val = keras.models.load_model(model_path).evaluate(test, verbose=0, return_dict=True)['weighted_accuracy']
+            print(f"Resuming at epoch {epoch}, best val_weighted_accuracy so far {best_val:.5f}")
+        model = keras.models.load_model(last_path if os.path.exists(last_path) else model_path)
     else:
         model = build_model(data.shape)
         model.summary()
@@ -823,35 +832,33 @@ def train(opts:Any=None):
 
     cb = []
 
-    cb.append(callbacks.EarlyStopping(monitor='val_weighted_accuracy', mode="max", patience=PATIENCE, restore_best_weights=True))
-
+    # Warmup, then one cosine from MAX_LR down to MIN_LR on the last epoch. No early stopping or
+    # ReduceLROnPlateau: epoch-to-epoch val noise (~1e-3) triggered both, so most runs stopped, and
+    # had their best epoch picked, while the LR was still at 20-90% of MAX_LR.
     def cosine_annealing_with_warmup(epoch, lr):
         WARMUP = min(max(EPOCHS//12, 1), 4) # 1-4 epochs
-        TOTAL = ceil(EPOCHS * .75)
-        MAX_LR = 0.001
-        MIN_LR = 0.00001 # Set your true floor here
-        
         if epoch < WARMUP:
             return MAX_LR * (epoch + 1) / WARMUP
-        
-        progress = min(1.0, (epoch - WARMUP) / (TOTAL - WARMUP))
-        return min(lr, MIN_LR + (MAX_LR - MIN_LR) * 0.5 * (1 + np.cos(np.pi * progress)))
+        progress = min(1.0, (epoch - WARMUP) / max(EPOCHS - 1 - WARMUP, 1))
+        return MIN_LR + (MAX_LR - MIN_LR) * 0.5 * (1 + np.cos(np.pi * progress))
     
     cb.append(callbacks.LearningRateScheduler(cosine_annealing_with_warmup))
-    # 2+ epochs (3+ where PATIENCE allows), so it doesn't react to every noisy one, but always short of
-    # PATIENCE, or early stopping would end training before the LR was ever cut
-    cb.append(callbacks.ReduceLROnPlateau(monitor='val_weighted_accuracy', mode="max", patience=max(min(max(PATIENCE-5, 5), PATIENCE-1), 2), factor=0.5))
     
     class EpochModelCheckpoint(callbacks.ModelCheckpoint):
         def on_epoch_end(self, epoch, logs=None):
             self.last_epoch = epoch
             return super().on_epoch_end(epoch, logs)
 
-    ecp = EpochModelCheckpoint(model_path, monitor='val_weighted_accuracy', mode="max", verbose=1, save_best_only=True)
+    ecp = EpochModelCheckpoint(model_path, monitor='val_weighted_accuracy', mode="max", verbose=1, save_best_only=True,
+                               initial_value_threshold=best_val)
     cb.append(ecp)
+    cb.append(callbacks.ModelCheckpoint(last_path))
 
+    interrupted = False
     def handler(signum, frame):
+        nonlocal interrupted
         print("\nStopping (gracefully)...\n")
+        interrupted = True
         model.stop_training = True
         signal.signal(signal.SIGINT, oldsint)
         signal.signal(signal.SIGTERM, oldterm)
@@ -861,6 +868,8 @@ def train(opts:Any=None):
 
     # no class weights with Focal loss: , class_weight={0:0.65, 1:1/0.65}
     model.fit(data, validation_data=test, epochs=EPOCHS, initial_epoch=epoch, callbacks=cb)
+    if not interrupted and os.path.exists(last_path):
+        os.unlink(last_path) # kept after an interrupt, to resume from
 
     print()
     print("Done")
