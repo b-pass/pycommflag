@@ -151,6 +151,7 @@ def _edit(opts, log:str, video:str|None) -> int:
     w = gui.Window(opts=opts, video=opts.filename, flog=flog)
     res = w.run()
     if res is None:
+        _print_log_fixes(flog, log)
         return 1
 
     flog['tags'] = res
@@ -159,7 +160,17 @@ def _edit(opts, log:str, video:str|None) -> int:
     processor.write_feature_log(flog, opts.feature_log)
     # the humans rename hand-edited logs into the training data, so they need to know which file it was
     print(f'Saved {os.path.abspath(opts.feature_log)}')
-    return 1 if output(opts, res, flog) is False else 0
+    ok = output(opts, res, flog) is not False
+    _print_log_fixes(flog, opts.feature_log)
+    return 0 if ok else 1
+
+
+def _print_log_fixes(flog:dict, path:str) -> None:
+    """Last on the terminal, where it can be copied: the command for any tools the log still needs."""
+    from .gui import log_fixes
+    problems, cmd = log_fixes(flog, path)
+    if cmd:
+        print(f"This log: {'; '.join(problems)}. To fix it, run:\n{cmd}")
 
 
 def _cmd_reprocess(opts) -> int:

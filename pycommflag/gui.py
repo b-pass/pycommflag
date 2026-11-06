@@ -34,6 +34,27 @@ SHEET_STEP = 10 # seconds per thumbnail
 SHEET_COLS = 12 # thumbnails per row, so a row is two minutes
 SHEET_THUMB = (96, 54)
 
+def log_fixes(flog:dict, path:str) -> tuple[list[str], str|None]:
+    """What the log at `path` is missing that a tool in tools/ can add, and a shell command (with the
+    python running this, so it works from the same venv) that runs those tools on it, or None."""
+    import os, shlex, sys
+    tools = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'tools')
+    header = flog.get('frames_header', ())
+    problems, cmds = [], []
+    # extraction before 2026-10-23 timed the audio from the audio stream's own start, so in a log
+    # without audio_shift every audio column is late (0.2-1s); training on it as-is teaches that
+    if 'audio_shift' not in flog and 'fvol' in header:
+        problems.append("its audio is late (no audio_shift): repair it before training on it")
+        cmds.append('repair_audio_shift.py')
+    # logs before file_version 11 have no captions; they can be added from the video in seconds
+    if header and 'cc_text' not in header:
+        problems.append("it has no caption data (no cc_text)")
+        cmds.append('add_cc_text.py')
+    if not cmds:
+        return problems, None
+    q = shlex.quote
+    return problems, ' && '.join(f'{q(sys.executable)} {q(os.path.join(tools, c))} {q(os.path.abspath(path))}' for c in cmds)
+
 def _review_kind(t):
     # intro and credits train as show (see load_nonpersistent), so the queue counts them as show
     if isinstance(t, int):
@@ -403,14 +424,20 @@ class Window(tk.Tk):
         self.info = tk.Label(self, text=f'File: {video}; Length:{self.duration/60.0:0.1f} mins; {float(self.frame_rate)} fps')
         self.info.grid(row=10, column=0, sticky="se", columnspan=5)
 
-        # extraction before 2026-10-23 timed the audio from the audio stream's own start, so in a log
-        # without audio_shift every audio column is late (0.2-1s); training on it as-is teaches that
-        if 'audio_shift' not in flog and 'fvol' in flog.get('frames_header', ()):
-            msg = (f"This log's audio is late (it has no audio_shift). Before training on it, close this and run "
-                   f"tools/repair_audio_shift.py {getattr(opts, 'gui', None) or 'on the log'} (it keeps the tags).")
-            log.warning(msg)
-            tk.Label(self, text=msg, bg='red', fg='white',
-                     wraplength=self.map_width, pady=4).grid(row=0, column=0, columnspan=5, sticky='we')
+        # the tools rewrite the log, and saving here would write back the copy loaded before they ran,
+        # so they have to wait until this closes
+        problems, cmd = log_fixes(flog, opts.feature_log or '')
+        if cmd:
+            msg = f"This log: {'; '.join(problems)}. Close this, then run (the tags are kept):"
+            log.warning(f'{msg}\n{cmd}')
+            bg = 'red' if 'repair_audio_shift' in cmd else 'dark orange'
+            banner = tk.Frame(self, bg=bg)
+            banner.grid(row=0, column=0, columnspan=5, sticky='we')
+            tk.Label(banner, text=msg, bg=bg, fg='white', wraplength=self.map_width, pady=2).pack(fill='x')
+            # an Entry rather than a Label, so the command can be selected and copied
+            cmdvar = tk.StringVar(value=cmd)
+            self.misc.append(cmdvar)
+            tk.Entry(banner, textvariable=cmdvar, state='readonly', relief=tk.FLAT).pack(fill='x', padx=4, pady=(0, 4))
 
         limg = logo_finder.toimage(self.logo)
         if limg:

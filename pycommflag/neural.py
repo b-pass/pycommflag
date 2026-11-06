@@ -21,7 +21,7 @@ from .feature_span import *
 from . import processor
 from . import neural
 
-SEED = int(os.environ.get('PYCF_SEED', 171112))
+SEED = int(os.environ.get('PYCF_SEED', 121711))
 
 # array indexes
 NORMTIME = 0
