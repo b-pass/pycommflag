@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Bring old feature logs up to date: the .mkv offset, the audio timing and the captions.
+"""Bring old feature logs up to date: the .mkv's lag, the audio timing and the captions.
 
 Each step is skipped when the log already has what it adds, so this can be run on any log.  The
 log is read once and rewritten once (in place, same compression and permissions).
 
-offset   (`mkv_offset`, `mkv_offset_from`) When the log's own video is gone and only the .mkv it
+mkv-lag  (`mkv_lag`, `mkv_lag_from`) When the log's own video is gone and only the .mkv it
          was transcoded to is left: how far the .mkv's clock is behind the log's (see
          pycommflag/timeline.py).  The other steps need it whenever they read the .mkv, and the
          editor and the outputs read it instead of measuring again.
@@ -17,8 +17,8 @@ audio    (`audio_shift`, `audio_shift_from`) Before 2026-10-23 extraction timed 
 
   probe     the log's video still exists: its stream start times, read the way Player reads
             them, which is exactly what the fixed extractor corrects for
-  probe-mkv the same, from the .mkv, less the .mkv's offset (its audio is the original's,
-            copied, but its video starts at the first keyframe; without a measured offset
+  probe-mkv the same, from the .mkv, less the .mkv's lag (its audio is the original's,
+            copied, but its video starts at the first keyframe; without a measured lag
             the .mkv isn't used)
   estimate  the log itself: at break boundaries the picture goes black and the sound goes
             quiet together, so the lag that best lines up blank frames with low volume is
@@ -48,12 +48,12 @@ cc       (`cc_text`, `cc_text_from`) Logs before file_version 11 have no caption
          timestamp is a frame's (checked identical to an extraction's cc_text on H.264 and
          MPEG-2, 29.97 and 59.94), and a packet with no frame (one the decoder dropped) counts
          for nothing; `cc_text_from` is `packets`.  From the .mkv (`packets-mkv`), a packet
-         counts for the frame shown at its time, less the offset: 10s totals then match an
+         counts for the frame shown at its time, plus the lag: 10s totals then match an
          extraction's within ~1%, also through a 29.97 -> 59.94 transcode.  Sets file_version
          11.  --redo-cc counts them again, for logs whose captions came from an .mkv before
-         the offset was applied.
+         the lag was applied.
 
-    tools/upgrade_log.py [--dry-run] [--only offset|audio|cc]... [--redo-from BACKUP_DIR] [--redo-cc] LOG...
+    tools/upgrade_log.py [--dry-run] [--only mkv-lag|audio|cc]... [--redo-from BACKUP_DIR] [--redo-cc] LOG...
 """
 import argparse
 import glob
@@ -66,7 +66,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from pycommflag import processor, timeline
 
-STEPS = ('offset', 'audio', 'cc')
+STEPS = ('mkv-lag', 'audio', 'cc')
 
 # --- audio ----------------------------------------------------------------------------------
 
@@ -137,9 +137,9 @@ def channel_offset(flog:dict) -> float|None:
         _channel_offsets[(d, ch)] = float(np.median(offs)) if len(offs) >= 3 else None
     return _channel_offsets[(d, ch)]
 
-def choose_shift(flog:dict, frames:np.ndarray, video:str|None, offset:float|None) -> tuple[float, str, str]:
+def choose_shift(flog:dict, frames:np.ndarray, video:str|None, lag:float|None) -> tuple[float, str, str]:
     """(shift, source, note) for a log whose video is `video` (its own, its .mkv, or None),
-    `offset` seconds behind it (None if unknown)."""
+    `lag` seconds behind it (None if unknown)."""
     est, why = estimate(frames, flog.get('frame_rate', 29.97))
     est_ok = est is not None and PLAUSIBLE[0] <= est <= PLAUSIBLE[1]
     prb, src, shown = None, 'probe', 'none'
@@ -148,11 +148,11 @@ def choose_shift(flog:dict, frames:np.ndarray, video:str|None, offset:float|None
         shown = 'none' if prb is None else f'{prb:+.3f}'
     elif video:
         src = 'probe-mkv'
-        if offset is None:
-            shown = 'mkv offset unknown'
+        if lag is None:
+            shown = 'mkv lag unknown'
         elif (raw := probe(video)) is not None:
-            prb = raw - offset
-            shown = f'{prb:+.3f} (mkv {raw:+.3f} less its offset)'
+            prb = raw - lag
+            shown = f'{prb:+.3f} (mkv {raw:+.3f} less its lag)'
     note = f"estimate={why or f'{est:+.3f}'} probe={shown}"
     if prb is not None and (not est_ok or abs(prb - est) <= PROBE_TRUST) and PLAUSIBLE[0] <= prb <= PLAUSIBLE[1]:
         return prb, src, note
@@ -199,7 +199,7 @@ def _body(flog:dict) -> list:
     rows = flog['frames']
     return rows[1:] if rows and rows[0] is None else rows
 
-def repair_audio(flog:dict, path:str, video:str|None, offset:float|None, redo_from:str|None=None) -> tuple[dict, str, bool]:
+def repair_audio(flog:dict, path:str, video:str|None, lag:float|None, redo_from:str|None=None) -> tuple[dict, str, bool]:
     """(the log, what happened, whether it changed); the log's frames are changed in place."""
     if redo_from is None:
         if 'audio_shift' in flog:
@@ -218,7 +218,7 @@ def repair_audio(flog:dict, path:str, video:str|None, offset:float|None, redo_fr
     body, obody = _body(flog), _body(orig)
     if obody is not body and [r[0] for r in body] != [r[0] for r in obody]:
         return flog, "skip (frame times differ from the original's)", False
-    shift, source, note = choose_shift(orig, np.array([r[:10] for r in obody], dtype='float64'), video, offset)
+    shift, source, note = choose_shift(orig, np.array([r[:10] for r in obody], dtype='float64'), video, lag)
     shift = round(shift, 4)  # applied exactly as recorded
     was = f" (was {flog['audio_shift']:+.3f} from {flog.get('audio_shift_from')})" if redo_from else ''
     msg = f"shift {shift:+.3f}s from {source}{was} ({note})"
@@ -300,7 +300,7 @@ def assign(row_times:np.ndarray, times:np.ndarray, counts:np.ndarray, exact:bool
     hit[idx[ok]] = True
     return out, float(hit.mean()) if len(hit) else 0.0
 
-def add_cc(flog:dict, video:str|None, offset:float|None, redo:bool=False) -> tuple[dict, str, bool]:
+def add_cc(flog:dict, video:str|None, lag:float|None, redo:bool=False) -> tuple[dict, str, bool]:
     """(the log, what happened, whether it changed); the log's frames are changed in place."""
     header = list(flog.get('frames_header', []))
     if 'cc_text' in header and not redo:
@@ -310,7 +310,7 @@ def add_cc(flog:dict, video:str|None, offset:float|None, redo:bool=False) -> tup
     if video is None:
         return flog, f"skip (no video: {flog.get('filename')})", False
     exact = timeline.same_video(flog, video)
-    if not exact and offset is None:
+    if not exact and lag is None:
         return flog, f'skip (where the log falls in {os.path.basename(video)} is unknown)', False
 
     body = _body(flog)
@@ -318,9 +318,9 @@ def add_cc(flog:dict, video:str|None, offset:float|None, redo:bool=False) -> tup
     row_times = np.array([r[0] for r in body], dtype='float64')
     times, counts = read_packets(video)
     if not exact:
-        times = times + offset  # into the log's time
+        times = times + lag  # into the log's time
     cc, matched = assign(row_times, times, counts, exact, flog.get('frame_rate', 29.97))
-    how = 'own video' if exact else f'{os.path.basename(video)}, {offset:+.3f}s'
+    how = 'own video' if exact else f'{os.path.basename(video)}, {lag:+.3f}s'
     msg = f'{cc.sum()} chars on {np.count_nonzero(cc)} of {len(cc)} frames, {matched:.1%} matched ({how})'
     if matched < MIN_MATCHED:
         return flog, f'skip (only {msg}; not this log\'s video?)', False
@@ -333,7 +333,7 @@ def add_cc(flog:dict, video:str|None, offset:float|None, redo:bool=False) -> tup
     if col is None:
         flog['frames_header'] = header + ['cc_text']
     flog['file_version'] = max(11, flog.get('file_version', 0))
-    after = next(k for k in ('mkv_offset_from', 'audio_shift_from', 'audio_shift', 'frame_rate', 'filename') if k in flog or k == 'filename')
+    after = next(k for k in ('mkv_lag_from', 'audio_shift_from', 'audio_shift', 'frame_rate', 'filename') if k in flog or k == 'filename')
     flog = processor.set_header_key(flog, 'cc_text_from', 'packets' if exact else 'packets-mkv', after=after)
     return flog, ('re-counted: ' if col is not None else '') + msg, True
 
@@ -354,38 +354,38 @@ def upgrade(path:str, steps=STEPS, dry_run:bool=False, redo_from:str|None=None, 
     video = find_video(flog)
     out, audio_changed, changed = [], False, False
 
-    offset = None
+    lag = None
     if video and timeline.same_video(flog, video):
-        offset = 0.0
-        if 'offset' in steps:
-            out.append(f'offset: skip (not transcoded: {os.path.basename(video)} still exists, so the log lines up with it)')
-    elif video and flog.get('mkv_offset') is not None:
-        offset = float(flog['mkv_offset'])
-        if 'offset' in steps:
-            out.append(f"offset: skip (already has mkv_offset={offset})")
+        lag = 0.0
+        if 'mkv-lag' in steps:
+            out.append(f'mkv lag: skip (not transcoded: {os.path.basename(video)} still exists, so the log lines up with it)')
+    elif video and flog.get('mkv_lag') is not None:
+        lag = float(flog['mkv_lag'])
+        if 'mkv-lag' in steps:
+            out.append(f"mkv lag: skip (already has mkv_lag={lag})")
     elif video:
         header = flog.get('frames_header', [])
-        needed = ('offset' in steps
+        needed = ('mkv-lag' in steps
                   or ('audio' in steps and ('audio_shift' not in flog or redo_from))
                   or ('cc' in steps and ('cc_text' not in header or redo_cc)))
         if needed:
             # recorded whichever step asked for it, so nothing has to measure it again
-            offset, source = timeline.video_offset(flog, video)
-            if offset is None:
-                out.append(f'offset: FAILED (the cuts in {os.path.basename(video)} did not line up with the log\'s)')
+            lag, source = timeline.video_lag(flog, video)
+            if lag is None:
+                out.append(f'mkv lag: FAILED (the cuts in {os.path.basename(video)} did not line up with the log\'s)')
             else:
-                flog = timeline.record_offset(flog, offset, source)
+                flog = timeline.record_lag(flog, lag, source)
                 changed = True
-                out.append(f'offset: {os.path.basename(video)} is {offset:+.3f}s behind the log (from {source})')
-    elif 'offset' in steps:
-        out.append(f"offset: skip (no video: {flog.get('filename')})")
+                out.append(f'mkv lag: {os.path.basename(video)} is {lag:+.3f}s behind the log (from {source})')
+    elif 'mkv-lag' in steps:
+        out.append(f"mkv lag: skip (no video: {flog.get('filename')})")
 
     if 'audio' in steps:
-        flog, msg, audio_changed = repair_audio(flog, path, video, offset, redo_from)
+        flog, msg, audio_changed = repair_audio(flog, path, video, lag, redo_from)
         changed |= audio_changed
         out.append(f'audio: {msg}')
     if 'cc' in steps:
-        flog, msg, did = add_cc(flog, video, offset, redo_cc)
+        flog, msg, did = add_cc(flog, video, lag, redo_cc)
         changed |= did
         out.append(f'cc: {msg}')
 

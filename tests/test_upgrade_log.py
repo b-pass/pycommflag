@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Checks tools/upgrade_log.py and pycommflag/timeline.py: the .mkv offset, captions from raw video
+"""Checks tools/upgrade_log.py and pycommflag/timeline.py: the .mkv lag, captions from raw video
 packets, the audio probe through an .mkv, and the log rewrite.
 
 Captions are found in MPEG-2 user data and H.264/HEVC SEI (behind emulation prevention bytes)
 and counted by processor._cc_text's rules (field 1 only, no control codes); a stray "GA94" in
 picture data doesn't count.  From the log's own video a packet counts only for the frame with
-its timestamp; from a transcode, for the frame shown at its time once the transcode's offset is
-added back.  The offset comes from the stream start times when the log has them, else from
+its timestamp; from a transcode, for the frame shown at its time once the transcode's lag is
+added back.  The lag comes from the stream start times when the log has them, else from
 lining up cuts, and a vote without enough agreeing cuts gives no answer.  A probe of the .mkv is
-used for the audio only less that offset.  The rewrite appends cc_text, sets file_version 11,
+used for the audio only less that lag.  The rewrite appends cc_text, sets file_version 11,
 keeps everything else, and leaves a log that has cc_text alone unless asked to redo it.  Also
 the editor's log_fixes, which tells the user what a log needs and how to run the tool.
 
@@ -82,7 +82,7 @@ t60 = np.arange(-1, 12) / 60  # a 59.94 transcode of the same frames
 cc, matched = upgrade_log.assign(rows, t60, np.ones(len(t60), dtype=np.int64), False, 29.97)
 check('transcode: packets count for the frame shown then', cc.tolist() == [2, 2, 2, 4, 2] and matched == 1.0, (cc.tolist(), matched))
 
-# --- the offset ---
+# --- the lag ---
 
 rng = np.random.default_rng(1)
 step = 1 / 29.97
@@ -92,7 +92,7 @@ log_cuts = [np.sort(rng.uniform(100, 140, 12)), np.sort(rng.uniform(900, 940, 10
 video_cuts = [np.sort(np.concatenate((lc[1:] - 0.734 + rng.choice([-step, 0, 0, 0, step], len(lc) - 1),
                                       rng.uniform(lc[0] - 3, lc[-1], 6)))) for lc in log_cuts]
 off = timeline.match_cuts(log_cuts, video_cuts, 29.97)
-check('cuts: the offset that lines them up', off is not None and abs(off - 0.734) < step / 2, off)
+check('cuts: the lag that lines them up', off is not None and abs(off - 0.734) < step / 2, off)
 noise = [np.sort(rng.uniform(lc[0] - 3, lc[-1] + 3, len(lc))) for lc in log_cuts]
 check('cuts: no answer from cuts that don\'t line up', timeline.match_cuts(log_cuts, noise, 29.97) is None)
 check('cuts: no answer from one window', timeline.match_cuts(log_cuts[:1] + [np.zeros(0)], video_cuts[:1] + [np.zeros(0)], 29.97) is None)
@@ -100,12 +100,12 @@ check('cuts: no answer from one window', timeline.match_cuts(log_cuts[:1] + [np.
 real_starts = timeline.stream_starts
 timeline.stream_starts = lambda v: (1.502, 0.0)
 fl = {'filename': '/nowhere/1_2.ts', 'video_start': 2362.2014, 'audio_start': 2361.755733}
-check('starts: the copy\'s video moved away from its audio', timeline.offset_from_starts(fl, '/nowhere/1_2.mkv') == round(1.502 - 0.445667, 4))
-check('own video: no offset', timeline.video_offset(fl, '/nowhere/1_2.ts') == (0.0, 'own'))
-check('a recorded offset wins', timeline.video_offset(dict(fl, mkv_offset=0.7, mkv_offset_from='cuts'), '/nowhere/1_2.mkv') == (0.7, 'cuts'))
-check('no starts, not measured: unknown', timeline.video_offset({'filename': '/nowhere/1_2.ts'}, '/nowhere/1_2.mkv', measure=False) == (None, 'unknown'))
+check('starts: the copy\'s video moved away from its audio', timeline.lag_from_starts(fl, '/nowhere/1_2.mkv') == round(1.502 - 0.445667, 4))
+check('own video: no lag', timeline.video_lag(fl, '/nowhere/1_2.ts') == (0.0, 'own'))
+check('a recorded lag wins', timeline.video_lag(dict(fl, mkv_lag=0.7, mkv_lag_from='cuts'), '/nowhere/1_2.mkv') == (0.7, 'cuts'))
+check('no starts, not measured: unknown', timeline.video_lag({'filename': '/nowhere/1_2.ts'}, '/nowhere/1_2.mkv', measure=False) == (None, 'unknown'))
 timeline.stream_starts = real_starts
-check('tags move back by the offset, none before 0',
+check('tags move back by the lag, none before 0',
       timeline.shift_tags([(3, (0.0, 7.5)), (3, (100.0, 160.0))], 0.734) == [(3, (0.0, 6.766)), (3, (99.266, 159.266))])
 
 # --- the audio probe through an .mkv ---
@@ -116,9 +116,9 @@ quiet = np.zeros((300, 10))
 quiet[:, 0] = np.arange(300) / 29.97  # no blanks, so no estimate
 mkvlog = {'filename': '/nowhere/1_2.ts', 'frame_rate': 29.97}
 shift, source, note = upgrade_log.choose_shift(mkvlog, quiet, '/nowhere/1_2.mkv', 0.734)
-check('probe-mkv: less the offset', (round(shift, 4), source) == (0.3, 'probe-mkv'), (shift, source, note))
+check('probe-mkv: less the lag', (round(shift, 4), source) == (0.3, 'probe-mkv'), (shift, source, note))
 shift, source, note = upgrade_log.choose_shift(mkvlog, quiet, '/nowhere/1_2.mkv', None)
-check('probe-mkv: not used without the offset', source != 'probe-mkv', (shift, source, note))
+check('probe-mkv: not used without the lag', source != 'probe-mkv', (shift, source, note))
 upgrade_log.probe = real_probe
 
 # --- the log ---
@@ -152,7 +152,7 @@ check('rewrite appends cc_text', new['frames_header'][-1] == 'cc_text' and [r[-1
 check('rewrite sets file_version 11 and keeps the rest',
       new['file_version'] == 11 and [r[:-1] for r in body] == flog['frames'][1:] and new['tags'] == flog['tags']
       and [k for k in new if k != 'cc_text_from'] == list(flog) and new['audio_shift'] == 0.5)
-check('own video: cc_text_from packets, no mkv_offset', new.get('cc_text_from') == 'packets' and 'mkv_offset' not in new)
+check('own video: cc_text_from packets, no mkv_lag', new.get('cc_text_from') == 'packets' and 'mkv_lag' not in new)
 check('rewrite keeps the permissions', os.stat(path).st_mode & 0o777 == 0o640)
 check('a log with cc_text is skipped', any(m.startswith('cc: skip') for m in upgrade_log.upgrade(path)))
 check('log_fixes is satisfied', gui.log_fixes(new, path)[1] is None)
@@ -169,11 +169,11 @@ msgs = upgrade_log.upgrade(path, redo_cc=True)
 new = processor.read_feature_log(path)
 body = new['frames'][1:]
 timeline.stream_starts = real_starts
-check('mkv: the offset is recorded, from the starts', (new.get('mkv_offset'), new.get('mkv_offset_from')) == (0.5, 'starts'), msgs)
+check('mkv: the lag is recorded, from the starts', (new.get('mkv_lag'), new.get('mkv_lag_from')) == (0.5, 'starts'), msgs)
 check('mkv: --redo-cc replaces the column, counted at the log\'s times',
       new['frames_header'].count('cc_text') == 1 and len(body[0]) == 11 and all(r[-1] == 5 for r in body)
       and new.get('cc_text_from') == 'packets-mkv', msgs)
-check('mkv: the timing keys sit before the frames', list(new).index('mkv_offset') < list(new).index('frames'))
+check('mkv: the timing keys sit before the frames', list(new).index('mkv_lag') < list(new).index('frames'))
 
 shutil.rmtree(tmp, ignore_errors=True)
 
