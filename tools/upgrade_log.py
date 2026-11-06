@@ -358,7 +358,7 @@ def upgrade(path:str, steps=STEPS, dry_run:bool=False, redo_from:str|None=None, 
     if video and timeline.same_video(flog, video):
         offset = 0.0
         if 'offset' in steps:
-            out.append('offset: skip (the log\'s own video is there)')
+            out.append(f'offset: skip (not transcoded: {os.path.basename(video)} still exists, so the log lines up with it)')
     elif video and flog.get('mkv_offset') is not None:
         offset = float(flog['mkv_offset'])
         if 'offset' in steps:
