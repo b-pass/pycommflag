@@ -148,6 +148,15 @@ def _edit(opts, log:str, video:str|None) -> int:
         print(err)
         return 1
 
+    from .timeline import video_offset, record_offset
+    if video_offset(flog, opts.filename, measure=False)[0] is None:
+        # an older log on a transcode: measure where it falls once, and keep it in the log
+        print(f'Measuring where the log falls in {opts.filename}...')
+        (off, source) = video_offset(flog, opts.filename)
+        if off is not None:
+            flog = record_offset(flog, off, source)
+            print(f'{opts.filename} is {off:+.3f}s behind the log')
+
     w = gui.Window(opts=opts, video=opts.filename, flog=flog)
     res = w.run()
     if res is None:
@@ -245,6 +254,14 @@ def _reprocess_one(opts, fl, allow_archive:bool) -> bool:
     from . import processor
     from .neural import predict, diff_tags
 
+    if vf != flog.get('filename', ''):
+        from .timeline import video_offset, record_offset
+        if video_offset(flog, vf, measure=False)[0] is None:
+            # measured here, not by output(), so a rewritten log keeps it
+            (off, source) = video_offset(flog, vf)
+            if off is not None:
+                flog = record_offset(flog, off, source)
+
     old = flog.get('tags', [])
     result = predict(flog, opts)
     (missing, extra, all) = diff_tags(old, result)
@@ -330,6 +347,17 @@ def output(opts, result, feature_log=None) -> None|bool:
         return
 
     if feature_log and (vf := _find_video(feature_log.get('filename', ''))):
+        if vf != feature_log.get('filename'):
+            # a transcode can start its clock later than the original's, and every output is
+            # in the video's time
+            import logging as log
+            from .timeline import video_offset, shift_tags
+            (off, source) = video_offset(feature_log, vf)
+            if off is None:
+                log.warning(f"Where the log falls in {vf} isn't known; writing its times unchanged")
+            elif off:
+                log.info(f'{vf} is {off:+.3f}s behind the log ({source})')
+                result = shift_tags(result, off)
         # the outputs that count frames (mythtv, txt) need the video's own rate, which isn't the
         # log's after a transcode changed it; the log itself keeps the rate its features were at
         feature_log = dict(feature_log, filename=vf)

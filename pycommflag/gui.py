@@ -12,6 +12,7 @@ from .player import Player
 from . import logo_finder
 from . import processor
 from . import neural
+from . import timeline
 from .feature_span import *
 
 INFO_LINES = 16 # in the info box, which must not change height
@@ -35,25 +36,23 @@ SHEET_COLS = 12 # thumbnails per row, so a row is two minutes
 SHEET_THUMB = (96, 54)
 
 def log_fixes(flog:dict, path:str) -> tuple[list[str], str|None]:
-    """What the log at `path` is missing that a tool in tools/ can add, and a shell command (with the
-    python running this, so it works from the same venv) that runs those tools on it, or None."""
+    """What the log at `path` is missing that tools/upgrade_log.py can add, and a shell command (with
+    the python running this, so it works from the same venv) that runs it on the log, or None."""
     import os, shlex, sys
-    tools = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'tools')
+    tool = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'tools', 'upgrade_log.py')
     header = flog.get('frames_header', ())
-    problems, cmds = [], []
+    problems = []
     # extraction before 2026-10-23 timed the audio from the audio stream's own start, so in a log
     # without audio_shift every audio column is late (0.2-1s); training on it as-is teaches that
     if 'audio_shift' not in flog and 'fvol' in header:
         problems.append("its audio is late (no audio_shift): repair it before training on it")
-        cmds.append('repair_audio_shift.py')
     # logs before file_version 11 have no captions; they can be added from the video in seconds
     if header and 'cc_text' not in header:
         problems.append("it has no caption data (no cc_text)")
-        cmds.append('add_cc_text.py')
-    if not cmds:
+    if not problems:
         return problems, None
     q = shlex.quote
-    return problems, ' && '.join(f'{q(sys.executable)} {q(os.path.join(tools, c))} {q(os.path.abspath(path))}' for c in cmds)
+    return problems, f'{q(sys.executable)} {q(tool)} {q(os.path.abspath(path))}'
 
 def _review_kind(t):
     # intro and credits train as show (see load_nonpersistent), so the queue counts them as show
@@ -195,10 +194,16 @@ class Window(tk.Tk):
         # Tk's own close would destroy the window without going through destroy() below
         self.protocol('WM_DELETE_WINDOW', self.destroy)
         self.player = Player(video, no_deinterlace=True)
+        # log time - the video's: not 0 when the video is a transcode that moved its clock
+        (offset, source) = timeline.video_offset(flog, video, measure=False)
+        if offset is None:
+            log.warning(f"Where the log falls in {video} isn't known; showing it as if it lined up")
+        self.video_offset = offset or 0.0
         # the main frames and the -5s/+5s thumbnails each get their own decoder, so they never
         # seek each other's position away (which is what makes small steps cheap)
-        self.cursor = _Cursor(self.player)
-        self.thumb_cursors = [_Cursor(Player(video, no_deinterlace=True), keep=int(1.5*self.player.frame_rate))
+        self.cursor = _Cursor(self.player, offset=self.video_offset)
+        self.thumb_cursors = [_Cursor(Player(video, no_deinterlace=True), keep=int(1.5*self.player.frame_rate),
+                                      offset=self.video_offset)
                               for _ in range(2)]
         self.thumb_job = None
 
@@ -421,7 +426,8 @@ class Window(tk.Tk):
                                 command=lambda n: self.move(abs=float(n)*60))
         self.scroller.grid(row=9, column=0, columnspan=5)
 
-        self.info = tk.Label(self, text=f'File: {video}; Length:{self.duration/60.0:0.1f} mins; {float(self.frame_rate)} fps')
+        shifted = f'; {self.video_offset:+.3f}s behind the log ({source})' if self.video_offset else ''
+        self.info = tk.Label(self, text=f'File: {video}{shifted}; Length:{self.duration/60.0:0.1f} mins; {float(self.frame_rate)} fps')
         self.info.grid(row=10, column=0, sticky="se", columnspan=5)
 
         # the tools rewrite the log, and saving here would write back the copy loaded before they ran,
@@ -430,7 +436,7 @@ class Window(tk.Tk):
         if cmd:
             msg = f"This log: {'; '.join(problems)}. Close this, then run (the tags are kept):"
             log.warning(f'{msg}\n{cmd}')
-            bg = 'red' if 'repair_audio_shift' in cmd else 'dark orange'
+            bg = 'red' if 'audio_shift' in problems[0] else 'dark orange'
             banner = tk.Frame(self, bg=bg)
             banner.grid(row=0, column=0, columnspan=5, sticky='we')
             tk.Label(banner, text=msg, bg=bg, fg='white', wraplength=self.map_width, pady=2).pack(fill='x')
@@ -472,7 +478,7 @@ class Window(tk.Tk):
         self.vMapPos = None
         self.vMaybe = None
         self.tag_canvas_items = []
-        self.sheet = _ContactSheet(self, video)
+        self.sheet = _ContactSheet(self, video, self.video_offset)
         self.drawMap()
 
         self.move(abs=0)
@@ -959,9 +965,10 @@ class _ContactSheet:
     CELL_W = SHEET_THUMB[0] + 8
     CELL_H = SHEET_THUMB[1] + 14
 
-    def __init__(self, win, video):
+    def __init__(self, win, video, offset=0.0):
         self.win = win
         self.video = video
+        self.offset = offset # log time - the video's
         self.n = max(1, int(math.ceil(win.duration / SHEET_STEP)))
         self.times = [k*SHEET_STEP for k in range(self.n)] # each thumbnail's time, once it is decoded
         self.photos = [None]*self.n
@@ -994,7 +1001,7 @@ class _ContactSheet:
                 if self.stop.is_set():
                     return
                 # in a .ts this lands on the first keyframe after the slot's start, a GOP into it
-                player.seek(k*SHEET_STEP)
+                player.seek(max(0.0, k*SHEET_STEP - self.offset))
                 frames = player.frames()
                 try:
                     f = next(frames, None)
@@ -1002,7 +1009,7 @@ class _ContactSheet:
                     frames.close()
                 if f is None or f.time is None:
                     continue
-                self.done.put((k, f.time - vt_start, f.to_image(width=SHEET_THUMB[0], height=SHEET_THUMB[1])))
+                self.done.put((k, f.time - vt_start + self.offset, f.to_image(width=SHEET_THUMB[0], height=SHEET_THUMB[1])))
         except Exception:
             log.exception('contact sheet decoding failed')
 
@@ -1123,14 +1130,15 @@ class _ContactSheet:
 
 class _Cursor:
     """Decoded frames around a position in a Player, decoding forward rather than seeking when it can."""
-    def __init__(self, player, keep=None):
+    def __init__(self, player, keep=None, offset=0.0):
         self.player = player
+        self.offset = offset # log time - the player's
         self.keep = keep if keep is not None else int(2*player.frame_rate) # 1080p frames are ~3MB each
         self.cache = [] # consecutive decoded frames, oldest first
         self.it = None # player.frames(), positioned just after cache[-1]
 
     def time(self, f):
-        return round(f.time - self.player.vt_start, 3)
+        return round(f.time - self.player.vt_start + self.offset, 3)
 
     def window(self, seconds):
         """The decoded (prev, this, next) frames at `seconds`; any of them may be None."""
@@ -1142,7 +1150,7 @@ class _Cursor:
             if self.it is not None:
                 self.it.close()
             c = self.cache = []
-            f = self.player.seek_exact(max(0, seconds - 1))
+            f = self.player.seek_exact(max(0, seconds - self.offset - 1))
             if f is not None:
                 c.append(f)
             self.it = self.player.frames()

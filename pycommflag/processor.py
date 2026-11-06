@@ -138,7 +138,7 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
 
     feature_log.write(f',\n"duration":{float(player.duration)}')
     feature_log.write(f',\n"frame_rate":{round(float(player.frame_rate),4)}')
-    # audio_shift: seconds tools/repair_audio_shift.py moved this log's audio columns by; 0
+    # audio_shift: seconds tools/upgrade_log.py moved this log's audio columns by; 0
     # here, since audio is already timed from the video start (see Player._queue_audio)
     feature_log.write(f',\n"audio_shift":0')
     feature_log.write(f',\n"video_start":{round(float(player.vt_start),6)}')
