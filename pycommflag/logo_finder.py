@@ -7,6 +7,11 @@ from typing import Any, BinaryIO
 
 from .player import Player
 
+
+# Anything dense enough (a QR code an ad parks over the logo, fine print) lights the whole
+# box, so it matches the mask; a real logo leaves the rest of its box to the picture.  
+_LOGO_MAX_OFF_EDGES = .65
+
 _LOGO_EDGE_THRESHOLD = 12 # minimum contrast step, in gray levels, to count as an edge
 
 _OVERSCAN = .03   # ignore this fraction of each side; signal artifacts live there
@@ -325,18 +330,6 @@ def _analyze(logo_sum:np.ndarray, fcount:int, shape:tuple, stuck_out:list|None=N
     log.debug(f"Final logo bounding box: {top},{left}->{bottom},{right} count_threshold={thresh}")
 
     return ((top,left), (bottom,right), logo_mask, thresh, *stuck)
-
-# Matching the mask only asks "are there edges where the logo's edges go", and anything
-# dense enough lights every pixel in the box -- a QR code an ad parks in the logo's corner,
-# fine print, a busy badge -- so it reads as the logo for as long as it is up.  A real logo
-# leaves the rest of its box to whatever is behind it.  Measured on four channels, with the
-# logo matched during show, the box's other pixels were edges <.46 of the time in 95% of
-# frames, and >=.75 in 0-.2% of them; a "scan to give" QR code over a COMET bug ran
-# .83-.89 for its whole three minutes, and a fake news chyron over another bug .80-.85.
-# Those false positives were what cost the tagging: on the COMET recording the model
-# called the QR ad show and cut the break from 240s to 60s.  Show-time dropouts cost
-# nothing, so the line sits closer to the show tail than to the QR code.
-_LOGO_MAX_OFF_EDGES = .75
 
 def check_frame(frame :VideoFrame, logo :tuple) -> bool:
     if not logo:
