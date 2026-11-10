@@ -140,7 +140,58 @@ def cand_rear_change(frames, timestamps, frame_rate):
     mask[np.flatnonzero(np.diff(active.astype('int8')) != 0) + 1] = True
     return [neural._scale_dist(d) for d in _since_until(timestamps, mask)]
 
+def cand_rear_ratio(frames, timestamps, frame_rate):
+    """Rear volume over front volume, each averaged over the surrounding second (log scale):
+    the level of the surround mix, which the model would have to work out from two columns."""
+    eps = 0.01 # rescaled volume this low is digital quiet
+    rear = _window_mean(timestamps, frames[:, neural.RVOL], 0.5)
+    front = _window_mean(timestamps, frames[:, neural.FVOL], 0.5)
+    return [np.log((rear + eps) / (front + eps))]
+
+REPEAT_CUTS = 5         # consecutive cut-to-cut intervals that make one pattern
+REPEAT_TOL = 0.05       # seconds each cut may be off, measured from the pattern's first cut
+REPEAT_MIN_SPAN = 3.0   # seconds a pattern must cover: rapid cutting matches itself by chance
+REPEAT_MIN_APART = 60.0 # seconds between two airings, so a pattern can't match its own neighbour
+REPEAT_CUT_MERGE = 0.1  # cut frames closer than this to the one before are the same cut
+
+def _repeats(frames, timestamps):
+    """True for frames inside a run of REPEAT_CUTS cut intervals that occurs again elsewhere in
+    the same recording: an ad (or promo) that aired twice.  Nothing is kept between recordings."""
+    mask = np.zeros(len(frames), dtype=bool)
+    ct = timestamps[frames[:, neural.DIFF] >= neural.DIFF_THRESHOLD / 40].astype('float64')
+    if len(ct):
+        ct = ct[np.concatenate(([True], np.diff(ct) > REPEAT_CUT_MERGE))]
+    if len(ct) <= REPEAT_CUTS:
+        return mask
+    start = ct[:-REPEAT_CUTS]
+    # each pattern as its later cuts' offsets from its first cut
+    rel = np.stack([ct[k:len(ct)-REPEAT_CUTS+k] - start for k in range(1, REPEAT_CUTS+1)], axis=1).astype('float32')
+    ok = rel[:, -1] >= REPEAT_MIN_SPAN
+    hit = np.zeros(len(rel), dtype=bool)
+    for lo in range(0, len(rel), 64):
+        hi = min(lo + 64, len(rel))
+        same = (np.abs(rel[lo:hi, None, :] - rel[None, :, :]).max(-1) <= REPEAT_TOL)
+        same &= np.abs(start[lo:hi, None] - start[None, :]) >= REPEAT_MIN_APART
+        hit[lo:hi] = (same & ok[None, :]).any(1)
+    hit &= ok
+    # mark every frame from a matched pattern's first cut to its last
+    edge = np.zeros(len(frames) + 1, dtype='int64')
+    np.add.at(edge, np.searchsorted(timestamps, start[hit]), 1)
+    np.add.at(edge, np.searchsorted(timestamps, ct[REPEAT_CUTS:][hit], 'right'), -1)
+    return np.cumsum(edge[:-1]) > 0
+
+def cand_repeat(frames, timestamps, frame_rate):
+    """Inside a cut pattern that occurs twice in this recording (see _repeats)."""
+    return [_repeats(frames, timestamps).astype('float32')]
+
+def cand_repeat_dist(frames, timestamps, frame_rate):
+    """Seconds since/until the nearest frame inside a repeated cut pattern."""
+    return [neural._scale_dist(d) for d in _since_until(timestamps, _repeats(frames, timestamps))]
+
 CANDIDATES = {
+    'rear_ratio': cand_rear_ratio,
+    'repeat': cand_repeat,
+    'repeat_dist': cand_repeat_dist,
     'quiet': cand_quiet,
     'cadence': cand_cadence,
     'logo_until': cand_logo_until,
