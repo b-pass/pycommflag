@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 from typing import Any, Iterator,TextIO,BinaryIO,List,Tuple
+from types import SimpleNamespace
 
 import numpy as np
 import signal
@@ -21,7 +22,7 @@ from .feature_span import *
 from . import processor
 from . import neural
 
-SEED = int(os.environ.get('PYCF_SEED', 121711))
+SEED = int(os.environ.get('PYCF_SEED', 1711))
 
 # array indexes
 NORMTIME = 0
@@ -166,6 +167,26 @@ def _snap_distance(tt) -> float:
     # human show/commercial boundaries are looser than the rest, so search further
     if isinstance(tt, SceneType): tt = tt.value
     return 5 if tt in (SceneType.SHOW.value, SceneType.COMMERCIAL.value) else 2
+
+TAG_MERGE_GAP = 10 # seconds; same-type tags closer than this are one (training labels, --eval's reference)
+
+def _merge_tag_gaps(tags: list) -> list:
+    """`tags` with each run of same-type tags less than TAG_MERGE_GAP apart made one tag.
+
+    (Nearly) zero-length tags hold no edge, so they are dropped first rather than allowed to bridge
+    a gap: the editor leaves some 0.0001s long.
+    Done before _adjust_tags too: it drops a sliver whose ends snap onto the same cut, and a sliver
+    is how a hand-placed edge that fell short gets fixed (a break ending 5s early, then 0.2s more
+    of break flagged where it really ends), so snapping first labelled that 5s as show."""
+    out = []
+    for (t,(b,e)) in tags:
+        if e - b < 0.05:
+            continue
+        if out and out[-1][0] == t and b - out[-1][1][1] < TAG_MERGE_GAP:
+            out[-1] = (t, (out[-1][1][0], max(e, out[-1][1][1])))
+        else:
+            out.append((t,(b,e)))
+    return out
 
 def _align_edge(when: float, max_distance: float, blank_mids: np.ndarray,
                 diff_times: np.ndarray, diff_mags: np.ndarray) -> float:
@@ -396,21 +417,15 @@ def load_nonpersistent(flog:dict, for_training=False, no_logo=False, no_blanks=F
                 if (t.value if isinstance(t, SceneType) else t) in
                    (SceneType.SHOW.value, SceneType.COMMERCIAL.value, SceneType.DO_NOT_USE.value)]
         spans = processor.read_feature_spans(flog, 'blank', 'diff')
+        tags = _merge_tag_gaps(tags)
         tags = _adjust_tags(tags, spans.get('blank', []), spans.get('diff', []))
-        
-        # clean up tiny gaps between identified breaks (including true 0-length gaps)
-        i = 1
-        while i < len(tags):
-            if tags[i][0] == tags[i-1][0] and (tags[i][1][0] - tags[i-1][1][1]) < 15:
-                tags[i-1] = (tags[i][0], (tags[i-1][1][0], tags[i][1][1]))
-                del tags[i]
-            else:
-                i += 1
-        
+        # snapping can close a gap too (including to 0-length)
+        tags = _merge_tag_gaps(tags)
+
         # a trailing DO_NOT_USE section gets cut off below, so "near the end of the recording"
         # has to be measured against where the usable content really stops
         useful_end = endtime
-        if tags[-1][0] in (SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value) and tags[-1][1][1]+10 >= endtime:
+        if tags and tags[-1][0] in (SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value) and tags[-1][1][1]+10 >= endtime:
             useful_end = min(endtime, tags[-1][1][0])
 
         i = 0
@@ -699,27 +714,25 @@ def load_data_sliding_window(condensed:np.ndarray, trim=False)->tuple[np.ndarray
 
     return frames, answers, weights, timestamps
 
+def _split_datafiles(datafiles: list) -> tuple[list, list]:
+    """(training, validation) files from --data: the ones after a literal TEST token validate, and
+    are left out of training even if also listed before it (so `data/* TEST data/test/*` works)."""
+    if 'TEST' not in datafiles:
+        return list(datafiles), []
+    i = datafiles.index('TEST')
+    testfiles = datafiles[i+1:]
+    train = []
+    for f in datafiles[:i]:
+        if not os.path.exists(f):
+            print(f, "does not exist!!")
+        elif f not in testfiles and os.path.isfile(f):
+            train.append(f)
+    return train, testfiles
+
 def load_data(opts, do_not_test=False) -> tuple:
-    datafiles = opts.ml_data
-    if not datafiles:
+    if not opts.ml_data:
         return None
-    
-    testfiles = []
-
-    if 'TEST' in datafiles:
-        i = datafiles.index('TEST')
-        testfiles = datafiles[i+1:]
-        datafiles = datafiles[:i]
-
-        i = 0
-        while i < len(datafiles):
-            if not os.path.exists(datafiles[i]):
-                print(datafiles[i], "does not exist!!")
-                del datafiles[i]
-            elif datafiles[i] in testfiles or not os.path.isfile(datafiles[i]):
-                del datafiles[i]
-            else:
-                i += 1
+    datafiles, testfiles = _split_datafiles(opts.ml_data)
 
     dlen = 0 # real windows only
     alen = 0 # augmented windows
@@ -893,6 +906,15 @@ def train(opts:Any=None):
         print(f"val {name}: {value:.4f}")
 
     tacc = tmetrics["accuracy"]
+    # The saved name carries the score --eval would give on the validation files, so a new model
+    # needs no separate --eval: post-processed tags, in seconds, not this per-window accuracy.
+    testfiles = [f for f in _split_datafiles(opts.ml_data)[1] if not (os.path.isdir(f) or f.endswith('.npy'))]
+    if testfiles:
+        print()
+        print('Scoring on', len(testfiles), 'validation logs as --eval would...')
+        scores = _score_models({model_path: keras.models.load_model(model_path)}, testfiles, opts)
+        tacc = 1 - (scores.missing[model_path] + scores.extra[model_path]) / scores.total_time
+        print(f"val --eval accuracy: {100*tacc:.5f} %")
     if tacc >= 0.95:
         name = f'{opts.models_dir if opts and opts.models_dir else "."}{os.sep}pycf-{tacc:.04f}-{MTYPE}-{F}x{K}x{len(DILATIONS)}-{DROPOUT}-w{WINDOW_BEFORE}x{WINDOW_AFTER}-{int(time.time())}.keras'
         print()
@@ -1201,14 +1223,6 @@ def eval(opts:Any):
     import keras
 
     models = {}
-    total_time = 0
-    all_missing = {}
-    all_extra = {}
-    
-    y_pred = []
-    y_true = []
-    y_dist = []
-
     for mf in opts.eval:
         try:
             models[mf] = keras.models.load_model(mf)
@@ -1217,88 +1231,13 @@ def eval(opts:Any):
             for layer in models[mf].layers:
                 if isinstance(layer, (keras.layers.Dropout, keras.layers.SpatialDropout1D)):
                     print(f"Layer Name: {layer.name} | Dropout Rate: {layer.rate}")
-            all_missing[mf] = 0
-            all_extra[mf] = 0
         except Exception as e:
             log.exception(f"Unable to load MODEL {mf}")
 
-    for f in datafiles:
-        try:
-            flog = processor.read_feature_log(f)
-            if not flog:
-                print('Load failed')
-                continue
+    scores = _score_models(models, datafiles, opts)
+    all_missing, all_extra, total_time = scores.missing, scores.extra, scores.total_time
+    y_true, y_pred, y_dist = scores.y_true, scores.y_pred, scores.y_dist
 
-            spans = processor.read_feature_spans(flog, 'diff', 'blank')
-
-            # score the lead-in the way training labels it; load_nonpersistent below then only
-            # crops the DO_NOT_USE pieces, so the model's predictions cover the rest
-            flog['tags'] = _split_lead_in(flog.get('tags', []), flog)
-
-            duration = flog.get('duration',0.00001)
-            real_dur = duration
-            realtags = []
-            dnutags = []
-
-            for (t,(b,e)) in flog.get('tags', []):
-                if t in [SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value]:
-                    if e+10 > real_dur and e < real_dur and b < real_dur:
-                        e = real_dur
-                    if b < 10 and e > 0:
-                        b = 0
-                    duration -= e-b
-                    dnutags.append( (SceneType.DO_NOT_USE.value,(b,e)) )
-                elif t in [SceneType.COMMERCIAL, SceneType.COMMERCIAL.value]:
-                    realtags.append( (t,(b,e)) )
-
-            realtags = _adjust_tags(realtags, spans.get('blank', []), spans.get('diff', []))
-            # diff_tags only excludes the DO_NOT_USE spans it is given; without them, predictions
-            # inside those spans counted as errors while `duration` above already left them out
-            realtags = sorted(realtags + dnutags, key=lambda x: x[1][0])
-            
-            total_time += duration
-        except Exception as e:
-            log.exception(f"Unable to load {f}")
-            continue
-        
-        for (mf, model) in models.items():
-            try:
-                data,answers,_,times = load_data_sliding_window(load_nonpersistent(flog, False))
-
-                def distances_to_nearest(times, tags):
-                    transitions = []
-                    for (t,(b,e)) in tags:
-                        if t != SceneType.DO_NOT_USE.value and t != SceneType.DO_NOT_USE:
-                            transitions += [b,e]
-                    transitions = np.array(transitions)
-                    idx = np.searchsorted(transitions, times)
-                    idx_left = np.clip(idx - 1, 0, len(transitions) - 1)
-                    idx_right = np.clip(idx, 0, len(transitions) - 1)
-                    dist_left = np.abs(times - transitions[idx_left])
-                    dist_right = np.abs(times - transitions[idx_right])
-                    return np.minimum(dist_left, dist_right)
-
-                distances = distances_to_nearest(times, realtags)
-                y_dist += distances.tolist()
-                y_true += answers.tolist()
-                
-                prediction = model.predict(make_data_generator(data), verbose=True)
-                
-                result = post_predict(flog, prediction, times, opts, spans=spans) #, threshold=best[0])
-
-                y_pred += prediction.flatten().tolist()
-
-                (missing,extra,_) = diff_tags(realtags, result)
-                acc = 100 - 100*(missing+extra)/duration
-                all_missing[mf] += missing
-                all_extra[mf] += extra
-
-                print(f'{f} @ {mf} -> Acc {round(acc,4)}% <- FN:{round(missing,3)} + FP:{round(extra,3)} = {round(missing+extra,3)} seconds WRONG')
-                #print(f,mf,model.evaluate(dataset_cat if model.output_shape[-1] > 1 else dataset_bin))
-            except Exception as e:
-                log.exception(f"Unable to load MODEL {mf}")
-        print()
-    
     print()
     print()
     print("Results:\nName\t\tMissing\t\tExtra\t\tAbsDiffSum\t\tAcc")
@@ -1365,3 +1304,101 @@ def eval(opts:Any):
         ##idx = np.argmin(np.abs(precisions - recalls))
         #idx = np.argmax( 2 * precisions * recalls / (precisions + recalls + 1e-12) )
         #print(f"threshold={thresholds[idx]:.4f} precision={precisions[idx]:.4f} recall={recalls[idx]:.4f}")
+
+
+def _score_models(models: dict, files: list, opts: Any):
+    """Score each of `models` (name -> keras model) on the feature logs `files` the way --eval does:
+    the returned `missing`/`extra` (per model name) are seconds of commercial missed/invented, out
+    of `total_time` seconds scored (DO_NOT_USE excluded), so accuracy is 1 - (missing+extra)/total_time.
+    Also returns the per-second y_true/y_pred/y_dist that eval's single-model breakdown uses."""
+    total_time = 0
+    all_missing = {mf: 0 for mf in models}
+    all_extra = {mf: 0 for mf in models}
+
+    y_pred = []
+    y_true = []
+    y_dist = []
+
+    for f in files:
+        try:
+            flog = processor.read_feature_log(f)
+            if not flog:
+                print('Load failed')
+                continue
+
+            spans = processor.read_feature_spans(flog, 'diff', 'blank')
+
+            # score the lead-in the way training labels it; load_nonpersistent below then only
+            # crops the DO_NOT_USE pieces, so the model's predictions cover the rest
+            flog['tags'] = _split_lead_in(flog.get('tags', []), flog)
+            # and merge slips the way training does (intro/credits count as show, as there)
+            flog['tags'] = _merge_tag_gaps([(t,(b,e)) for (t,(b,e)) in flog['tags'] if t in
+                                            (SceneType.COMMERCIAL, SceneType.COMMERCIAL.value,
+                                             SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value)])
+
+            duration = flog.get('duration',0.00001)
+            real_dur = duration
+            realtags = []
+            dnutags = []
+
+            for (t,(b,e)) in flog.get('tags', []):
+                if t in [SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value]:
+                    if e+10 > real_dur and e < real_dur and b < real_dur:
+                        e = real_dur
+                    if b < 10 and e > 0:
+                        b = 0
+                    duration -= e-b
+                    dnutags.append( (SceneType.DO_NOT_USE.value,(b,e)) )
+                elif t in [SceneType.COMMERCIAL, SceneType.COMMERCIAL.value]:
+                    realtags.append( (t,(b,e)) )
+
+            realtags = _adjust_tags(realtags, spans.get('blank', []), spans.get('diff', []))
+            # diff_tags only excludes the DO_NOT_USE spans it is given; without them, predictions
+            # inside those spans counted as errors while `duration` above already left them out
+            realtags = sorted(realtags + dnutags, key=lambda x: x[1][0])
+            
+            total_time += duration
+        except Exception as e:
+            log.exception(f"Unable to load {f}")
+            continue
+        
+        for (mf, model) in models.items():
+            try:
+                data,answers,_,times = load_data_sliding_window(load_nonpersistent(flog, False))
+
+                def distances_to_nearest(times, tags):
+                    transitions = []
+                    for (t,(b,e)) in tags:
+                        if t != SceneType.DO_NOT_USE.value and t != SceneType.DO_NOT_USE:
+                            transitions += [b,e]
+                    transitions = np.array(transitions)
+                    idx = np.searchsorted(transitions, times)
+                    idx_left = np.clip(idx - 1, 0, len(transitions) - 1)
+                    idx_right = np.clip(idx, 0, len(transitions) - 1)
+                    dist_left = np.abs(times - transitions[idx_left])
+                    dist_right = np.abs(times - transitions[idx_right])
+                    return np.minimum(dist_left, dist_right)
+
+                distances = distances_to_nearest(times, realtags)
+                y_dist += distances.tolist()
+                y_true += answers.tolist()
+                
+                prediction = model.predict(make_data_generator(data), verbose=True)
+                
+                result = post_predict(flog, prediction, times, opts, spans=spans) #, threshold=best[0])
+
+                y_pred += prediction.flatten().tolist()
+
+                (missing,extra,_) = diff_tags(realtags, result)
+                acc = 100 - 100*(missing+extra)/duration
+                all_missing[mf] += missing
+                all_extra[mf] += extra
+
+                print(f'{f} @ {mf} -> Acc {round(acc,4)}% <- FN:{round(missing,3)} + FP:{round(extra,3)} = {round(missing+extra,3)} seconds WRONG')
+                #print(f,mf,model.evaluate(dataset_cat if model.output_shape[-1] > 1 else dataset_bin))
+            except Exception as e:
+                log.exception(f"Unable to load MODEL {mf}")
+        print()
+
+    return SimpleNamespace(missing=all_missing, extra=all_extra, total_time=total_time,
+                           y_true=y_true, y_pred=y_pred, y_dist=y_dist)
