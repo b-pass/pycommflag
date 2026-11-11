@@ -82,8 +82,18 @@ F         = 48 # TCN filter count
 K         = 5  # TCN kernel size
 DILATIONS = [1, 2, 4, 8] # TCN dilation schedule
 DROPOUT   = 0.25
-START_DROP= 0.25
 TCN_DROP  = 0.15
+
+INPUT_GRP_DROPOUT = 0.1
+INPUT_GROUPS = [
+    [NORMTIME, PERCTIME],
+    [LOGO, LOGO_RUN, HAVE_LOGO],
+    [BLANK, BLANK_SINCE, BLANK_UNTIL],
+    [DIFF, DIFF_90TH, DIFF_MAX],
+    [FVOL, FVOL_MAX],
+    [RVOL, HAVE_RVOL, RVOL_STDDEV],
+    [SILENCE, SPEECH, MUSIC, NOISE],
+]
 
 
 def build_model(input_shape=(WINDOW_BEFORE+1+WINDOW_AFTER, FEATURE_WIDTH)):
@@ -100,7 +110,22 @@ def build_model(input_shape=(WINDOW_BEFORE+1+WINDOW_AFTER, FEATURE_WIDTH)):
     # epsilon (1e-3) is as big as the variance of DIFF and the volume spreads, and would
     # leave those at a fraction of unit scale.
     x = layers.BatchNormalization(center=False, scale=False, epsilon=1e-5, name="input_norm")(inputs)
-    x = layers.SpatialDropout1D(START_DROP, name="input_drop")(x)
+    
+    n = input_shape[-1]
+    assert sorted(c for g in INPUT_GROUPS for c in g) == list(range(n)) # each column in exactly one group
+    member = np.zeros((len(INPUT_GROUPS), n), dtype='float32')
+    for i, g in enumerate(INPUT_GROUPS):
+        member[i, g] = 1
+    # ones shaped (batch, time, group); SpatialDropout1D zeroes a group for a whole window
+    # (and scales the rest by 1/(1-rate), as it does per column), then the fixed membership
+    # matrix spreads each group's keep onto its columns.  At inference the mask is exactly 1.
+    gdrop = layers.Dense(len(INPUT_GROUPS), kernel_initializer='zeros', bias_initializer='ones',
+                        trainable=False, name="input_group_ones")(x)
+    gdrop = layers.SpatialDropout1D(INPUT_GRP_DROPOUT, name="input_group_drop")(gdrop)
+    expand = layers.Dense(n, use_bias=False, trainable=False, name="input_group_expand")
+    gdrop = expand(gdrop)
+    expand.set_weights([member])
+    x = layers.Multiply(name="input_group_drop")([x, gdrop])
 
     x = layers.Dense(F, use_bias=False, name="projection")(x)
     x = layers.LayerNormalization(name="projection_ln")(x)
