@@ -431,7 +431,9 @@ def load_nonpersistent(flog:dict, for_training=False, no_logo=False, no_blanks=F
         i = 0
         while i < len(tags):
             clen = tags[i][1][1] - tags[i][1][0]
-            if clen < 10 and not (tags[i][1][1]+clen+10 >= useful_end or tags[i][0] in [SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value]):
+            if clen < 10 and not (tags[i][1][1]+clen+10 >= useful_end or tags[i][0] in [SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value]
+                                  # a lead-in commercial (often 2-15s) is real at any length, as in post_predict
+                                  or (tags[i][0] in [SceneType.COMMERCIAL, SceneType.COMMERCIAL.value] and tags[i][1][1] <= 60)):
                 # delete the tiny segment
                 del tags[i]
             else:
@@ -1096,9 +1098,10 @@ def post_predict(flog:dict, prediction, times, opts:Any, threshold=0.5, spans=No
             if i+1 >= len(results) and clen >= 5 and results[i][1][1]+clen+10 >= duration:
                 # dont require full length if it is near the end of the recording
                 break
-            elif i == 0 and clen >= 5 and results[i][1][1] <= 66:
-                # don't require full length in the lead-in before the show (see _split_lead_in,
-                # which can leave the previous show's tail before it, so it needn't start at 0)
+            elif i == 0 and results[i][1][1] <= opts.show_min_len:
+                # a commercial in the lead-in before the show is real at any length (often 2-15s).
+                # It needn't start at 0: _split_lead_in can leave up to a minute of the previous
+                # show's tail before it.
                 i += 1
                 pass
             else:
@@ -1351,6 +1354,15 @@ def _score_models(models: dict, files: list, opts: Any):
                     dnutags.append( (SceneType.DO_NOT_USE.value,(b,e)) )
                 elif t in [SceneType.COMMERCIAL, SceneType.COMMERCIAL.value]:
                     realtags.append( (t,(b,e)) )
+
+            # before the first frame there is no video (a log can start seconds in) and nothing
+            # for the model to predict, so that time isn't scored either; a leading DO_NOT_USE
+            # already starts at 0, so only what it doesn't cover is added
+            first = next((fr[0] for fr in flog['frames'] if fr is not None), 0)
+            covered = max([e for (_,(b,e)) in dnutags if b <= 0] + [0])
+            if covered < first:
+                duration -= first - covered
+                dnutags.append( (SceneType.DO_NOT_USE.value,(covered,first)) )
 
             realtags = _adjust_tags(realtags, spans.get('blank', []), spans.get('diff', []))
             # diff_tags only excludes the DO_NOT_USE spans it is given; without them, predictions
