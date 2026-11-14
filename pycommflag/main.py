@@ -245,8 +245,8 @@ def _reprocess_one(opts, fl, allow_archive:bool) -> bool:
 
     if opts.chanid:
         from .mythtv import check_method
-        if not check_method(opts.chanid):
-            print("Channel has flagging disabled")
+        if not check_method(opts.chanid, commfree_is_off=True):
+            print("Channel has flagging disabled or is commercial-free")
             if output(opts, [], flog) is False:
                 raise RuntimeError(f'Output failed for {vf}')
             return False

@@ -125,7 +125,7 @@ def build_model(input_shape=(WINDOW_BEFORE+1+WINDOW_AFTER, FEATURE_WIDTH)):
     expand = layers.Dense(n, use_bias=False, trainable=False, name="input_group_expand")
     gdrop = expand(gdrop)
     expand.set_weights([member])
-    x = layers.Multiply(name="input_group_drop")([x, gdrop])
+    x = layers.Multiply(name="igd_apply")([x, gdrop])
 
     x = layers.Dense(F, use_bias=False, name="projection")(x)
     x = layers.LayerNormalization(name="projection_ln")(x)
@@ -233,9 +233,26 @@ def _align_edge(when: float, max_distance: float, blank_mids: np.ndarray,
 
     return when
 
+def _undecided_spans(tags: list) -> list:
+    return sorted((b,e) for (t,(b,e)) in tags or []
+                  if (t.value if isinstance(t, SceneType) else t) == SceneType.TRANSITION.value)
+
+def _undecided_edges(tags: list) -> np.ndarray:
+    """The sorted edges of `tags`' TRANSITION spans, which mark time without a trusted label.
+    A label that ends at one ends where the labeller's confidence ran out, not at a show/commercial
+    boundary, so that edge is neither snapped to a cut nor upweighted, and a short tag holding one
+    is a piece of something longer."""
+    return np.asarray(sorted(x for span in _undecided_spans(tags) for x in span), dtype='float64')
+
+def _is_fixed(when: float, fixed) -> bool:
+    if not len(fixed):
+        return False
+    i = np.searchsorted(fixed, when)
+    return any(abs(fixed[j] - when) < 0.01 for j in (i-1, i) if 0 <= j < len(fixed))
+
 def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]],
                  blanks: List[Tuple[bool, Tuple[float, float]]],
-                 diffvals: List[Tuple[float, float]]) \
+                 diffvals: List[Tuple[float, float]], fixed=()) \
         -> List[Tuple[int, Tuple[float, float]]]:
     """
     Adjust tag boundaries to align with scene transitions using blank frames and diff values.
@@ -247,6 +264,7 @@ def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]],
         tags: List of (tag_type, (start_time, end_time))
         blanks: List of (is_blank, (start_time, end_time))
         diffvals: List of (time, diff_magnitude), one entry per frame
+        fixed: sorted edge times that stay where they are (see _undecided_edges)
 
     Returns:
         Adjusted tags list with updated boundaries
@@ -258,6 +276,8 @@ def _adjust_tags(tags: List[Tuple[int, Tuple[float, float]]],
     diff_mags = np.asarray([v for _,v in diffvals], dtype='float32')
 
     def align(when: float, max_distance: float) -> float:
+        if _is_fixed(when, fixed):
+            return when
         return _align_edge(when, max_distance, blank_mids, diff_times, diff_mags)
 
     filtered_tags = []
@@ -425,6 +445,8 @@ def load_nonpersistent(flog:dict, for_training=False, no_logo=False, no_blanks=F
             have_logo = False
 
     tags = flog.get('tags', [])
+    undecided = _undecided_spans(tags)
+    fixed = _undecided_edges(tags)
     
     frames_header = flog['frames_header']
     assert('time' in frames_header[NORMTIME])
@@ -433,17 +455,17 @@ def load_nonpersistent(flog:dict, for_training=False, no_logo=False, no_blanks=F
     assert('diff' in frames_header[DIFF])
 
     if tags and for_training:
-        # INTRO/TRANSITION/CREDITS train as plain show: they are not commercials, and the model gets
+        # INTRO/CREDITS train as plain show: they are not commercials, and the model gets
         # them wrong far more often than other show, so they need full weight. Dropping the tags
         # (rather than relabelling them SHOW) makes them exactly what an unlabelled stretch of show
         # is, for the small-gap merging and boundary upweights below too, so logs where humans
-        # skipped them agree.
+        # skipped them agree. TRANSITION tags go too: `undecided` holds them, and they get weight 0.
         tags = [(t,(b,e)) for (t,(b,e)) in tags
                 if (t.value if isinstance(t, SceneType) else t) in
                    (SceneType.SHOW.value, SceneType.COMMERCIAL.value, SceneType.DO_NOT_USE.value)]
         spans = processor.read_feature_spans(flog, 'blank', 'diff')
         tags = _merge_tag_gaps(tags)
-        tags = _adjust_tags(tags, spans.get('blank', []), spans.get('diff', []))
+        tags = _adjust_tags(tags, spans.get('blank', []), spans.get('diff', []), fixed)
         # snapping can close a gap too (including to 0-length)
         tags = _merge_tag_gaps(tags)
 
@@ -458,7 +480,8 @@ def load_nonpersistent(flog:dict, for_training=False, no_logo=False, no_blanks=F
             clen = tags[i][1][1] - tags[i][1][0]
             if clen < 10 and not (tags[i][1][1]+clen+10 >= useful_end or tags[i][0] in [SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value]
                                   # a lead-in commercial (often 2-15s) is real at any length, as in post_predict
-                                  or (tags[i][0] in [SceneType.COMMERCIAL, SceneType.COMMERCIAL.value] and tags[i][1][1] <= 60)):
+                                  or (tags[i][0] in [SceneType.COMMERCIAL, SceneType.COMMERCIAL.value] and tags[i][1][1] <= 60)
+                                  or any(_is_fixed(x, fixed) for x in tags[i][1])):
                 # delete the tiny segment
                 del tags[i]
             else:
@@ -580,6 +603,9 @@ def load_nonpersistent(flog:dict, for_training=False, no_logo=False, no_blanks=F
         elif tt == SceneType.COMMERCIAL.value:
             answers[si:ei] = 1.0
 
+    for (st,et) in undecided:
+        weights[np.searchsorted(timestamps, st):np.searchsorted(timestamps, et)] = 0
+
     # massively up weight near boundaries. however, _adjust_tags makes this only really matter outside of 5
     # within 5, it can be wrong ... so we only upweight the closest ones to the boundary
     # the others that are a little farther are not upweighted at all because they are in "dont care" territory
@@ -587,6 +613,8 @@ def load_nonpersistent(flog:dict, for_training=False, no_logo=False, no_blanks=F
     for (tt,(st,et)) in tags:
         if tt in [SceneType.COMMERCIAL, SceneType.SHOW, SceneType.COMMERCIAL.value, SceneType.SHOW.value]:
             for edge in (st,et):
+                if _is_fixed(edge, fixed):
+                    continue
                 dt = np.abs(timestamps - edge)
                 near = (dt < window) & (weights[:,0] >= 1.0)
                 weights[near,0] = np.maximum(weights[near,0], 1 + ((window - dt[near]) / window) ** 2)
@@ -1360,9 +1388,11 @@ def _score_models(models: dict, files: list, opts: Any):
             # crops the DO_NOT_USE pieces, so the model's predictions cover the rest
             flog['tags'] = _split_lead_in(flog.get('tags', []), flog)
             # and merge slips the way training does (intro/credits count as show, as there)
+            fixed = _undecided_edges(flog['tags'])
             flog['tags'] = _merge_tag_gaps([(t,(b,e)) for (t,(b,e)) in flog['tags'] if t in
                                             (SceneType.COMMERCIAL, SceneType.COMMERCIAL.value,
-                                             SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value)])
+                                             SceneType.DO_NOT_USE, SceneType.DO_NOT_USE.value,
+                                             SceneType.TRANSITION, SceneType.TRANSITION.value)])
 
             duration = flog.get('duration',0.00001)
             real_dur = duration
@@ -1377,6 +1407,10 @@ def _score_models(models: dict, files: list, opts: Any):
                         b = 0
                     duration -= e-b
                     dnutags.append( (SceneType.DO_NOT_USE.value,(b,e)) )
+                elif t in [SceneType.TRANSITION, SceneType.TRANSITION.value]:
+                    # not scored, like DO_NOT_USE
+                    duration -= e-b
+                    dnutags.append( (SceneType.DO_NOT_USE.value,(b,e)) )
                 elif t in [SceneType.COMMERCIAL, SceneType.COMMERCIAL.value]:
                     realtags.append( (t,(b,e)) )
 
@@ -1389,7 +1423,7 @@ def _score_models(models: dict, files: list, opts: Any):
                 duration -= first - covered
                 dnutags.append( (SceneType.DO_NOT_USE.value,(covered,first)) )
 
-            realtags = _adjust_tags(realtags, spans.get('blank', []), spans.get('diff', []))
+            realtags = _adjust_tags(realtags, spans.get('blank', []), spans.get('diff', []), fixed)
             # diff_tags only excludes the DO_NOT_USE spans it is given; without them, predictions
             # inside those spans counted as errors while `duration` above already left them out
             realtags = sorted(realtags + dnutags, key=lambda x: x[1][0])

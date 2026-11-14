@@ -137,6 +137,10 @@ class SceneType(Enum):
     UNKNOWN = 0
     SHOW = 0
     INTRO = 1
+    # no trusted label here (what machine-labelled logs hold where their evidence ran out): trains
+    # at weight 0 like DO_NOT_USE, but says nothing about the recording, so none of DO_NOT_USE's
+    # rules (lead-in split, cropping at the ends) apply and its edges are not show/commercial
+    # boundaries. No log ever used it for a transition between scenes.
     TRANSITION = 2
     COMMERCIAL = 3
     CREDITS = 4

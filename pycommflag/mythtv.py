@@ -287,7 +287,16 @@ def set_job_status(opts, msg='', status='run'):
                   'WHERE id = %s', (msg, status, opts.mythjob))
 
 
-def check_method(chanid):
+# channel.commmethod values, from mythtv's libs/libmythtv/programtypes.h
+COMM_DETECT_COMMFREE = -2
+COMM_DETECT_OFF = 0
+
+def check_method(chanid, commfree_is_off:bool=False)->bool:
+    """False if the channel has commercial flagging turned off.
+
+    A "Commercial Free" channel counts as off only with commfree_is_off: MythTV never queues a
+    flag job for one, but mythcommflag run by hand on its recording flags it anyway."""
+    off = (COMM_DETECT_OFF, COMM_DETECT_COMMFREE) if commfree_is_off else (COMM_DETECT_OFF,)
     try:
         conn = _open()
         if conn is not None:
@@ -297,7 +306,7 @@ def check_method(chanid):
                         "LIMIT 1",
                         (chanid,))
                 (m,) = c.fetchone()
-                if int(m) == 0:
+                if int(m) in off:
                     return False
     except:
         pass
