@@ -7,10 +7,15 @@ from typing import Any, BinaryIO
 
 from .player import Player
 
+try:
+    import zxingcpp
+except ImportError:
+    zxingcpp = None
+    log.warning("zxing-cpp is not installed: a QR code over the logo will read as the logo")
 
 # Anything dense enough (a QR code an ad parks over the logo, fine print) lights the whole
 # box, so it matches the mask; a real logo leaves the rest of its box to the picture.  
-_LOGO_MAX_OFF_EDGES = .65
+_LOGO_MAX_OFF_EDGES = .70
 
 _LOGO_EDGE_THRESHOLD = 12 # minimum contrast step, in gray levels, to count as an edge
 
@@ -334,8 +339,22 @@ def _analyze(logo_sum:np.ndarray, fcount:int, shape:tuple, stuck_out:list|None=N
 def check_frame(frame :VideoFrame, logo :tuple) -> bool:
     if not logo:
         return False
-    ((top,left),(bottom,right),*_) = logo
-    return _logo_matches(_edges(_gray(frame, [top,bottom,left,right])), logo)
+    ((top,left),(bottom,right),lmask,*_) = logo
+    edges = _edges(_gray(frame, [top,bottom,left,right]))
+    if not _logo_matches(edges, logo):
+        return False
+    # A QR code with big modules lights only the module borders, as few as a busy picture behind
+    # a real logo does (one over a logo ran .62-.75), so a match that leaves more than half the
+    # rest of the box lit also fails if a QR code can be read in the logo's quarter of the screen.
+    if zxingcpp is None or np.count_nonzero(edges & ~lmask) <= np.count_nonzero(~lmask) * 0.50:
+        return True
+    # the code's corner squares can lie outside the box, so read the whole quarter
+    h, w = frame.height // 2, frame.width // 2
+    y = h if top + bottom >= 2 * h else 0
+    x = w if left + right >= 2 * w else 0
+    quarter = np.ascontiguousarray(_gray(frame, [y, y + h, x, x + w]), dtype=np.uint8)
+    # return_errors: a code that is found but doesn't decode cleanly still counts
+    return not zxingcpp.read_barcodes(quarter, formats=zxingcpp.BarcodeFormat.QRCode, return_errors=True)
 
 def _logo_matches(edges:np.ndarray, logo:tuple) -> bool:
     """Whether an edge map of the logo's box shows the logo."""

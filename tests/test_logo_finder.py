@@ -244,6 +244,63 @@ for name, img, expect in (('the logo over a flat picture', paint(np.full(art.sha
 check('a QR code lights the mask well past the match threshold (so only the off-mask test rejects it)',
       np.count_nonzero(lf._edges(qr) & lmask) >= logo[3])
 
+# A QR code with big modules lights only the module borders, few enough to pass the
+# off-mask test, so when a match leaves more than half the rest of the box lit,
+# check_frame also refuses it if a QR code can be read in the logo's quarter of the screen.
+# Frames go in as yuv420p, what the decoder hands VideoProc.
+import av
+import zxingcpp
+def yuv_frame(gray):
+    gray = np.pad(np.asarray(gray, np.uint8), ((0, gray.shape[0] % 2), (0, gray.shape[1] % 2)), mode='edge')
+    chroma = np.full((gray.shape[0] // 2, gray.shape[1]), 128, np.uint8)
+    return av.VideoFrame.from_ndarray(np.vstack([gray, chroma]), format='yuv420p')
+
+top, left = 360, 560    # in the bottom-right quarter of a 480x720 frame
+framed = ((top, left), (top + art.shape[0], left + art.shape[1]), lmask, logo[3])
+def in_box(img):
+    return img[top:top+art.shape[0], left:left+art.shape[1]]
+picture = np.full((480, 720), 60.0)
+in_box(picture)[:] = paint(in_box(picture))
+check('check_frame sees the logo', lf.check_frame(yuv_frame(picture), framed))
+# a softened code with 3px modules over the left part of the box: the logo still lights its
+# mask, and the code leaves more of the box lit than a show frame would, but not too much
+code = ndimage.gaussian_filter(np.array(zxingcpp.create_barcode('https://example.com/a', zxingcpp.BarcodeFormat.QRCode)
+                                        .to_image(scale=3, add_quiet_zones=True), np.float64), 0.7)
+covered = picture.copy()
+cy, cx = top + art.shape[0] // 2 - code.shape[0] // 2, left + 54 - code.shape[1]
+covered[cy:cy+code.shape[0], cx:cx+code.shape[1]] = code
+box_edges = lf._edges(in_box(covered))
+share = np.count_nonzero(box_edges & ~lmask) / np.count_nonzero(~lmask)
+check('a QR code beside the logo passes the edge tests but is over the QR threshold',
+      lf._logo_matches(box_edges, framed) and share > .5, f'off-mask share {share:.2f}')
+check('check_frame refuses it because the code can be read', not lf.check_frame(yuv_frame(covered), framed))
+elsewhere = picture.copy()
+elsewhere[20:20+code.shape[0], 20:20+code.shape[1]] = code
+check('a QR code in another quarter does not hide the logo', lf.check_frame(yuv_frame(elsewhere), framed))
+
+# The real case (private only: these are frames of a recording): a QR code over a bug that
+# ran .62-.75 off-mask, as frames that pass the edge tests (with the code fully on screen:
+# while it slides in it can't be read), plus show frames of the same bug.  Each is the
+# bottom-right quarter of a 1080p frame, where the bug sits.
+qr_path = os.path.join(_PRIVATE, 'qr-over-logo.npz')
+if os.path.exists(qr_path):
+    z = np.load(qr_path)
+    t_, l_, b_, r_ = (int(v) for v in z['box'])
+    def full_frame(q):  # put the quarter back in its corner of a frame
+        f = np.zeros((q.shape[0] * 2, q.shape[1] * 2), np.uint8)
+        f[q.shape[0]:, q.shape[1]:] = q
+        return yuv_frame(f)
+    qh, qw = z['qr'].shape[1:]
+    real = ((t_ + qh, l_ + qw), (b_ + qh, r_ + qw), z['mask'], int(z['thresh']))
+    passed = [lf._logo_matches(lf._edges(q[t_:b_, l_:r_]), real) for q in z['qr']]
+    check(f'real QR frames: all {len(passed)} pass the edge tests', all(passed), f'{sum(passed)} pass')
+    seen = [lf.check_frame(full_frame(q), real) for q in z['qr']]
+    check('real QR frames: check_frame refuses every one', not any(seen), f'{sum(seen)} read as logo')
+    seen = [lf.check_frame(full_frame(q), real) for q in z['show']]
+    check(f'real show frames: check_frame sees the logo in all {len(seen)}', all(seen), f'{sum(seen)} seen')
+else:
+    print(f'(no {os.path.relpath(qr_path, _HERE)}: real QR-over-logo frames not checked)')
+
 # An overlay found on a recording with no usable logo must still reach the blank check, or
 # the banner (or the stuck bug) stays in the blank statistics and no frame can read as blank.
 for name, s, fc, shape, e in fixtures():

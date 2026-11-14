@@ -67,3 +67,9 @@ Station logos are deliberately left intact, since the logo is what is under test
 - synthetic overlays composited onto a real map: a scrolling band with disconnected pieces,
   a band flush with the frame edge, core-size boundaries at 1/49/100/400px, a graded skirt,
   an oversized region, and a scatter of edges beside a removed banner
+- per-frame matching: dense overlays fail the off-mask test, and a QR code that passes it (a
+  synthetic one beside the logo) is still refused by `check_frame`, while one in another
+  quarter of the screen is not. `private/qr-over-logo.npz` adds real frames: the bottom-right
+  quarter of frames where a QR code over a bug passed the edge tests, and of show frames of
+  the same bug. It has no scrubbed counterpart in `fixtures/`, since they are frames of a
+  recording.
