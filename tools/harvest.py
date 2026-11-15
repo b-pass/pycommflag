@@ -864,10 +864,21 @@ def model_name(path):
 def ens_path(cache, meta):
     return os.path.join(cache, 'ens', meta['key'] + '.npz')
 
-def load_ens(cache, meta, models):
-    """(times, probs[model, time]) for `models` (paths), or None if any is missing."""
-    p = ens_path(cache, meta)
+def ens_current(p, meta):
+    """Whether the output cached at p was computed from the log as it is now: the log's stamp
+    when it was run, or, for output saved without one, written after the log last changed."""
     if not os.path.exists(p):
+        return False
+    with np.load(p) as z:
+        if 'stamp' in z.files:
+            return z['stamp'].tolist() == list(meta['stamp'])
+    return os.path.getmtime(p) >= meta['stamp'][1]
+
+def load_ens(cache, meta, models):
+    """(times, probs[model, time]) for `models` (paths), or None if any is missing or the log
+    has changed since they were run."""
+    p = ens_path(cache, meta)
+    if not ens_current(p, meta):
         return None
     with np.load(p) as z:
         names = [model_name(x) for x in models]
@@ -880,6 +891,8 @@ def select_logs(metas, which, args):
     holdout (machine logs held out for silver), sample (up to 4 recent per channel), or a file
     listing log paths.  Machine logs of channels MythTV has as commercial-free (or flagging off)
     are never candidates, held out or sampled: their old logs still carry false breaks."""
+    if getattr(args, 'skip_channels', None):
+        metas = [m for m in metas if m['role'] != 'machine' or m['chanid'] not in args.skip_channels]
     if which == 'test':
         return [m for m in metas if m['role'] == 'test']
     if which == 'train':
@@ -920,7 +933,7 @@ def cmd_ensemble(args):
     for k, m in enumerate(logs):
         p = ens_path(args.cache, m)
         have = {}
-        if os.path.exists(p):
+        if ens_current(p, m):
             with np.load(p) as z:
                 have = {n: z[n] for n in z.files}
         need = [(n, f) for n, f in zip(names, args.model) if n not in have]
@@ -939,6 +952,7 @@ def cmd_ensemble(args):
                     models[n] = keras.models.load_model(f)
                 have[n] = models[n].predict(gen, verbose=0).flatten().astype(np.float32)
             have['times'] = np.asarray(times, dtype=np.float64)
+            have['stamp'] = np.asarray(m['stamp'], dtype=np.float64)
             tmp = p + '.tmp'
             with open(tmp, 'wb') as fh:
                 np.savez(fh, **have)
@@ -991,7 +1005,11 @@ def cmd_ens_report(args):
 
 # --- label -------------------------------------------------------------------------------------
 
-LABEL_DEFAULTS = dict(com_mean=0.8, show_mean=0.2, veto=0.1, edge_margin=0.0, fp_override=True)
+# fp_override: a fingerprint mark makes a second commercial whatever the models say (short of
+# all of them under `veto`).  Off, because marks also land on title sequences that the guide files
+# under several titles (and on the next programme's opening at a recording's end): a mark the
+# ensemble doesn't second leaves the second undecided, so a mark can confirm a label, never make one.
+LABEL_DEFAULTS = dict(com_mean=0.8, show_mean=0.2, veto=0.1, edge_margin=0.0, fp_override=False)
 
 def spans_of(cache, meta):
     with log_npz(cache, meta['key']) as z:
@@ -1018,6 +1036,8 @@ class Label:
         if lab['fp_override']:
             st[fp & ~self.conflict] = 1
             peff[fp & ~self.conflict] = 1.0
+        else:
+            st[fp & (st != 1)] = -1
         st[self.conflict] = -1
         # the length rules the real output gets: a decided second the post-processed tags
         # disagree with is undecided
@@ -1081,7 +1101,7 @@ def cmd_label(args):
     variants = [('rule as given', {})]
     if args.variants:
         variants += [
-            ('no fingerprint override', dict(fp_override=False)),
+            ('marks make labels (fingerprint override)', dict(fp_override=True)),
             ('mean 0.9 / 0.1', dict(com_mean=0.9, show_mean=0.1)),
             ('mean 0.95 / 0.05', dict(com_mean=0.95, show_mean=0.05)),
             ('edge margin 2 s', dict(edge_margin=2.0)),
@@ -1254,7 +1274,7 @@ def cmd_select(args):
     why = collections.Counter(); cand = []
     unmarked_hours = collections.Counter()
     top = single_series(metas)
-    for m in select_logs(metas, 'candidates', args):
+    for m in select_logs(metas, args.logs, args):
         if m['rec'] in human_recs or (m['filename'] and os.path.realpath(m['filename']) in human_files):
             why['same recording as a hand-labelled log'] += 1; continue
         if m['ntitle'] and (m['ntitle'], norm_title(m.get('subtitle'))) in test_eps:
@@ -1284,11 +1304,30 @@ def cmd_select(args):
     picked, hours = [], 0.0
     per_title, per_chan = collections.Counter(), collections.Counter()
     chan_cap = args.channel_cap if args.channel_cap else args.hours
-    for c in cand:
+    def fits(c):
         t = c['m']['ntitle'] or c['m']['key']
-        if per_title[t] >= args.title_cap or per_chan[c['m']['chanid']] + c['hrs'] > chan_cap or hours + c['hrs'] > args.hours:
-            continue
-        picked.append(c); hours += c['hrs']; per_title[t] += 1; per_chan[c['m']['chanid']] += c['hrs']
+        return not (per_title[t] >= args.title_cap or per_chan[c['m']['chanid']] + c['hrs'] > chan_cap or hours + c['hrs'] > args.hours)
+    def take(c):
+        nonlocal hours
+        picked.append(c); hours += c['hrs']
+        per_title[c['m']['ntitle'] or c['m']['key']] += 1; per_chan[c['m']['chanid']] += c['hrs']
+    if args.spread == 'even':
+        # the channel with the fewest hours so far takes its next log that fits, until none can
+        queue = collections.defaultdict(list)
+        for c in cand:
+            queue[c['m']['chanid']].append(c)
+        while queue:
+            ch = min(queue, key=lambda k: (per_chan[k], k))
+            while queue[ch] and not fits(queue[ch][0]):
+                queue[ch].pop(0)
+            if queue[ch]:
+                take(queue[ch].pop(0))
+            if not queue[ch]:
+                del queue[ch]
+    else:
+        for c in cand:
+            if fits(c):
+                take(c)
     with open(args.out, 'w') as f:
         f.write('log\tchannel\ttitle\thours\tdecided\tbreaks_120s\tbreaks_marked\tconflicts\tfile_version\thuman_logs_on_channel\n')
         for c in picked:
@@ -1318,7 +1357,7 @@ def cmd_review(args):
     os.makedirs(args.out_dir, exist_ok=True)
     rows = []
     for m in metas:
-        if m['role'] != 'machine' or m['commfree']:
+        if m['role'] != 'machine' or m['commfree'] or m['chanid'] in args.skip_channels:
             continue
         L = labels_for(args.cache, m, args.model, by_key, rule, lab, lopts)
         if L is None:
@@ -1447,6 +1486,9 @@ def main(argv=None):
             else:
                 p.add_argument('--fp-' + k.replace('_', '-'), dest='fp_' + k, type=type(v), default=None, help=f'fingerprint rule (default {v})')
         p.add_argument('--holdout-mod', type=int, default=10, help='machine logs whose recording hashes to 0 mod this are held out for silver (0: none)')
+        p.add_argument('--skip-channels', nargs='*', default=[], metavar='CHANID',
+                       help="machine logs of these channels are not candidates, held out, sampled or listed in review.tsv "
+                            "(for channels whose logs carry a known extraction fault); they still serve as fingerprint partners")
         if models:
             p.add_argument('--model', nargs='+', required=True, help='model files')
             for k, v in LABEL_DEFAULTS.items():
@@ -1513,6 +1555,13 @@ def main(argv=None):
     p = sub.add_parser('select', help='choose logs to write')
     common(p, models=True)
     p.add_argument('--hours', type=float, default=200.0)
+    p.add_argument('--logs', choices=('candidates', 'holdout'), default='candidates',
+                   help='candidates: for training.  holdout: the machine logs kept out of candidates (see --holdout-mod), '
+                        'for a validation set no training copy can overlap')
+    p.add_argument('--spread', choices=('even', 'unlabelled-first'), default='even',
+                   help="even: the same hours from every channel, as far as each has them; unlabelled-first: fill the "
+                        "budget from channels with the fewest hand-labelled logs.  Within a channel both take logs "
+                        "with review conflicts, then the newest file version, then the newest recording")
     p.add_argument('--title-cap', type=int, default=3, help='most logs of one title')
     p.add_argument('--channel-cap', type=float, default=30.0, help='most hours of one channel (0: no cap)')
     p.add_argument('--min-decided', type=float, default=0.8)
