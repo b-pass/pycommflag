@@ -22,11 +22,24 @@ _LOGO_EDGE_THRESHOLD = 12 # minimum contrast step, in gray levels, to count as a
 _OVERSCAN = .03   # ignore this fraction of each side; signal artifacts live there
 
 def _edges(data:np.ndarray) -> np.ndarray:
-    # re-cast so that sobel doesn't wrap the u8
-    data = data.astype(np.float32, copy=False)
-    # The /4 is the 3x3 kernel's gain for a step edge, which puts the result back on the input's scale -- a step of N gray levels comes out as N.
-    mag = np.hypot(ndimage.sobel(data, 0), ndimage.sobel(data, 1)) / 4
-    return mag > _LOGO_EDGE_THRESHOLD
+    """Where a gray image has a contrast step of at least _LOGO_EDGE_THRESHOLD levels.
+
+    This is ndimage.sobel's magnitude / 4 (the 3x3 kernel's gain for a step edge, so a step
+    of N gray levels comes out as N) against the threshold, done by slicing: it runs on every
+    sampled frame of the logo search and is most of that search's cost.  8-bit input is
+    summed in integers, which is exact (and the square root is skipped); anything else in
+    float32.  Borders reflect by half a sample, as ndimage does.
+    """
+    ints = data.dtype == np.uint8
+    d = np.pad(data.astype(np.int16 if ints else np.float32, copy=False), 1, mode='symmetric')
+    sm = d[:, :-2] + 2*d[:, 1:-1] + d[:, 2:]    # smooth along x
+    gy = sm[2:] - sm[:-2]                       # then difference along y
+    sm = d[:-2] + 2*d[1:-1] + d[2:]             # smooth along y
+    gx = sm[:, 2:] - sm[:, :-2]                 # then difference along x
+    if ints:
+        gx = gx.astype(np.int32)                # the squares overflow int16
+        gy = gy.astype(np.int32)
+    return gx*gx + gy*gy > (4*_LOGO_EDGE_THRESHOLD)**2
 
 def _blank_margins(a:np.ndarray, shape:tuple) -> np.ndarray:
     """Zero the places neither a logo nor an alert banner can be.  In place.
