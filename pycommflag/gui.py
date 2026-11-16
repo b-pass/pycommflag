@@ -3,11 +3,9 @@ import tkinter.font as tkfont
 import bisect
 import logging as log
 import math
-import queue
-import threading
 import time
 import numpy as np
-from PIL import ImageTk, Image
+from PIL import ImageTk
 from .player import Player
 from . import logo_finder
 from . import processor
@@ -29,11 +27,6 @@ REVIEW_BLANK_SAME = 5 # seconds; blanks this close together are one fade (or fli
 REVIEW_BLANK_GAP = 65 # seconds; blanks inside show this close together are spaced like the ends of ads
 REVIEW_BLANKS = 3 # blanks spaced like that before it asks (a missed break of two ads has three)
 REVIEW_TOL = 0.5 # seconds; a stop this close to the position (or to an edge just flagged) has been seen
-
-# the contact sheet
-SHEET_STEP = 10 # seconds per thumbnail
-SHEET_COLS = 12 # thumbnails per row, so a row is two minutes
-SHEET_THUMB = (96, 54)
 
 def log_fixes(flog:dict, path:str) -> tuple[list[str], str|None]:
     """What the log at `path` is missing that tools/upgrade_log.py can add, and a shell command (with
@@ -367,7 +360,6 @@ class Window(tk.Tk):
         line = tk.Frame(skips)
         line.pack(pady=(5,0))
         for (text, cmd) in (("|< Review", lambda:self.review(-1)),
-                            ("Contact sheet", lambda:self.sheet.show()),
                             ("Review >|", lambda:self.review(1))):
             b = tk.Button(line, text=text, command=cmd)
             b.pack(side=tk.LEFT, padx=5)
@@ -471,14 +463,23 @@ class Window(tk.Tk):
         self.vinfo = tk.Label(infof, font=self.info_font, justify=tk.LEFT, anchor='nw')
         self.vinfo.place(x=0, y=0, relwidth=1, relheight=1)
 
-        self.images = [ImageTk.PhotoImage(Image.new("RGB", (320,180))), ImageTk.PhotoImage(Image.new("RGB", (640,360)))]
+        # shown wherever there is no frame (before the first, after the last, -5s near the ends): an
+        # empty label would shrink to nothing and shift the whole grid
+        self.blank_images = {(320,180): tk.PhotoImage(width=320, height=180),
+                             (640,360): tk.PhotoImage(width=640, height=360)}
+        self.images = [None]*5
         for v in range(len(self.video_labels)):
-            self.video_labels[v].configure(image=self.images[0 if v != 2 else 1])
-        
+            self.video_labels[v].configure(image=self.blank_images[(640,360) if v == 2 else (320,180)])
+        # the log's time starts at 0, but the video's first decodable frame can be a fraction of a
+        # second in, and a tag must be able to start before it
+        self.first_frame_time = 0.0
+        f = self.cursor.window(0)[1]
+        if f is not None:
+            self.first_frame_time = max(0.0, self.cursor.time(f))
+
         self.vMapPos = None
         self.vMaybe = None
         self.tag_canvas_items = []
-        self.sheet = _ContactSheet(self, video, self.video_lag)
         self.drawMap()
 
         self.move(abs=0)
@@ -584,16 +585,25 @@ class Window(tk.Tk):
 
         (prev, cur, nxt) = self.cursor.window(seconds)
         t = self.cursor.time
-        self.position = t(cur) if cur is not None else seconds
-        self.prev_frame_time = t(prev) if prev is not None else self.position - 1/self.frame_rate
-        self.next_frame_time = t(nxt) if nxt is not None else self.position + 1/self.frame_rate
+        if round(seconds, 3) < self.first_frame_time:
+            # before the first frame there is no picture yet; that frame is the next one
+            (prev, cur, nxt) = (None, None, cur)
+            self.position = seconds
+            self.prev_frame_time = 0.0
+            self.next_frame_time = self.first_frame_time
+        else:
+            self.position = t(cur) if cur is not None else seconds
+            if prev is not None:
+                self.prev_frame_time = t(prev)
+            elif self.position <= self.first_frame_time:
+                self.prev_frame_time = 0.0 # back from the first frame goes to the very start
+            else:
+                self.prev_frame_time = max(0.0, self.position - 1/self.frame_rate)
+            self.next_frame_time = t(nxt) if nxt is not None else self.position + 1/self.frame_rate
 
-        if len(self.images) != 5:
-            self.images = [None]*5
         for (n, f, size) in ((1, prev, (320,180)), (2, cur, (640,360)), (3, nxt, (320,180))):
             self.images[n] = ImageTk.PhotoImage(f.to_image(width=size[0], height=size[1])) if f is not None else None
-            # tkinter drops None options, which would leave the old picture up
-            self.video_labels[n].configure(image=self.images[n] if self.images[n] is not None else '')
+            self.video_labels[n].configure(image=self.images[n] or self.blank_images[size])
 
         # the -5s/+5s thumbnails are drawn just after the main frames have shown up, and only for
         # the last of several quick moves
@@ -609,13 +619,12 @@ class Window(tk.Tk):
             at = self.position + d
             f = self.thumb_cursors[i].window(at)[1] if 0 <= at <= self.duration else None
             self.images[n] = ImageTk.PhotoImage(f.to_image(width=320, height=180)) if f is not None else None
-            self.video_labels[n].configure(image=self.images[n] if self.images[n] is not None else '')
+            self.video_labels[n].configure(image=self.images[n] or self.blank_images[(320,180)])
 
     def updatePosIndicators(self):
         self.pos_label.configure(text=f'{int(self.position/60):02}:{self.position%60:06.03f}')
         self.updateInfo()
         self.updateReview()
-        self.sheet.update_position()
         
         self.scale_pos.set(self.position/60) #self.scroller.set(self.position/60)
         x = math.ceil(self.position / (self.duration / self.map_width))
@@ -783,7 +792,6 @@ class Window(tk.Tk):
 
         self.review_cache = None
         self.drawReviewMarks()
-        self.sheet.recolor()
 
     def drawReviewMarks(self):
         # a tick at the top of the tags row for each review stop, orange until it has been seen
@@ -795,7 +803,6 @@ class Window(tk.Tk):
                                        fill='grey40' if self._is_reviewed(t) else 'orange')
         if self.vMapPos is not None:
             self.mapCanvas.tag_raise(self.vMapPos)
-        self.sheet.mark_review()
 
     def drawMap(self):
         for x in self.mapCanvas.find_all():
@@ -939,8 +946,6 @@ class Window(tk.Tk):
 
     def destroy(self):
         # however the window goes (Save, the window manager's close), nothing may be left pending
-        if getattr(self, 'sheet', None) is not None:
-            self.sheet.close()
         if getattr(self, 'thumb_job', None) is not None:
             self.after_cancel(self.thumb_job)
             self.thumb_job = None
@@ -949,184 +954,6 @@ class Window(tk.Tk):
     def run(self):
         tk.mainloop()
         return self.result
-
-    def tag_at(self, t):
-        """The tag type at time `t`."""
-        i = bisect.bisect_right([b for (_,(b,_)) in self.tags], t) - 1
-        return self.tags[max(0, i)][0] if self.tags else SceneType.SHOW
-
-class _ContactSheet:
-    """A window of one thumbnail every SHEET_STEP seconds of the whole recording, each framed in the
-    colour of its tag with the model's highest commercial probability in it as a bar underneath;
-    clicking one moves the editor there.  A run of ads stands out from the show at a glance, which
-    is the quick way to find a break the tags miss altogether."""
-
-    LABEL_W = 50
-    CELL_W = SHEET_THUMB[0] + 8
-    CELL_H = SHEET_THUMB[1] + 14
-
-    def __init__(self, win, video, lag=0.0):
-        self.win = win
-        self.video = video
-        self.lag = lag # log time - the video's
-        self.n = max(1, int(math.ceil(win.duration / SHEET_STEP)))
-        self.times = [k*SHEET_STEP for k in range(self.n)] # each thumbnail's time, once it is decoded
-        self.photos = [None]*self.n
-        self.prob = [0.0]*self.n
-        for (t,v) in win.raw:
-            k = int(t // SHEET_STEP)
-            if 0 <= k < self.n:
-                self.prob[k] = max(self.prob[k], float(v))
-        self.top = None
-        self.canvas = None
-        self.frames = {} # canvas item ids, per slot
-        self.cursor = None
-        self.done = queue.Queue()
-        self.stop = threading.Event()
-        self.poll_job = None
-
-    def _start(self):
-        # decoding waits for the window to be asked for
-        threading.Thread(target=self._decode, daemon=True).start()
-        self.poll_job = self.win.after(100, self._poll)
-
-    def _decode(self):
-        # its own Player, on this thread; seeking to each slot and decoding just the keyframe
-        # there is far cheaper than decoding the recording through
-        try:
-            player = Player(self.video, no_deinterlace=True)
-            player._skip_frames('NONKEY')
-            vt_start = float(player.vt_start)
-            for k in range(self.n):
-                if self.stop.is_set():
-                    return
-                # in a .ts this lands on the first keyframe after the slot's start, a GOP into it
-                player.seek(max(0.0, k*SHEET_STEP - self.lag))
-                frames = player.frames()
-                try:
-                    f = next(frames, None)
-                finally:
-                    frames.close()
-                if f is None or f.time is None:
-                    continue
-                self.done.put((k, f.time - vt_start + self.lag, f.to_image(width=SHEET_THUMB[0], height=SHEET_THUMB[1])))
-        except Exception:
-            log.exception('contact sheet decoding failed')
-
-    def close(self):
-        # a pending after() whose window is destroyed fails with "invalid command name" when it fires
-        self.stop.set()
-        if self.poll_job is not None:
-            self.win.after_cancel(self.poll_job)
-            self.poll_job = None
-
-    def _poll(self):
-        self.poll_job = None
-        try:
-            while True:
-                (k, t, img) = self.done.get_nowait()
-                self.times[k] = t
-                self.photos[k] = ImageTk.PhotoImage(img)
-                if self.canvas is not None:
-                    self.canvas.itemconfigure(self.frames[k]['img'], image=self.photos[k])
-                    self._color(k)
-        except queue.Empty:
-            pass
-        except tk.TclError:
-            return # the editor has gone
-        if not self.stop.is_set():
-            self.poll_job = self.win.after(200, self._poll)
-
-    def _xy(self, k):
-        return (self.LABEL_W + (k % SHEET_COLS) * self.CELL_W, (k // SHEET_COLS) * self.CELL_H)
-
-    def show(self):
-        if self.top is not None:
-            self.top.deiconify()
-            self.top.lift()
-            return
-        self._start()
-        self.top = tk.Toplevel(self.win)
-        self.top.title('pycommflag contact sheet')
-        self.top.protocol('WM_DELETE_WINDOW', self.top.withdraw)
-        rows = int(math.ceil(self.n / SHEET_COLS))
-        width = self.LABEL_W + SHEET_COLS * self.CELL_W
-        height = rows * self.CELL_H
-        self.canvas = tk.Canvas(self.top, width=width, height=min(height, 900), scrollregion=(0, 0, width, height),
-                                yscrollincrement=self.CELL_H)
-        bar = tk.Scrollbar(self.top, orient=tk.VERTICAL, command=self.canvas.yview)
-        self.canvas.configure(yscrollcommand=bar.set)
-        self.canvas.grid(row=0, column=0, sticky='nswe')
-        bar.grid(row=0, column=1, sticky='ns')
-        self.top.rowconfigure(0, weight=1)
-        self.canvas.bind('<Button-1>', self._click)
-        self.canvas.bind('<Button-4>', lambda e: self.canvas.yview_scroll(-1, 'units'))
-        self.canvas.bind('<Button-5>', lambda e: self.canvas.yview_scroll(1, 'units'))
-        self.canvas.bind('<MouseWheel>', lambda e: self.canvas.yview_scroll(-1 if e.delta > 0 else 1, 'units'))
-        self.top.bind('n', lambda e: self.win.review(1))
-        self.top.bind('p', lambda e: self.win.review(-1))
-
-        (tw, th) = SHEET_THUMB
-        for r in range(rows):
-            m = r * SHEET_COLS * SHEET_STEP / 60
-            self.canvas.create_text(self.LABEL_W - 6, r * self.CELL_H + 4, anchor='ne', text=f'{int(m)}:{int(m*60)%60:02}')
-        for k in range(self.n):
-            (x, y) = self._xy(k)
-            ids = {}
-            ids['frame'] = self.canvas.create_rectangle(x+1, y+1, x+tw+7, y+th+7, width=0)
-            ids['img'] = self.canvas.create_image(x+4, y+4, anchor='nw')
-            if self.photos[k] is not None:
-                self.canvas.itemconfigure(ids['img'], image=self.photos[k])
-            ids['prob'] = self.canvas.create_rectangle(x+4, y+th+9, x+4+max(1, round(self.prob[k]*tw)), y+th+12,
-                                                        width=0, fill='darkred')
-            ids['review'] = self.canvas.create_oval(x+tw-4, y+6, x+tw+2, y+12, width=0, fill='orange', state='hidden')
-            self.frames[k] = ids
-        self.cursor = self.canvas.create_rectangle(0, 0, 0, 0, outline='orange', width=3)
-        self.recolor()
-        self.mark_review()
-        self.update_position()
-
-    def _click(self, e):
-        x = self.canvas.canvasx(e.x) - self.LABEL_W
-        y = self.canvas.canvasy(e.y)
-        if x < 0:
-            return
-        k = int(y // self.CELL_H) * SHEET_COLS + int(x // self.CELL_W)
-        if 0 <= k < self.n and int(x // self.CELL_W) < SHEET_COLS:
-            self.win.move(abs=self.times[k])
-
-    def _color(self, k):
-        c = SceneType.color_map().get(self.win.tag_at(self.times[k] + 0.5))
-        self.canvas.itemconfigure(self.frames[k]['frame'], fill=c if c is not None else 'grey50')
-
-    def recolor(self):
-        if self.canvas is None:
-            return
-        for k in range(self.n):
-            self._color(k)
-
-    def mark_review(self):
-        # a dot on each thumbnail holding a review stop not seen yet
-        if self.canvas is None:
-            return
-        todo = set()
-        for (t,_,_) in self.win._review_items():
-            if not self.win._is_reviewed(t):
-                todo.add(int(t // SHEET_STEP))
-        for k in range(self.n):
-            self.canvas.itemconfigure(self.frames[k]['review'], state='normal' if k in todo else 'hidden')
-
-    def update_position(self):
-        if self.canvas is None:
-            return
-        k = min(self.n - 1, max(0, int(self.win.position // SHEET_STEP)))
-        (x, y) = self._xy(k)
-        self.canvas.coords(self.cursor, x, y, x + self.CELL_W - 1, y + self.CELL_H - 1)
-        # keep it in view
-        height = int(math.ceil(self.n / SHEET_COLS)) * self.CELL_H
-        (top, bottom) = self.canvas.yview()
-        if y < top * height or y + self.CELL_H > bottom * height:
-            self.canvas.yview_moveto(max(0, (y - (bottom - top) * height / 2) / height))
 
 class _Cursor:
     """Decoded frames around a position in a Player, decoding forward rather than seeking when it can."""
