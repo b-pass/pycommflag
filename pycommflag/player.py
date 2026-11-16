@@ -14,6 +14,8 @@ class Player:
         self.streams = {'video':0}
         self.aq = None
         self._audio_res = []
+        self._a_end = None
+        self._a_off = 0
         self.shape = (-1,-1)
 
         self._resync(None)
@@ -164,6 +166,8 @@ class Player:
         # 0.2-1s after audio in OTA .ts).  Audio before the video start comes out negative and
         # AudioProc drops it.
         when = af.time - self.vt_start
+        if not self._check_audio_time(when, len(main) / af.sample_rate):
+            return
 
         if self.aq and \
             self.aq[-1][3] == af.sample_rate and \
@@ -188,7 +192,9 @@ class Player:
         if self.graph:
             self._create_graph()
         self.aq = [] if 'audio' in self.streams else None
-    
+        self._a_end = None
+        self._a_off = 0
+
     def _create_graph(self):
         self.graph = av.filter.Graph()
         buffer = self.graph.add_buffer(template=self._video_stream())
@@ -259,6 +265,39 @@ class Player:
                         log.info(f"Skipping a frame whose timestamp jumps {float((pts - last_pts) * self.vtime_base):.0f}s ahead")
                     return False, last_pts, ahead
         return True, pts, 0
+
+    # Audio needs the same guard.  A single audio frame stamped hours ahead would open a segment
+    # there that the following audio is appended to, and AudioProc would zero-fill up to it
+    # (gigabytes) and then drop everything after it as already played: the rest of the
+    # recording goes silent.  Ahead is measured from whichever is later, the end of the last
+    # audio accepted or the video position, so audio resuming in step with the video after a
+    # gap of its own is taken at once.
+    #
+    # Unlike video, audio may step back: replays after a recovery seek, and frames restamped a
+    # little early, go on to AudioProc, which trims the overlap and keeps the rest.  Only a frame
+    # MAX_PTS_JUMP behind the last audio is skipped.  AudioProc would drop it too, but taking it
+    # as the new reference would make the good frames after it look like a jump ahead.
+    def _check_audio_time(self, when, length):
+        """Whether to queue an audio frame starting `when` (seconds from the video start)."""
+        ahead_of = self._a_end
+        if self.vpts is not None:
+            vpos = float(self.vpts * self.vtime_base - self.vt_start)
+            ahead_of = vpos if ahead_of is None else max(ahead_of, vpos)
+        jump = 0.0
+        if ahead_of is not None and when - ahead_of > self.MAX_PTS_JUMP:
+            jump = when - ahead_of
+        elif self._a_end is not None and self._a_end - when > self.MAX_PTS_JUMP:
+            jump = when - self._a_end
+        if jump:
+            self._a_off += 1
+            if self._a_off < self.PTS_JUMP_CONFIRM:
+                if self._a_off == 1:
+                    log.info(f"Skipping an audio frame whose timestamp jumps {abs(jump):.0f}s "
+                             f"{'ahead' if jump > 0 else 'back'}")
+                return False
+        self._a_off = 0
+        self._a_end = when + length
+        return True
 
     def move_audio(self)->list[tuple[np.ndarray,np.ndarray|None,float,int]]|None:
         x = self.aq

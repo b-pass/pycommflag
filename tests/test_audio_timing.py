@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Checks that AudioProc puts audio on the right timeline.
+"""Checks that Player and AudioProc put audio on the right timeline.
 
 Audio segments arrive as (main, surround, time, rate), with times measured from the video
 start, so they can be negative (audio that starts before the video), repeat audio already
 seen (replays after a recovery seek), or leave holes.  Each case feeds 1kHz bursts at
 known times and checks where the RMS volume says they landed.
+
+The last cases feed fake audio frames through Player._queue_audio, where a frame stamped far
+ahead or behind must be skipped rather than silencing everything after it.
 
 The segmenter and TensorFlow are stubbed out: only the timeline is under test.
 
@@ -13,6 +16,7 @@ Run it directly; it exits non-zero if anything fails.
 import os
 import sys
 import types
+from fractions import Fraction
 
 import numpy as np
 
@@ -25,6 +29,7 @@ sys.modules.setdefault('tensorflow', _tf)
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from pycommflag import processor
+from pycommflag.player import Player
 
 class _Seg:
     def __call__(self, samples):
@@ -88,6 +93,94 @@ rms = run(segs)
 fg, rg = onsets(rms, 1), onsets(rms, 2)
 check('front lands after a hole', near(fg, [2.0]), f'burst at {fg}')
 check('surround lands with the front after a hole', near(rg, [2.0]), f'burst at {rg}')
+
+# --- Player._queue_audio: timestamps far from the audio and video ---
+
+AF = 1536  # samples per frame, as AC-3 has
+
+def make_player():
+    p = Player.__new__(Player)
+    p.aq = []
+    p.streams = {'video': 0, 'audio': 0}
+    p.vt_start = 0.0
+    p.vtime_base = Fraction(1, 90000)
+    p.vpts = 0
+    p._a_end = None
+    p._a_off = 0
+    return p
+
+def frame(stamp, x):
+    """a fake stereo AudioFrame stamped `stamp` holding samples x"""
+    d = np.vstack([x, x]).astype('float32')
+    return types.SimpleNamespace(time=stamp, sample_rate=SR, to_ndarray=lambda: d,
+                                 layout=types.SimpleNamespace(channels=[None, None]))
+
+def feed(p, t0, t1, bursts, stamp=lambda i, t: t, video=lambda t: t, drain=1.0):
+    """frames covering [t0,t1), the video kept at video(t); returns the drained segments"""
+    out = []
+    x = tone(t0, t1, bursts)
+    nexttake = t0 + drain
+    for i in range(len(x) // AF):
+        t = t0 + i*AF/SR
+        p.vpts = int(round(video(t) * 90000))
+        p._queue_audio(frame(stamp(i, t), x[i*AF:(i+1)*AF]))
+        if t >= nexttake:
+            out += p.move_audio()
+            nexttake += drain
+    return out + p.move_audio()
+
+# one frame at 5s stamped 12 hours ahead: the burst at 15s must still land at 15s
+p = make_player()
+bad = int(5*SR/AF)
+segs = feed(p, 0, 20, [(15, 15.5)], stamp=lambda i, t: t + 12*3600 if i == bad else t)
+latest = max(s[2] for s in segs)
+check('a lone far-future audio frame is never queued', latest < 20, f'latest segment at {latest:.0f}s')
+got = onsets(run(segs), 1)
+check('audio after a far-future frame lands on time', near(got, [15.0]), f'burst at {got}')
+
+# one frame at 5s stamped 12 hours back, then one at 8s stamped 1 hour back with the video
+# still at 0 (no help from the video position): neither queued, and later audio on time
+p = make_player()
+bad2 = int(8*SR/AF)
+segs = feed(p, 0, 20, [(15, 15.5)],
+            stamp=lambda i, t: t - 12*3600 if i == bad else (t - 3600 if i == bad2 else t),
+            video=lambda t: 0.0)
+earliest = min(s[2] for s in segs)
+check('a lone far-past audio frame is never queued', earliest >= 0, f'earliest segment at {earliest:.0f}s')
+got = onsets(run(segs), 1)
+check('audio after a far-past frame lands on time', near(got, [15.0]), f'burst at {got}')
+
+# a short replay (2s back, as after a recovery seek) still reaches AudioProc to be trimmed
+p = make_player()
+feed(p, 0, 5, [])
+segs = feed(p, 3, 4, [])
+n = sum(len(s[0]) for s in segs)
+check('a short replay is still queued', n == int(SR/AF)*AF, f'{n} samples')
+
+# the audio clock really moves an hour ahead of the video: taken from the 5th frame on
+p = make_player()
+segs = feed(p, 0, 1, [], stamp=lambda i, t: t + 3600, video=lambda t: 0.0)
+n = sum(len(s[0]) for s in segs)
+want = (int(SR/AF) - (Player.PTS_JUMP_CONFIRM - 1)) * AF
+check('a lasting audio jump is followed after PTS_JUMP_CONFIRM frames', n == want, f'{n} samples, want {want}')
+check('...at its own time', abs(segs[0][2] - (3600 + (Player.PTS_JUMP_CONFIRM-1)*AF/SR)) < 1e-6,
+      f'starts at {segs[0][2]:.3f}')
+
+# audio stops for 30s while the video runs on, then resumes in step with the video: nothing lost
+p = make_player()
+feed(p, 0, 1, [])
+segs = feed(p, 31, 32, [])
+n = sum(len(s[0]) for s in segs)
+check('audio resuming with the video after a gap is taken at once', n == int(SR/AF)*AF, f'{n} samples')
+
+# a seek clears the reference
+p = make_player()
+p.graph = None
+p._skip_frames = lambda mode: None
+feed(p, 0, 1, [])
+p._a_off = 3
+p._flush()
+check('_flush resets the audio jump guard', p._a_end is None and p._a_off == 0)
 
 if _fails:
     print(f'{len(_fails)} failed')
