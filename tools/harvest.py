@@ -1009,7 +1009,7 @@ def cmd_ens_report(args):
 # all of them under `veto`).  Off, because marks also land on title sequences that the guide files
 # under several titles (and on the next programme's opening at a recording's end): a mark the
 # ensemble doesn't second leaves the second undecided, so a mark can confirm a label, never make one.
-LABEL_DEFAULTS = dict(com_mean=0.8, show_mean=0.2, veto=0.1, edge_margin=0.0, fp_override=False)
+LABEL_DEFAULTS = dict(com_mean=0.8, show_mean=0.2, veto=0.1, edge_margin=0.0, fp_override=False, tail=300.0)
 
 def spans_of(cache, meta):
     with log_npz(cache, meta['key']) as z:
@@ -1047,6 +1047,15 @@ class Label:
         if lab['edge_margin'] > 0:
             d = boundary_distance(self.tags, times)
             st[d < lab['edge_margin']] = -1
+        if lab['tail'] > 0 and len(times):
+            # A recording's ending is where the models agree and are wrong together: closing scenes
+            # and credits after the last break called commercial.  Undecided from `tail` seconds
+            # before the end, and from the start of a break that runs into that.
+            cut = float(times[-1]) - lab['tail']
+            for tt, (b, e) in self.tags:
+                if tt == COM and e > cut:
+                    cut = min(cut, b)
+            st[times >= cut] = -1
         self.state = st
 
     def decided(self):

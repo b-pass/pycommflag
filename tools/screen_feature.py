@@ -148,7 +148,73 @@ def cand_rear_ratio(frames, timestamps, frame_rate):
     front = _window_mean(timestamps, frames[:, neural.FVOL], 0.5)
     return [np.log((rear + eps) / (front + eps))]
 
-REPEAT_CUTS = 5         # consecutive cut-to-cut intervals that make one pattern
+VOL_FLOOR = 0.01 # rescaled volume this low is digital quiet; keeps the dB level finite
+
+def _vol_db(frames):
+    return 20 * np.log10(frames[:, neural.FVOL].astype('float64') + VOL_FLOOR)
+
+def _one_sided_mean(timestamps, values, before, after):
+    """Mean of values over [t - before, t + after] (either may be 0 for a one-sided window)."""
+    csum = np.concatenate(([0.0], np.cumsum(values, dtype='float64')))
+    lo = np.searchsorted(timestamps, timestamps - before)
+    hi = np.searchsorted(timestamps, timestamps + after, 'right')
+    return (csum[hi] - csum[lo]) / np.maximum(hi - lo, 1)
+
+def cand_vol_db(frames, timestamps, frame_rate):
+    """Front volume in dB over the surrounding second (median-rescaled, so 0 dB = the
+    recording's median): the same step is the same size at any level."""
+    v = _window_mean(timestamps, frames[:, neural.FVOL], 0.5)
+    return [20 * np.log10(v + VOL_FLOOR)]
+
+def cand_vol_contrast(frames, timestamps, frame_rate):
+    """dB of mean front volume over the next 20s minus the previous 20s: a loudness step."""
+    v = frames[:, neural.FVOL]
+    after = _one_sided_mean(timestamps, v, 0, 20)
+    before = _one_sided_mean(timestamps, v, 20, 0)
+    return [20 * np.log10((after + VOL_FLOOR) / (before + VOL_FLOOR))]
+
+def cand_vol_spread(frames, timestamps, frame_rate):
+    """Std of the per-frame dB level over +-5s: heavier compression (ads) reads flatter."""
+    db = _vol_db(frames)
+    m = _window_mean(timestamps, db, 5.0)
+    m2 = _window_mean(timestamps, db * db, 5.0)
+    return [np.sqrt(np.maximum(m2 - m * m, 0))]
+
+GAP_LEVEL = 0.01 # rescaled front and rear volume both under this is silence
+GAP_MIN = 0.1    # seconds a silence must last: the gap spliced between two ads is ~130ms
+
+def _gaps(frames, timestamps, frame_rate):
+    """(start, end) frame index of each silence lasting GAP_MIN or more; the quiet distances
+    (branch quiet-distance) counted any quiet frame, this only counts a held one."""
+    q = (frames[:, neural.FVOL] < GAP_LEVEL) & (frames[:, neural.RVOL] < GAP_LEVEL)
+    d = np.diff(np.concatenate(([0], q.astype('int8'), [0])))
+    s, e = np.flatnonzero(d == 1), np.flatnonzero(d == -1)
+    t_end = np.append(timestamps, timestamps[-1] + 1/frame_rate)
+    keep = t_end[e] - timestamps[s] >= GAP_MIN
+    return s[keep], e[keep]
+
+def _gap_mask(frames, timestamps, frame_rate):
+    mask = np.zeros(len(frames), dtype=bool)
+    for s, e in zip(*_gaps(frames, timestamps, frame_rate)):
+        mask[s:e] = True
+    return mask
+
+def cand_gap(frames, timestamps, frame_rate):
+    """A silence of GAP_MIN or more within the surrounding second (a flag per second)."""
+    return [(_window_mean(timestamps, _gap_mask(frames, timestamps, frame_rate), 0.5) > 0).astype('float32')]
+
+def cand_gap_dist(frames, timestamps, frame_rate):
+    """Seconds since/until the nearest silence of GAP_MIN or more."""
+    return [neural._scale_dist(d) for d in _since_until(timestamps, _gap_mask(frames, timestamps, frame_rate))]
+
+def cand_gap_rate(frames, timestamps, frame_rate):
+    """Silences of GAP_MIN or more starting within +-15s (log1p): ads splice one every 15-30s."""
+    s, _ = _gaps(frames, timestamps, frame_rate)
+    st = timestamps[s]
+    counts = np.searchsorted(st, timestamps + 15, 'right') - np.searchsorted(st, timestamps - 15)
+    return [np.log1p(counts) / np.log1p(10)]
+
+REPEAT_CUTS = 5       # consecutive cut-to-cut intervals that make one pattern
 REPEAT_TOL = 0.05       # seconds each cut may be off, measured from the pattern's first cut
 REPEAT_MIN_SPAN = 3.0   # seconds a pattern must cover: rapid cutting matches itself by chance
 REPEAT_MIN_APART = 60.0 # seconds between two airings, so a pattern can't match its own neighbour
@@ -201,6 +267,12 @@ CANDIDATES = {
     'audio_flips': cand_audio_flips,
     'music_wide': cand_music_wide,
     'rear_change': cand_rear_change,
+    'vol_db': cand_vol_db,
+    'vol_contrast': cand_vol_contrast,
+    'vol_spread': cand_vol_spread,
+    'gap': cand_gap,
+    'gap_dist': cand_gap_dist,
+    'gap_rate': cand_gap_rate,
 }
 
 # --- loading
