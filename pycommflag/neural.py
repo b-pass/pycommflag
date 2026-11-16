@@ -1201,6 +1201,17 @@ def post_predict(flog:dict, prediction, times, opts:Any, threshold=0.5, spans=No
     
     #log.debug(f'Post n={len(results)}: {str(results)}')
 
+    # read_feature_spans' blank track starts as blank at 0, so a break the recording starts in
+    # snaps onto that phantom blank's middle, before any video. The mark goes on the first frame
+    # instead, where a player that starts at frame 0 still reaches it.
+    first = next((f[0] for f in flog.get('frames', []) if f is not None), 0.0)
+    while results and results[0][1][0] < first:
+        (t, (b, e)) = results[0]
+        if e > first:
+            results[0] = (t, (first, e))
+        else:
+            del results[0]
+
     return results
 
 def diff_tags(realtags, result) -> tuple[float,float,list]:
