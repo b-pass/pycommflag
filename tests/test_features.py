@@ -72,6 +72,24 @@ if c is not None:
     c11 = neural.load_nonpersistent(flog11)
     check('an extra cc_text column changes nothing the model sees', c11 is not None and np.array_equal(c, c11))
 
+    # a 130ms dip to silence (4 frames) becomes SILENCE; a 60ms one (2 frames) does not
+    def second_of(c, t):
+        return c[np.flatnonzero((c[:, neural.TIMESTAMPS] >= t) & (c[:, neural.TIMESTAMPS] < t + 1))[0]]
+    dipped = [list(r) for r in rows]
+    i130, i60 = times.index(next(x for x in times if x >= 100.3)), times.index(next(x for x in times if x >= 200.3))
+    for i in range(i130, i130 + 4):
+        dipped[i][4] = 0
+    for i in range(i60, i60 + 2):
+        dipped[i][4] = 0
+    cd = neural.load_nonpersistent(dict(flog, frames=dipped))
+    s130, s60, s0 = second_of(cd, 100), second_of(cd, 200), second_of(c, 100)
+    share = 4 / np.count_nonzero((np.array(times) >= 100) & (np.array(times) < 101))
+    check('a 130ms silence is labelled SILENCE for its share of the second',
+          abs(s130[neural.SILENCE] - share) < 1e-4 and abs(s130[neural.SPEECH] - (1 - share)) < 1e-4,
+          f'silence {s130[neural.SILENCE]:.4f} speech {s130[neural.SPEECH]:.4f} want {share:.4f}')
+    check('a 60ms silence is not', s60[neural.SILENCE] == 0 and s60[neural.SPEECH] == s0[neural.SPEECH],
+          f'silence {s60[neural.SILENCE]:.4f}')
+
     # condensing goes by time, one row a second (the last second can be a partial one)
     body = c[neural.WINDOW_BEFORE:-neural.WINDOW_AFTER]
     step = np.diff(body[:-1, neural.TIMESTAMPS])
@@ -128,6 +146,27 @@ for k, s in enumerate(np.unique(sec)):
             neural.WEIGHTS: 0 if ww.min() < .1 else ww.max()}
     bad += [col for col, v in want.items() if abs(got[k, col] - v) > 1e-5]
 check("condense's per-second stats match numpy's", len(got) == len(np.unique(sec)) and not bad, str(sorted(set(bad))))
+
+# the DIFF column counts cuts a second, whatever the frame rate: the same cuts read the same at
+# 24 (uneven), 30 and 60 fps, and a cut that spans two frames is still one
+cut_times = np.array([2.2, 3.5, 3.9, 7.1, 9.6])
+def cuts_at(rate, split, uneven=False):
+    t = np.arange(0, 12, 1 / rate)
+    if uneven:
+        t = np.cumsum(rng.choice([0.03337, 0.05005], 400))[:int(12 * 24)]
+    f = np.zeros((len(t), neural.GENERATED_FEATURES_START), 'float32')
+    for c in cut_times:
+        i = int(np.searchsorted(t, c))
+        f[i, neural.DIFF] = 1
+        if split:
+            f[i + 1, neural.DIFF] = .8
+    z = np.zeros((len(t), 1), 'float32')
+    return neural.condense(f, t, z, z + 1, 1.0)[:, neural.DIFF]
+want = np.bincount(cut_times.astype(int), minlength=12)
+for name, got in (('30 fps', cuts_at(29.97, False)), ('30 fps, cuts split over two frames', cuts_at(29.97, True)),
+                  ('59.94 fps', cuts_at(59.94, False)), ('uneven ~24 fps', cuts_at(24, False, True))):
+    n = min(len(got), len(want))
+    check(f'DIFF is cuts a second at {name}', np.allclose(got[:n], want[:n]), f'{got[:n]} want {want[:n]}')
 
 if _fails:
     print(f'{len(_fails)} failed')

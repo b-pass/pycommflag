@@ -58,8 +58,14 @@ WINDOW_BEFORE = 60
 WINDOW_AFTER = 60
 SUMMARY_RATE = 1
 
-# LOGO_RUN, BLANK_SINCE and BLANK_UNTIL are distances in seconds, capped here 
+# LOGO_RUN, BLANK_SINCE and BLANK_UNTIL are distances in seconds, capped here
 DIST_CAP = 300.0
+
+# A run of frames with both volumes (rescaled by the recording's median) under SILENCE_GAP_LEVEL
+# for SILENCE_GAP_MIN seconds or more is labelled SILENCE.  The audio segmenter's own silence is
+# smoothed so hard that it misses most gaps under 0.3s.
+SILENCE_GAP_LEVEL = 0.01
+SILENCE_GAP_MIN = 0.1
 
 # Pre-trained model downloaded when none is found locally. The release asset and the local copy
 # are both named MODEL_FNAME, which encodes the input shape, so a feature/window change never
@@ -391,7 +397,13 @@ def condense(frames: np.ndarray, timestamps: np.ndarray, answers: np.ndarray, we
     res.append(frames[mid, NORMTIME]) # middle relative timestamp
     res.append(mean(frames[:, LOGO]))
     res.append(mean(frames[:, BLANK]))
-    res.append(mean(frames[:, DIFF] >= 0.5))  # Diff count above 0.5
+    # cuts a second: a run of frames at 0.5 or more (raw 20) is one cut, counted where it starts.
+    # The share of frames at 0.5 or more read 1/30 of a cut at 29.97 fps, 1/60 at 59.94, and
+    # counted twice a cut that interlacing splits over two frames (a fifth to a third of them at
+    # 29.97 fps, almost none at 59.94).
+    big = frames[:, DIFF] >= 0.5
+    cut = big & ~np.concatenate(([False], big[:-1]))
+    res.append(np.add.reduceat(cut.astype('float64'), starts) / seconds)
     for x in (FVOL,RVOL,SILENCE,SPEECH,MUSIC,NOISE):
         res.append(mean(frames[:, x]))
     for x in (LOGO_RUN, HAVE_LOGO, HAVE_RVOL):
@@ -563,6 +575,16 @@ def load_nonpersistent(flog:dict, for_training=False, no_logo=False, no_blanks=F
         vref = float(np.median(audible))
         frames[:, FVOL] = np.clip(frames[:, FVOL] / vref, 0, 10)
         frames[:, RVOL] = np.clip(frames[:, RVOL] / vref, 0, 10)
+
+        # short silences the segmenter smoothed away (see SILENCE_GAP_MIN); timed, not counted
+        quiet = (frames[:, FVOL] < SILENCE_GAP_LEVEL) & (frames[:, RVOL] < SILENCE_GAP_LEVEL)
+        edges = np.diff(np.concatenate(([0], quiet.astype('int8'), [0])))
+        qs, qe = np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)
+        t_end = np.append(timestamps, timestamps[-1] + 1/frame_rate)
+        for s, e in zip(qs, qe):
+            if t_end[e] - timestamps[s] >= SILENCE_GAP_MIN:
+                frames[s:e, SILENCE] = 1
+                frames[s:e, SPEECH:NOISE+1] = 0
 
     # add a column for time percentage
     assert(frames.shape[-1] == PERCTIME)
