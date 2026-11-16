@@ -68,12 +68,15 @@ SILENCE_GAP_LEVEL = 0.01
 SILENCE_GAP_MIN = 0.1
 
 # Pre-trained model downloaded when none is found locally. The release asset and the local copy
-# are both named MODEL_FNAME, which encodes the input shape, so a feature/window change never
-# fetches or reuses a stale model; whenever FEATURE_WIDTH or the window sizes change, upload a
-# new model under the new name and update MODEL_SHA256.
-MODEL_FNAME = f'pycommflag-f{FEATURE_WIDTH}-w{WINDOW_BEFORE}x{WINDOW_AFTER}.keras'
+# are both named MODEL_FNAME, which encodes the input shape and FEATURE_VERSION, so a feature or
+# window change never fetches or reuses a stale model. Bump FEATURE_VERSION whenever feature
+# values change without changing the shape (a model trained on the old values still loads and
+# quietly predicts worse); after any such change, upload a new model under the new name and
+# update MODEL_SHA256.
+FEATURE_VERSION = 2
+MODEL_FNAME = f'pycommflag-f{FEATURE_WIDTH}v{FEATURE_VERSION}-w{WINDOW_BEFORE}x{WINDOW_AFTER}.keras'
 MODEL_URL = 'https://github.com/b-pass/pycommflag/releases/download/models/' + MODEL_FNAME
-MODEL_SHA256 = '8d810febadcd22a72d032de5bf687a1126454b31339c5ab933bfdb30ef174258'
+MODEL_SHA256 = '5ac84ca602baf0542f571b3daf8083b1ab16dbd5e7ff00b5552e68567d67677e'
 DIFF_THRESHOLD = 15.0
 
 # training params
