@@ -564,4 +564,4 @@ are applied.
 - Publish to PyPI.
 - Per-channel settings or models. So far, one model trained on enough varied data seems to generalize well.
 - Live/streaming flagging ... would need to lag at least a couple minutes behind live TV, but could be done.  Would this require integration with the recorder, or could it be accomplished just with access to the file on disk?
-- Training logs from other countries might help?  Or fine tuning for those?  Should we have a SILENCE_SINCE/SILENCE_UNIT feature for UK?  Or the existing audio classes already work well enough for UK?
+- Training logs from other countries might help?  Or fine tuning for those?  

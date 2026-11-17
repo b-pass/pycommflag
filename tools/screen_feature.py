@@ -254,7 +254,83 @@ def cand_repeat_dist(frames, timestamps, frame_rate):
     """Seconds since/until the nearest frame inside a repeated cut pattern."""
     return [neural._scale_dist(d) for d in _since_until(timestamps, _repeats(frames, timestamps))]
 
+STD_LENGTHS = (10.0, 15.0, 20.0, 30.0, 45.0, 60.0, 90.0, 120.0) # seconds an ad (or a run of them) lasts
+STD_TOL = 0.5           # seconds a gap may be off a standard length (comskip: 0.5-1.0)
+STD_BIAS = 0.0          # seconds added to a gap before matching (comskip adds 0.11)
+STD_EVENT_MERGE = 1.0   # boundary events closer than this are one event
+STD_AHEAD = 6           # events ahead an interval may reach: a 30s ad can hold a blank of its own
+
+def _boundary_events(frames, timestamps, frame_rate):
+    """Times of the events an ad splice leaves: the middle of each run of blank frames and of
+    each silence of GAP_MIN or more; events within STD_EVENT_MERGE are one, timed by its blank
+    when it has one (a blank is placed to the frame, a silence only to the audio frame)."""
+    t_end = np.append(timestamps, timestamps[-1] + 1/frame_rate)
+    blank = frames[:, neural.BLANK] > 0.5
+    d = np.diff(np.concatenate(([0], blank.astype('int8'), [0])))
+    bs, be = np.flatnonzero(d == 1), np.flatnonzero(d == -1)
+    gs, ge = _gaps(frames, timestamps, frame_rate)
+    t = np.concatenate(((timestamps[bs] + t_end[be]) / 2, (timestamps[gs] + t_end[ge]) / 2))
+    is_blank = np.concatenate((np.ones(len(bs), bool), np.zeros(len(gs), bool)))
+    order = np.argsort(t, kind='stable')
+    t, is_blank = t[order], is_blank[order]
+    events = []
+    i = 0
+    while i < len(t):
+        j = i
+        while j + 1 < len(t) and t[j+1] - t[j] < STD_EVENT_MERGE:
+            j += 1
+        b = np.flatnonzero(is_blank[i:j+1])
+        events.append(t[i + b[0]] if len(b) else t[i:j+1].mean())
+        i = j + 1
+    return np.array(events)
+
+def _std_matches(ev, ahead):
+    """(start, end) of every interval from an event to one of the next `ahead` events whose
+    length is within STD_TOL of a standard ad length"""
+    out = []
+    lens = np.array(STD_LENGTHS)
+    for k in range(1, ahead + 1):
+        g = ev[k:] - ev[:-k] + STD_BIAS
+        hit = np.abs(g[:, None] - lens[None, :]).min(1) <= STD_TOL
+        out += list(zip(ev[:-k][hit], ev[k:][hit]))
+    return out
+
+def _cover(timestamps, spans):
+    edge = np.zeros(len(timestamps) + 1, dtype='int64')
+    for s, e in spans:
+        edge[np.searchsorted(timestamps, s)] += 1
+        edge[np.searchsorted(timestamps, e)] -= 1
+    return np.cumsum(edge[:-1]) > 0
+
+def cand_std_len(frames, timestamps, frame_rate):
+    """comskip's strongest cue: inside an interval between splice events (blanks, silences)
+    that lasts a standard ad length; one column for neighbouring events, one for events up to
+    STD_AHEAD apart (comskip's combined blocks)."""
+    ev = _boundary_events(frames, timestamps, frame_rate)
+    return [_cover(timestamps, _std_matches(ev, 1)).astype('float32'),
+            _cover(timestamps, _std_matches(ev, STD_AHEAD)).astype('float32')]
+
+def _std_reliability(ev):
+    """Share of neighbouring-event intervals under 125s that land on a standard length, over
+    the whole recording: comskip drops a kind of cut whose gaps rarely do (ValidateBlackFrames)."""
+    g = np.diff(ev)
+    g = g[(g > 4) & (g < 125)]
+    if len(g) < 4:
+        return 0.0
+    lens = np.array(STD_LENGTHS)
+    return float(np.mean(np.abs(g[:, None] + STD_BIAS - lens[None, :]).min(1) <= STD_TOL))
+
+def cand_std_len_rel(frames, timestamps, frame_rate):
+    """cand_std_len plus the recording's _std_reliability, alone and times each column.  The
+    shifted null keeps the constant and moves the products, so a gain over std_len's is what
+    knowing the recording's regularity adds."""
+    a, b = cand_std_len(frames, timestamps, frame_rate)
+    r = np.full(len(frames), _std_reliability(_boundary_events(frames, timestamps, frame_rate)), 'float32')
+    return [a, b, r, a * r, b * r]
+
 CANDIDATES = {
+    'std_len': cand_std_len,
+    'std_len_rel': cand_std_len_rel,
     'rear_ratio': cand_rear_ratio,
     'repeat': cand_repeat,
     'repeat_dist': cand_repeat_dist,
@@ -296,23 +372,42 @@ neural.condense = _condense
 def _pad(a):
     return np.concatenate((np.tile(a[:1], (WB, 1)), a, np.tile(a[-1:], (WA, 1))))
 
+def parse_cols(spec):
+    cols = []
+    for part in spec.split(','):
+        a, _, b = part.partition('-')
+        cols += list(range(int(a), int(b or a) + 1))
+    assert all(0 <= c < neural.FEATURE_WIDTH for c in cols), spec
+    return cols
+
 class Model:
-    def __init__(self, path):
+    """A trained model; with `deprive`, those input columns are held where the model's input_norm
+    maps them to 0, which is exactly what input-group dropout feeds it in training when it drops
+    their group: the model's own prediction without that information."""
+    def __init__(self, path, deprive=()):
         self.path = path
         self.model = None
+        self.deprive = list(deprive)
 
     def logits(self, condensed):
         if self.model is None:
             import keras
             self.model = keras.models.load_model(self.path)
+            self.fill = np.asarray(self.model.get_layer('input_norm').moving_mean)[self.deprive]
+        if self.deprive:
+            condensed = condensed.copy()
+            condensed[:, self.deprive] = self.fill
         windows = neural.load_data_sliding_window(condensed)[0]
         p = self.model.predict(neural.make_data_generator(windows), verbose=0).reshape(-1)
         p = np.clip(p.astype('float64'), 1e-6, 1 - 1e-6)
         return np.log(p / (1 - p))
 
 def load(logs, model, cands, cache):
-    mdir = os.path.join(cache, 'model-' + os.path.splitext(os.path.basename(os.path.realpath(model.path)))[0])
+    mdir = os.path.join(cache, 'model-' + os.path.splitext(os.path.basename(os.path.realpath(model.path)))[0]
+                        + ('-deprive-' + '.'.join(map(str, model.deprive)) if model.deprive else ''))
     os.makedirs(mdir, exist_ok=True)
+    cols = {c: parse_cols(c[4:]) for c in cands if c.startswith('col:')}
+    cands = [c for c in cands if c not in cols]
     for c in cands:
         os.makedirs(os.path.join(cache, 'cand-' + c), exist_ok=True)
 
@@ -342,6 +437,9 @@ def load(logs, model, cands, cache):
         m['name'] = os.path.basename(path).split('.json')[0]
         m['set'] = dset
         m['cands'] = {c: np.load(cfiles[c]) for c in cands}
+        m['cands'].update({c: m['base'][:, cc] for c, cc in cols.items()}) # the model's own input columns
+        if model.deprive:
+            m['base'] = np.delete(m['base'], model.deprive, axis=1) # what the deprived model sees
         out.append(m)
     return out
 
@@ -510,7 +608,7 @@ def screen_redundancy(data, cand, folds):
             p = np.column_stack((np.ones(len(x)), (x - mu) / sd)) @ w
             sse += ((y - p) ** 2).sum(0)
             sst += ((y - Y.mean(0)) ** 2).sum(0)
-    print(f'redundancy: held-out R^2 from the {neural.FEATURE_WIDTH} features\' window summaries: '
+    print(f'redundancy: held-out R^2 from the {data[0]["base"].shape[1]} features\' window summaries: '
           + ', '.join(f'col {j} {1 - sse[j]/sst[j]:.3f}' if sst[j] else f'col {j} constant' for j in range(ncol))
           + f'  (column std {", ".join(f"{s:.3f}" for s in ally.std(0))})')
 
@@ -538,7 +636,11 @@ def screen_stability(data, cand):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--model', required=True, help='the trained model to screen against')
-    ap.add_argument('-c', '--candidate', action='append', required=True, choices=sorted(CANDIDATES))
+    ap.add_argument('-c', '--candidate', action='append', required=True,
+                    help='one of ' + ', '.join(sorted(CANDIDATES)) + ', or col:COLS for the model\'s own'
+                    ' input columns (e.g. col:6-9), to screen what --deprive took away')
+    ap.add_argument('--deprive', metavar='COLS', help='input columns (e.g. 6-9 or 2,14,15) the model'
+                    ' predicts without, as when input-group dropout drops them: a positive control')
     ap.add_argument('--cache', default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.tmp', 'screen-cache'))
     ap.add_argument('--folds', type=int, default=10, help='group k-fold over logs (default 10)')
     ap.add_argument('--nulls', type=int, default=3, help='circularly shifted copies for the chance gain (default 3)')
@@ -548,8 +650,11 @@ def main():
     try: os.nice(19)
     except OSError: pass
 
+    for c in args.candidate:
+        if c not in CANDIDATES and not c.startswith('col:'):
+            ap.error(f'unknown candidate {c}')
     logs = sorted(f for f in args.logs if '.json' in os.path.basename(f) and not f.endswith('.npy'))
-    data = load(logs, Model(args.model), args.candidate, args.cache)
+    data = load(logs, Model(args.model, parse_cols(args.deprive) if args.deprive else ()), args.candidate, args.cache)
     print(f'{len(data)} logs: ' + ', '.join(f'{s} {sum(m["set"] == s for m in data)}' for s in sorted({m["set"] for m in data})))
     folds = min(args.folds, len(data))
     for c in args.candidate:
