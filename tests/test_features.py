@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Checks for the caption count recorded by extraction.
+"""Checks for the captions recorded by extraction.
 
-`processor._cc_text` counts CEA-608 caption characters per frame from its A53 side data;
-it goes into the feature log (cc_text) but not, yet, into the model.
+`processor._cc_data` keeps a frame's caption bytes from its A53 side data (cc_data in the
+feature log) and `processor.cc_chars` counts the CEA-608 characters in them (cc_text); neither
+goes into the model, yet.
 
 Run it directly; it exits non-zero if anything fails.
 """
@@ -34,22 +35,39 @@ def frame(*side_data):
 def triplet(c1, c2, valid=True, cc_type=0):
     return [0xf8 | (0x04 if valid else 0) | cc_type, c1, c2]
 
+def cc_text(f):
+    return processor.cc_chars(processor._cc_data(f))
+
 # 'H','i' with odd parity set on the 'i' byte, as broadcast
 text = triplet(ord('H'), ord('i') | 0x80)
-check('caption text counts both characters', processor._cc_text(frame(SideData(text))) == 2)
+check('caption text counts both characters', cc_text(frame(SideData(text))) == 2)
 check('a control code (resume caption loading) does not count',
-      processor._cc_text(frame(SideData(triplet(0x14, 0x20)))) == 0)
-check('padding does not count', processor._cc_text(frame(SideData(triplet(0x80, 0x80)))) == 0)
+      cc_text(frame(SideData(triplet(0x14, 0x20)))) == 0)
+check('padding does not count', cc_text(frame(SideData(triplet(0x80, 0x80)))) == 0)
 check('an invalid triplet does not count',
-      processor._cc_text(frame(SideData(triplet(ord('H'), ord('i'), valid=False)))) == 0)
+      cc_text(frame(SideData(triplet(ord('H'), ord('i'), valid=False)))) == 0)
 check('field 2 and 708 data do not count',
-      processor._cc_text(frame(SideData(triplet(ord('H'), ord('i'), cc_type=1)
+      cc_text(frame(SideData(triplet(ord('H'), ord('i'), cc_type=1)
                                         + triplet(ord('H'), ord('i'), cc_type=2)))) == 0)
 check('other side data is ignored',
-      processor._cc_text(frame(SideData(text, type='MOTION_VECTORS'))) == 0)
-check('a frame without side data has none', processor._cc_text(frame()) == 0)
+      cc_text(frame(SideData(text, type='MOTION_VECTORS'))) == 0)
+check('a frame without side data has none', cc_text(frame()) == 0)
 check('several triplets add up',
-      processor._cc_text(frame(SideData(text + triplet(0x14, 0x2f) + text))) == 4)
+      cc_text(frame(SideData(text + triplet(0x14, 0x2f) + text))) == 4)
+
+# what is kept: every valid construct but 608 null padding, whole, in order, parity and all
+PAC = triplet(0x91, 0x70)                       # field 1 preamble: row 1, indent 16
+POPON = triplet(0x94, 0x20)                     # resume caption loading (pop-on)
+XDS = triplet(0x01, 0x83, cc_type=1)            # field 2: XDS start, programme name
+DTV = triplet(0x02, 0x21, cc_type=3) + triplet(0x8f, 0x00, cc_type=2)  # a 708 packet; its 00 stays
+kept = POPON + PAC + text + XDS + DTV
+sd = SideData(triplet(0x80, 0x80) + POPON + PAC + triplet(0x80, 0x80, cc_type=1) + text
+              + triplet(ord('Z'), ord('Z'), valid=False) + XDS + DTV + triplet(0, 0, valid=False, cc_type=2))
+check('caption bytes: mode, position, field 2 and 708 kept; padding and invalid ones dropped',
+      processor._cc_data(frame(sd)) == bytes(kept), processor._cc_data(frame(sd)).hex())
+check('caption bytes from several A53 side data, in order',
+      processor._cc_data(frame(SideData(PAC), SideData(text, type='MOTION_VECTORS'), SideData(text))) == bytes(PAC + text))
+check('no captions, no bytes', processor._cc_data(frame(SideData(triplet(0x80, 0x80)))) == b'')
 
 # A plain 300s log, to check that an extra cc_text column is ignored.
 FPS = 29.97

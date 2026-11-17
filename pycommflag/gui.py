@@ -42,6 +42,11 @@ def log_fixes(flog:dict, path:str) -> tuple[list[str], str|None]:
     # logs before file_version 11 have no captions; they can be added from the video in seconds
     if header and 'cc_text' not in header:
         problems.append("it has no caption data (no cc_text)")
+    # before file_version 12 they were only counted, and their bytes (modes, positions, styles)
+    # thrown away, so a log upgraded for cc_text still needs the tool run on it again
+    elif header and 'cc_data' not in flog:
+        problems.append("its captions are counts only, without their bytes (no cc_data): "
+                        "run the upgrade again, even if it has been run on this log before")
     if not problems:
         return problems, None
     q = shlex.quote

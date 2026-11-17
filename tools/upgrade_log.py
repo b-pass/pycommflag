@@ -39,19 +39,26 @@ audio    (`audio_shift`, `audio_shift_from`) Before 2026-10-23 extraction timed 
          audio columns in their backup (found under BACKUP_DIR by the log's path, .json or
          .json.gz), keeping everything else in the current log, such as tags edited since.
 
-cc       (`cc_text`, `cc_text_from`) Logs before file_version 11 have no captions.  Broadcast
-         captions (ATSC A/53 "GA94" user data: MPEG-2 picture user data, or an H.264/HEVC SEI
-         message) ride in each video packet as plain bytes, so they can be read without
-         decoding: a few seconds per hour of video, where re-extracting the log takes ~60
-         CPU-minutes.  Each frame gets the number of CEA-608 field-1 characters it carries,
-         counted as processor._cc_text counts them.  From the log's own video every packet's
-         timestamp is a frame's (checked identical to an extraction's cc_text on H.264 and
-         MPEG-2, 29.97 and 59.94), and a packet with no frame (one the decoder dropped) counts
-         for nothing; `cc_text_from` is `packets`.  From the .mkv (`packets-mkv`), a packet
-         counts for the frame shown at its time, plus the lag: 10s totals then match an
-         extraction's within ~1%, also through a 29.97 -> 59.94 transcode.  Sets file_version
-         11.  --redo-cc counts them again, for logs whose captions came from an .mkv before
-         the lag was applied.
+cc       (`cc_text`, `cc_text_from`, `cc_data`, `cc_data_from`) Logs before file_version 11
+         have no captions, and those before 12 only count them (cc_text), without the caption
+         bytes (cc_data) that hold their modes, positions and styles.  Broadcast captions (ATSC
+         A/53 "GA94" user data: MPEG-2 picture user data, or an H.264/HEVC SEI message) ride in
+         each video packet as plain bytes, so they can be read without decoding: a few seconds
+         per hour of video, where re-extracting the log takes ~60 CPU-minutes.  Each frame gets
+         the number of CEA-608 field-1 characters it carries (processor.cc_chars) and the bytes
+         processor.cc_keep keeps.  From the log's own video every packet's timestamp is a
+         frame's (checked identical to an extraction's cc_text on H.264 and MPEG-2, 29.97 and
+         59.94), and a packet with no frame (one the decoder dropped) counts for nothing; the
+         `_from` keys are `packets`.  From the .mkv (`packets-mkv`), a packet counts for the
+         frame shown at its time, plus the lag: 10s totals then match an extraction's within
+         ~1%, also through a 29.97 -> 59.94 transcode, except where a soft-pulldown film transcode
+         re-timed the frames and dropped some, with their captions (~4% fewer characters, and
+         ~5% of the log's frames with no packet).  Whichever of the two a log already has
+         is left alone (an extraction's cc_text beats one from an .mkv).  Some transcodes
+         dropped the captions, so a video whose total disagrees with the log's cc_text by over
+         CC_AGREE, or an .mkv with none at all, is skipped rather than recorded as captionless.
+         Sets file_version 12 once the log has cc_data.  --redo-cc redoes both, for logs whose captions came from an
+         .mkv before the lag was applied.
 
     tools/upgrade_log.py [--dry-run] [--only mkv-lag|audio|cc]... [--redo-from BACKUP_DIR] [--redo-cc] LOG...
 """
@@ -232,27 +239,17 @@ def repair_audio(flog:dict, path:str, video:str|None, lag:float|None, redo_from:
 
 GA94 = re.compile(rb'GA94\x03')
 NAL_CODECS = ('h264', 'hevc')   # caption bytes sit in a NAL unit, behind emulation prevention
-MIN_MATCHED = 0.99              # share of the log's frames that must line up with a packet
+MIN_MATCHED = 0.99              # share of the log's frames that must line up with a packet...
+MIN_MATCHED_MKV = 0.9           # ...or a transcode's (film transcodes dropped ~5% of the frames)
+CC_AGREE = 0.1                  # a transcode's caption total is within ~1% of the extraction's (4% for film)
 
-def cc_chars(cc:bytes) -> int:
-    """CEA-608 field-1 characters in a run of 3-byte cc_data constructs (processor._cc_text's rules)."""
-    n = 0
-    for i in range(0, len(cc) - 2, 3):
-        if not (cc[i] & 0x04) or (cc[i] & 3) != 0:
-            continue  # not cc_valid, or not 608 field 1
-        c1, c2 = cc[i+1] & 0x7f, cc[i+2] & 0x7f
-        if 0x10 <= c1 <= 0x1f:
-            continue  # a control code (both bytes)
-        n += (c1 >= 0x20) + (c2 >= 0x20)
-    return n
-
-def packet_cc(data:bytes, nal:bool) -> int:
-    """Caption characters in one video packet."""
+def packet_cc(data:bytes, nal:bool) -> bytes:
+    """The caption bytes in one video packet, as processor.cc_keep keeps them."""
     if b'GA94' not in data:
-        return 0
+        return b''
     if nal:
         data = data.replace(b'\x00\x00\x03', b'\x00\x00')
-    n = 0
+    out = b''
     for m in GA94.finditer(data):
         p = m.start()
         # what precedes it: the T.35 country/provider code (0xB5, 0x0031) in an SEI, or the
@@ -263,13 +260,13 @@ def packet_cc(data:bytes, nal:bool) -> int:
         if q + 2 > len(data) or not (data[q] & 0x40):
             continue  # no process_cc_data_flag
         count = data[q] & 0x1f
-        n += cc_chars(data[q+2:q+2+count*3])  # skip the flags byte and em_data
-    return n
+        out += processor.cc_keep(data[q+2:q+2+count*3])  # skip the flags byte and em_data
+    return out
 
-def read_packets(video:str) -> tuple[np.ndarray, np.ndarray]:
-    """(times from the stream's start, caption characters) per packet of the first video stream, the one Player decodes."""
+def read_packets(video:str) -> tuple[np.ndarray, list[bytes]]:
+    """(times from the stream's start, caption bytes) per packet of the first video stream, the one Player decodes."""
     import av
-    times, counts = [], []
+    times, data = [], []
     with av.open(video) as c:
         vs = c.streams.video[0]
         nal = vs.codec_context.name in NAL_CODECS
@@ -280,22 +277,25 @@ def read_packets(video:str) -> tuple[np.ndarray, np.ndarray]:
             if pkt.pts is None or pkt.size == 0:
                 continue
             times.append(float((pkt.pts - start) * tb))
-            counts.append(packet_cc(bytes(pkt), nal))
+            data.append(packet_cc(bytes(pkt), nal))
     order = np.argsort(times, kind='stable')
-    return np.asarray(times)[order], np.asarray(counts, dtype=np.int64)[order]
+    return np.asarray(times)[order], [data[i] for i in order]
 
-def assign(row_times:np.ndarray, times:np.ndarray, counts:np.ndarray, exact:bool, frame_rate:float) -> tuple[np.ndarray, float]:
-    """Caption characters per row, and the share of rows that a packet lined up with.
+def assign(row_times:np.ndarray, times:np.ndarray, data:list[bytes], exact:bool, frame_rate:float) -> tuple[list[bytes], float]:
+    """Caption bytes per row (its packets', in time order), and the share of rows that a packet
+    lined up with.
 
     exact: packets count only for the row with their own timestamp (within 1ms; the log
     rounds times to 5 places).  Otherwise each counts for the row shown at its time, unless
     that row is more than 1.5 frames older (a gap in the log)."""
-    out = np.zeros(len(row_times), dtype=np.int64)
+    out = [b''] * len(row_times)
     idx = np.searchsorted(row_times, times + 0.001, side='right') - 1
     ok = idx >= 0
     lag = times - row_times[np.maximum(idx, 0)]
     ok &= (np.abs(lag) <= 0.001) if exact else (lag <= 1.5 / frame_rate)
-    np.add.at(out, idx[ok], counts[ok])
+    for i in np.flatnonzero(ok):
+        if data[i]:
+            out[idx[i]] += data[i]
     hit = np.zeros(len(row_times), dtype=bool)
     hit[idx[ok]] = True
     return out, float(hit.mean()) if len(hit) else 0.0
@@ -303,8 +303,10 @@ def assign(row_times:np.ndarray, times:np.ndarray, counts:np.ndarray, exact:bool
 def add_cc(flog:dict, video:str|None, lag:float|None, redo:bool=False) -> tuple[dict, str, bool]:
     """(the log, what happened, whether it changed); the log's frames are changed in place."""
     header = list(flog.get('frames_header', []))
-    if 'cc_text' in header and not redo:
-        return flog, 'skip (already has cc_text)', False
+    want_text = 'cc_text' not in header or redo
+    want_data = 'cc_data' not in flog or redo
+    if not (want_text or want_data):
+        return flog, 'skip (already has cc_text and cc_data)', False
     if header[:1] != ['time']:
         return flog, f'skip (unexpected frames_header {header})', False
     if video is None:
@@ -316,26 +318,48 @@ def add_cc(flog:dict, video:str|None, lag:float|None, redo:bool=False) -> tuple[
     body = _body(flog)
     col = header.index('cc_text') if 'cc_text' in header else None
     row_times = np.array([r[0] for r in body], dtype='float64')
-    times, counts = read_packets(video)
+    times, data = read_packets(video)
     if not exact:
         times = times + lag  # into the log's time
-    cc, matched = assign(row_times, times, counts, exact, flog.get('frame_rate', 29.97))
+    cc, matched = assign(row_times, times, data, exact, flog.get('frame_rate', 29.97))
+    chars = [processor.cc_chars(b) for b in cc]
     how = 'own video' if exact else f'{os.path.basename(video)}, {lag:+.3f}s'
-    msg = f'{cc.sum()} chars on {np.count_nonzero(cc)} of {len(cc)} frames, {matched:.1%} matched ({how})'
-    if matched < MIN_MATCHED:
+    msg = (f'{sum(chars)} chars on {sum(1 for n in chars if n)} of {len(cc)} frames, '
+           f'{sum(map(len, cc))} bytes on {sum(1 for b in cc if b)}, {matched:.1%} matched ({how})')
+    if matched < (MIN_MATCHED if exact else MIN_MATCHED_MKV):
         return flog, f'skip (only {msg}; not this log\'s video?)', False
+    # Some transcodes drop the captions: an empty cc_data would then claim the recording had none
+    if col is not None:
+        had = sum(r[col] for r in body)
+        if abs(sum(chars) - had) > CC_AGREE * had + 50:
+            return flog, f"skip ({msg}, but the log's cc_text has {had} chars: the video lost captions?)", False
+    elif not exact and not any(cc):
+        return flog, f'skip ({msg}: none in a transcode, which may have dropped them)', False
 
-    for r, n in zip(body, cc.tolist()):
-        if col is None:
-            r.append(n)
-        else:
-            r[col] = n
-    if col is None:
-        flog['frames_header'] = header + ['cc_text']
-    flog['file_version'] = max(11, flog.get('file_version', 0))
+    source = 'packets' if exact else 'packets-mkv'
     after = next(k for k in ('mkv_lag_from', 'audio_shift_from', 'audio_shift', 'frame_rate', 'filename') if k in flog or k == 'filename')
-    flog = processor.set_header_key(flog, 'cc_text_from', 'packets' if exact else 'packets-mkv', after=after)
-    return flog, ('re-counted: ' if col is not None else '') + msg, True
+    done = []
+    if want_text:
+        for r, n in zip(body, chars):
+            if col is None:
+                r.append(n)
+            else:
+                r[col] = n
+        if col is None:
+            flog['frames_header'] = header + ['cc_text']
+        flog['file_version'] = max(11, flog.get('file_version', 0))
+        flog = processor.set_header_key(flog, 'cc_text_from', source, after=after)
+        done.append('cc_text' if col is None else 'cc_text re-counted')
+    if want_data:
+        had = 'cc_data' in flog
+        # after the frames, as extraction writes it: it is as long as they are
+        flog.pop('cc_data', None)
+        flog['cc_data'] = [[r[0], b.hex()] for r, b in zip(body, cc) if b]
+        flog['file_version'] = max(12, flog.get('file_version', 0))
+        flog = processor.set_header_key(flog, 'cc_data_from', source,
+                                        after='cc_text_from' if 'cc_text_from' in flog else after)
+        done.append('cc_data redone' if had else 'cc_data')
+    return flog, f"{' and '.join(done)}: {msg}", True
 
 # --- the log --------------------------------------------------------------------------------
 
@@ -367,7 +391,7 @@ def upgrade(path:str, steps=STEPS, dry_run:bool=False, redo_from:str|None=None, 
         header = flog.get('frames_header', [])
         needed = ('mkv-lag' in steps
                   or ('audio' in steps and ('audio_shift' not in flog or redo_from))
-                  or ('cc' in steps and ('cc_text' not in header or redo_cc)))
+                  or ('cc' in steps and ('cc_text' not in header or 'cc_data' not in flog or redo_cc)))
         if needed:
             # recorded whichever step asked for it, so nothing has to measure it again
             lag, source = timeline.video_lag(flog, video)
@@ -413,7 +437,7 @@ def main():
                     help=f'run only this step ({", ".join(STEPS)}); may be repeated')
     ap.add_argument('--redo-from', metavar='BACKUP_DIR',
                     help='repair the audio of already repaired logs again, from the originals in this directory')
-    ap.add_argument('--redo-cc', action='store_true', help='count the captions again even if the log has them')
+    ap.add_argument('--redo-cc', action='store_true', help='read the captions again even if the log has them')
     ap.add_argument('logs', nargs='+')
     args = ap.parse_args()
     failed = 0

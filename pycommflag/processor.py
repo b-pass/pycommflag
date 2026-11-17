@@ -121,7 +121,7 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
         feature_log.seek(0)
         feature_log.truncate()
 
-    feature_log.write('{ "file_version":11')
+    feature_log.write('{ "file_version":12')
 
     # these go through json.dumps because a " or \ in the value would otherwise
     # produce a log that cannot be read back -- and we would not find out until after
@@ -246,8 +246,11 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
     assert(AudioSegmentLabel.count() == 4)
     header += ['silence', 'speech', 'music', 'noise']
 
-    # not a model input (yet): kept so a dataset flagged from these logs can use it later
+    # not model inputs (yet): kept so a dataset flagged from these logs can use them later.
+    # cc_text counts the caption characters per frame; cc_data, written after the frames,
+    # keeps the caption bytes themselves (see cc_keep).
     header += ['cc_text']
+    cc_data = []
     
     # normalize with the max volume of the whole recording
     vscale = np.max(np.array(audioProc.rms)[..., 1:3])
@@ -284,12 +287,16 @@ def process_video(video_filename:str, feature_log:str|TextIO, opts:Any=None) -> 
         x = [0] * AudioSegmentLabel.count()
         x[audio[0].value if ft >= audio[1][0] else AudioSegmentLabel.SILENCE.value] = 1
         frame += x
-        frame.append(cc)
+        frame.append(cc_chars(cc))
+        if cc:
+            cc_data.append([ft, cc.hex()])
 
     feature_log.write(',\n"frames_header":')
     json.dump(header, feature_log)
     feature_log.write(',\n"frames":')
     json.dump(frames, feature_log)
+    feature_log.write(',\n"cc_data":')
+    json.dump(cc_data, feature_log)
     
     if die:
         feature_log.write("\n\n,\"EARLY_STOP_TRUNCATION\":true")
@@ -320,7 +327,7 @@ class VideoProc(Thread):
         self.prev_col = None
         self.lasttime = 0
         self.frames = []
-        self.cc = []  # caption characters per frame, parallel to self.frames
+        self.cc = []  # caption bytes per frame (cc_keep's), parallel to self.frames
         self.keep = False  # False until the first frame tells us the frame size; then
                            # a mask, or None when there is nothing to leave out
 
@@ -349,7 +356,7 @@ class VideoProc(Thread):
         # the logo's box and mask are in the first frame's pixels; after a resolution change
         # they point at the wrong place, so don't claim to see it there
         logo_present = fcolor.shape == self.shape and logo_finder.check_frame(frame, self.logo)
-        self.queue.put((frame.time,fcolor,logo_present,_cc_text(frame)))
+        self.queue.put((frame.time,fcolor,logo_present,_cc_data(frame)))
     
     def _proc(self, ftime, fcolor, logo_present, cc):
         if ftime is None or fcolor is None:
@@ -391,25 +398,48 @@ class VideoProc(Thread):
     def frame_header(self):
         return ["time","logo_present","is_blank","diff"]
 
-def _cc_text(frame) -> int:
-    """How many CEA-608 caption characters this frame carries (field 1: CC1/CC2).
+def cc_keep(cc:bytes) -> bytes:
+    """The constructs worth keeping from a run of 3-byte A53 cc_data constructs (a marker/valid/type
+    byte, then two data bytes): every valid one but CEA-608 null padding, whole and in order.
+
+    The recordings are deleted after flagging, so these bytes are all a log can ever have of its
+    captions.  A decoder can get everything back from them: the text of both 608 fields, the 608
+    control codes (pop-on, roll-up or paint-on; row and indent; colour, italics and underline;
+    when captions are shown and erased), XDS in field 2, and the CEA-708 packets with their own
+    windows and pen styles.  Data bytes keep their parity bits.
+    """
+    out = bytearray()
+    for i in range(0, len(cc) - 2, 3):
+        if not (cc[i] & 0x04):
+            continue  # not cc_valid (for 708, padding)
+        if (cc[i] & 3) < 2 and not (cc[i+1] & 0x7f) and not (cc[i+2] & 0x7f):
+            continue  # 608 null padding
+        out += cc[i:i+3]
+    return bytes(out)
+
+def cc_chars(cc:bytes) -> int:
+    """How many CEA-608 field-1 (CC1/CC2) caption characters a run of cc_data constructs carries.
 
     Shows are captioned nearly throughout and many ads aren't, so the amount of caption text
-    tells them apart on most channels.  Control codes, padding and field 2 don't count.
+    tells them apart on most channels.  Control codes, padding, field 2 and 708 don't count.
     """
     n = 0
-    for sd in frame.side_data:
-        if 'A53' not in str(getattr(sd.type, 'name', sd.type)):
-            continue
-        b = bytes(sd)
-        for i in range(0, len(b) - 2, 3):
-            if not (b[i] & 0x04) or (b[i] & 3) != 0:
-                continue  # not cc_valid, or not 608 field 1
-            c1, c2 = b[i+1] & 0x7f, b[i+2] & 0x7f
-            if 0x10 <= c1 <= 0x1f:
-                continue  # a control code (both bytes)
-            n += (c1 >= 0x20) + (c2 >= 0x20)
+    for i in range(0, len(cc) - 2, 3):
+        if not (cc[i] & 0x04) or (cc[i] & 3) != 0:
+            continue  # not cc_valid, or not 608 field 1
+        c1, c2 = cc[i+1] & 0x7f, cc[i+2] & 0x7f
+        if 0x10 <= c1 <= 0x1f:
+            continue  # a control code (both bytes)
+        n += (c1 >= 0x20) + (c2 >= 0x20)
     return n
+
+def _cc_data(frame) -> bytes:
+    """The caption bytes this frame carries in its A53 side data, as cc_keep keeps them."""
+    out = b''
+    for sd in frame.side_data:
+        if 'A53' in str(getattr(sd.type, 'name', sd.type)):
+            out += cc_keep(bytes(sd))
+    return out
 
 def _drain(queue:Queue):
     """For a worker that has failed: keep taking items until the producer says stop, so it

@@ -40,13 +40,21 @@ def check(name, ok, detail=''):
     if not ok:
         _fails.append(name)
 
+class _A53:
+    type = 'A53_CC'
+    def __init__(self, data):
+        self._data = data
+    def __bytes__(self):
+        return self._data
+
 class FakeFrame:
     def __init__(self, n, shape):
         self.time = n / FPS
         self.pts = n
         self.height, self.width = shape
         self.format = types.SimpleNamespace(is_planar=False)
-        self.side_data = []
+        # every 100th frame carries a caption pair ('H','i'), as A53 side data
+        self.side_data = [_A53(b'\xfc\xc8\xe9')] if n % 100 == 0 else []
         self._n = n
     def to_ndarray(self, format=None, threads=None):
         x = np.full((self.height, self.width, 3), 60 + (self._n % 50), 'uint8')
@@ -151,6 +159,10 @@ if done and err is None:
     check('...all frames logged', len(f) == FakePlayer.count, f'{len(f)} frames')
     check('...with the caption count as the last column', flog['frames_header'][-1] == 'cc_text'
           and f.shape[1] == len(flog['frames_header']), str(flog['frames_header']))
+    check('...counting the captions', [i for i in range(len(f)) if f[i, -1]] == list(range(0, len(f), 100))
+          and set(f[::100, -1]) == {2})
+    check('...and keeping their bytes, by frame time', flog['file_version'] == 12
+          and flog.get('cc_data') == [[f[i, 0], 'fcc8e9'] for i in range(0, len(f), 100)], str(flog.get('cc_data'))[:200])
     check('...logo seen before the change', f[:600, 1].all())
     check('...and not claimed after it', not f[600:, 1].any())
 check('...and no worker threads', not workers_alive(), str(workers_alive()))

@@ -3,13 +3,14 @@
 packets, the audio probe through an .mkv, and the log rewrite.
 
 Captions are found in MPEG-2 user data and H.264/HEVC SEI (behind emulation prevention bytes)
-and counted by processor._cc_text's rules (field 1 only, no control codes); a stray "GA94" in
-picture data doesn't count.  From the log's own video a packet counts only for the frame with
+and kept as processor.cc_keep keeps them (all but padding and invalid constructs); a stray "GA94"
+in picture data doesn't count.  From the log's own video a packet counts only for the frame with
 its timestamp; from a transcode, for the frame shown at its time once the transcode's lag is
 added back.  The lag comes from the stream start times when the log has them, else from
 lining up cuts, and a vote without enough agreeing cuts gives no answer.  A probe of the .mkv is
-used for the audio only less that lag.  The rewrite appends cc_text, sets file_version 11,
-keeps everything else, and leaves a log that has cc_text alone unless asked to redo it.  Also
+used for the audio only less that lag.  The rewrite appends cc_text and cc_data, sets
+file_version 12, keeps everything else, adds cc_data to a log that only has cc_text without
+touching its count, and leaves a log that has both alone unless asked to redo them.  Also
 the editor's log_fixes, which tells the user what a log needs and how to run the tool.
 
 Run it directly; it exits non-zero if anything fails.  Needs no video.
@@ -60,27 +61,29 @@ INVALID = (0xf8, odd(ord('Z')), odd(ord('Z'))) # cc_valid clear
 PAD = (0xfc, 0x80, 0x80)                       # null padding
 ZEROS = (0x00, 0x00, 0x01)                     # not valid, and makes an emulation prevention byte
 
-check('cc_chars counts field-1 characters only', upgrade_log.cc_chars(b''.join(bytes(t) for t in (HI, CTRL, F2, INVALID, PAD))) == 2)
+def cc(*triples):
+    return b''.join(bytes(t) for t in triples)
 
 mpeg2 = (b'\x00\x00\x01\x00' + b'\x11' * 40 + b'\x00\x00\x01\xb2' + cc_payload([HI, F2, HI])
          + b'\x00\x00\x01\x01' + b'\x22' * 40 + b'GA94\x03\x43\xff' + bytes(HI) * 3)  # stray, in slice data
-check('MPEG-2 user data', upgrade_log.packet_cc(mpeg2, False) == 4, upgrade_log.packet_cc(mpeg2, False))
+check('MPEG-2 user data', upgrade_log.packet_cc(mpeg2, False) == cc(HI, F2, HI), upgrade_log.packet_cc(mpeg2, False))
 
 sei = b'\x06\x04\x20' + b'\xb5\x00\x31' + cc_payload([ZEROS, HI, CTRL, HI, PAD]) + b'\xff\x80'
 h264 = b'\x00\x00\x00\x01\x09\xf0' + b'\x00\x00\x00\x01' + epb(sei) + b'\x00\x00\x00\x01\x65' + b'\x33' * 40
-check('H.264 SEI survives emulation prevention', b'\x00\x00\x03\x01' in h264 and upgrade_log.packet_cc(h264, True) == 4,
+check('H.264 SEI survives emulation prevention', b'\x00\x00\x03\x01' in h264 and upgrade_log.packet_cc(h264, True) == cc(HI, CTRL, HI),
       upgrade_log.packet_cc(h264, True))
-check('a T.35 prefix is required in a NAL', upgrade_log.packet_cc(h264.replace(b'\xb5\x00\x31', b'\xb5\x00\x32'), True) == 0)
-check('no captions, no count', upgrade_log.packet_cc(b'\x00\x00\x01\xb2' + b'\x00' * 20, False) == 0)
+check('a T.35 prefix is required in a NAL', upgrade_log.packet_cc(h264.replace(b'\xb5\x00\x31', b'\xb5\x00\x32'), True) == b'')
+check('no captions, no bytes', upgrade_log.packet_cc(b'\x00\x00\x01\xb2' + b'\x00' * 20, False) == b'')
 
 rows = np.array([0.0, 1/30, 2/30, 3/30, 5/30])  # one frame missing from the log
 times = np.array([-1/30, 0.0, 1/30, 2/30, 3/30, 4/30, 5/30])
-counts = np.array([7, 1, 2, 3, 4, 5, 6])
-cc, matched = upgrade_log.assign(np.round(rows, 5), times, counts, True, 29.97)
-check('own video: only same-timestamp packets count', cc.tolist() == [1, 2, 3, 4, 6] and matched == 1.0, (cc.tolist(), matched))
+data = [bytes([n]) for n in (7, 1, 2, 3, 4, 5, 6)]
+got, matched = upgrade_log.assign(np.round(rows, 5), times, data, True, 29.97)
+check('own video: only same-timestamp packets count', got == [b'\x01', b'\x02', b'\x03', b'\x04', b'\x06'] and matched == 1.0, (got, matched))
 t60 = np.arange(-1, 12) / 60  # a 59.94 transcode of the same frames
-cc, matched = upgrade_log.assign(rows, t60, np.ones(len(t60), dtype=np.int64), False, 29.97)
-check('transcode: packets count for the frame shown then', cc.tolist() == [2, 2, 2, 4, 2] and matched == 1.0, (cc.tolist(), matched))
+got, matched = upgrade_log.assign(rows, t60, [bytes([n]) for n in range(len(t60))], False, 29.97)
+check('transcode: packets count for the frame shown then, in order',
+      got == [b'\x01\x02', b'\x03\x04', b'\x05\x06', b'\x07\x08\x09\x0a', b'\x0b\x0c'] and matched == 1.0, (got, matched))
 
 # --- the lag ---
 
@@ -144,18 +147,38 @@ del noaudio['audio_shift']
 problems, cmd = gui.log_fixes(noaudio, path)
 check('log_fixes names both, audio first', len(problems) == 2 and 'audio_shift' in problems[0] and '&&' not in cmd, (problems, cmd))
 
-upgrade_log.read_packets = lambda v: (np.array([round(i/29.97, 5) for i in range(100)]), np.arange(100) % 3)
+T = [round(i/29.97, 5) for i in range(100)]
+upgrade_log.read_packets = lambda v: (np.array(T), [cc(HI) * (i % 3) for i in range(100)])
 msgs = upgrade_log.upgrade(path)
 new = processor.read_feature_log(path)
 body = new['frames'][1:]
-check('rewrite appends cc_text', new['frames_header'][-1] == 'cc_text' and [r[-1] for r in body] == (np.arange(100) % 3).tolist(), msgs)
-check('rewrite sets file_version 11 and keeps the rest',
-      new['file_version'] == 11 and [r[:-1] for r in body] == flog['frames'][1:] and new['tags'] == flog['tags']
-      and [k for k in new if k != 'cc_text_from'] == list(flog) and new['audio_shift'] == 0.5)
-check('own video: cc_text_from packets, no mkv_lag', new.get('cc_text_from') == 'packets' and 'mkv_lag' not in new)
+check('rewrite appends cc_text', new['frames_header'][-1] == 'cc_text' and [r[-1] for r in body] == [2 * (i % 3) for i in range(100)], msgs)
+check('rewrite adds cc_data after the frames, by frame time, frames without captions left out',
+      new['cc_data'] == [[T[i], (cc(HI) * (i % 3)).hex()] for i in range(100) if i % 3] and list(new)[-1] == 'cc_data', msgs)
+check('rewrite sets file_version 12 and keeps the rest',
+      new['file_version'] == 12 and [r[:-1] for r in body] == flog['frames'][1:] and new['tags'] == flog['tags']
+      and [k for k in new if k not in ('cc_text_from', 'cc_data_from', 'cc_data')] == list(flog) and new['audio_shift'] == 0.5)
+check('own video: both from packets, no mkv_lag',
+      (new.get('cc_text_from'), new.get('cc_data_from')) == ('packets', 'packets') and 'mkv_lag' not in new)
 check('rewrite keeps the permissions', os.stat(path).st_mode & 0o777 == 0o640)
-check('a log with cc_text is skipped', any(m.startswith('cc: skip') for m in upgrade_log.upgrade(path)))
+check('a log with cc_text and cc_data is skipped', any(m.startswith('cc: skip') for m in upgrade_log.upgrade(path)))
 check('log_fixes is satisfied', gui.log_fixes(new, path)[1] is None)
+
+# a file_version 11 log: counted by its extraction, no bytes
+v11 = dict(new, file_version=11)
+for k in ('cc_data', 'cc_data_from', 'cc_text_from'):
+    del v11[k]
+problems, cmd = gui.log_fixes(v11, path)
+check('log_fixes asks for the upgrade again on a log with counts only',
+      cmd is not None and len(problems) == 1 and 'cc_data' in problems[0] and 'again' in problems[0], problems)
+processor.write_feature_log(v11, path)
+upgrade_log.read_packets = lambda v: (np.array(T), [cc(HI, F2)] * 100)
+msgs = upgrade_log.upgrade(path)
+new = processor.read_feature_log(path)
+check('cc_data added to a log with counts, its counts untouched',
+      [r[-1] for r in new['frames'][1:]] == [2 * (i % 3) for i in range(100)] and 'cc_text_from' not in new
+      and new['cc_data'] == [[t, cc(HI, F2).hex()] for t in T] and new['file_version'] == 12
+      and new.get('cc_data_from') == 'packets', msgs)
 
 # the same recording, transcoded: the .ts is gone, and the .mkv's clock is 0.5s behind
 os.remove(video)
@@ -164,15 +187,26 @@ timeline.stream_starts = lambda v: (0.9, 0.0)
 old = processor.read_feature_log(path)
 old.update(video_start=10.0, audio_start=9.6)
 processor.write_feature_log(old, path)
-upgrade_log.read_packets = lambda v: (np.array([round(i/29.97, 5) - 0.5 for i in range(100)]), np.full(100, 5))
+upgrade_log.read_packets = lambda v: (np.array([t - 0.5 for t in T]), [cc(HI, CTRL)] * 100)
+old = processor.read_feature_log(path)
+lost = upgrade_log.read_packets
+upgrade_log.read_packets = lambda v: (np.array([t - 0.5 for t in T]), [b''] * 100)
+msgs = upgrade_log.upgrade(path, redo_cc=True)
+check('mkv: a transcode without the captions the log counted is skipped',
+      any(m.startswith('cc: skip') and 'lost captions' in m for m in msgs)
+      and processor.read_feature_log(path)['cc_data'] == old['cc_data'], msgs)
+upgrade_log.read_packets = lost
 msgs = upgrade_log.upgrade(path, redo_cc=True)
 new = processor.read_feature_log(path)
 body = new['frames'][1:]
 timeline.stream_starts = real_starts
 check('mkv: the lag is recorded, from the starts', (new.get('mkv_lag'), new.get('mkv_lag_from')) == (0.5, 'starts'), msgs)
 check('mkv: --redo-cc replaces the column, counted at the log\'s times',
-      new['frames_header'].count('cc_text') == 1 and len(body[0]) == 11 and all(r[-1] == 5 for r in body)
+      new['frames_header'].count('cc_text') == 1 and len(body[0]) == 11 and all(r[-1] == 2 for r in body)
       and new.get('cc_text_from') == 'packets-mkv', msgs)
+check('mkv: --redo-cc replaces cc_data, at the log\'s times',
+      new['cc_data'] == [[t, cc(HI, CTRL).hex()] for t in T] and new.get('cc_data_from') == 'packets-mkv'
+      and list(new)[-1] == 'cc_data', msgs)
 check('mkv: the timing keys sit before the frames', list(new).index('mkv_lag') < list(new).index('frames'))
 
 shutil.rmtree(tmp, ignore_errors=True)
